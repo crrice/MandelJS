@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>MandelJS — a fractal explorer</title>
+	<link rel="stylesheet" href="index.css" />
+</head>
+<body>
+	<main>
+		<h1>MandelJS</h1>
+		<p class="sub">A from-scratch Mandelbrot explorer, drawn pixel by pixel on a canvas
+			(<code>z ↦ z² + c</code>). Drag a box over a region and hit <b>zoom</b> to dive in;
+			<b>reset</b> returns to the full view.</p>
+
+		<div class="scroll">
+			<div class="easel">
+				<canvas class="fractal" width="640" height="320"></canvas>
+			</div>
+		</div>
+
+		<div class="controls">
+			<button class="btn zoom-button" type="button">⤢ zoom</button>
+			<button class="btn reset-button" type="button">↺ reset</button>
+		</div>
+	</main>
+
+	<script src="index.js"></script>
+</body>
+</html>

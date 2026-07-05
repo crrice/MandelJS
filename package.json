@@ -1,0 +1,15 @@
+{
+	"name": "mandeljs",
+	"version": "0.1.0",
+	"description": "A from-scratch Mandelbrot fractal explorer — canvas + TypeScript, zero runtime dependencies.",
+	"scripts": {
+		"build": "tsc",
+		"watch": "tsc --watch",
+		"serve": "http-server . -c-1 -p 8080"
+	},
+	"author": "Conor Rice",
+	"license": "ISC",
+	"devDependencies": {
+		"typescript": "^5.9.0"
+	}
+}

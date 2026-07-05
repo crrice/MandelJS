@@ -1,0 +1,84 @@
+/* MandelJS — standalone styles. No external dependencies. */
+
+* { box-sizing: border-box; }
+
+body {
+	margin: 0;
+	min-height: 100vh;
+	background: #0e0f12;
+	color: #e7e7e2;
+	font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+	line-height: 1.55;
+	display: flex;
+	justify-content: center;
+}
+
+main {
+	width: 100%;
+	max-width: 720px;
+	padding: 48px 24px;
+}
+
+h1 {
+	margin: 0 0 8px;
+	font-size: 2rem;
+	font-weight: 600;
+	letter-spacing: -0.02em;
+}
+
+.sub {
+	margin: 0 0 24px;
+	color: #a9aab0;
+	max-width: 60ch;
+}
+.sub code {
+	font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+	color: #cdd6e6;
+}
+
+/* horizontal scroll wrapper for narrow screens */
+.scroll {
+	width: 100%;
+	overflow-x: auto;
+	display: flex;
+	justify-content: center;
+}
+
+/* the fractal engine requires: a positioned .easel containing an absolutely
+   positioned base canvas + the overlay canvas it appends at runtime. */
+.easel {
+	position: relative;
+	width: 640px;
+	height: 320px;
+	flex: none;
+	background: #000;
+	border: 1px solid #2a2c31;
+	border-radius: 6px;
+	overflow: hidden;
+}
+.easel > canvas { position: absolute; top: 0; left: 0; }
+
+.controls {
+	display: flex;
+	gap: 12px;
+	justify-content: center;
+	margin-top: 16px;
+}
+
+.btn {
+	font: 500 0.85rem/1 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+	letter-spacing: 0.04em;
+	color: #cdd6e6;
+	background: #1a1c20;
+	border: 1px solid #2a2c31;
+	border-radius: 6px;
+	padding: 9px 16px;
+	cursor: pointer;
+	transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+.btn:hover { color: #fff; border-color: #4c6ef5; background: #20242b; }
+.btn:focus-visible { outline: 2px solid #4c6ef5; outline-offset: 2px; }
+
+@media (max-width: 560px) {
+	main { padding: 32px 16px; }
+}
