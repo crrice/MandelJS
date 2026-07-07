@@ -16,6 +16,10 @@ const easel = document.querySelector(".easel") as HTMLDivElement;
 const canvas = document.querySelector(".fractal") as HTMLCanvasElement;
 const ctx = canvas.getContext("2d")!;
 
+// Debug instrumentation toggle (URL: ?debug=1). Off by default so the production
+// console stays quiet; on, every completed render logs timing + iteration counts.
+const DEBUG = new URLSearchParams(location.search).has("debug");
+
 //---------------------------------------------------------------------------\\
 // Core compute
 //---------------------------------------------------------------------------\\
@@ -61,6 +65,19 @@ const EDGE_TH = 30;
 // smoother continuous coloring; 256 (radius 16) is the usual sweet spot.
 const BAILOUT2 = 256;
 
+// Periodicity checking. If an orbit returns within this squared distance of a
+// saved reference point, it has settled onto an attracting cycle -> the point is
+// in-set, so we stop early instead of burning the whole iteration budget.
+// EPS = 1e-10: an epsilon sweep showed this is the loosest value that stays
+// bit-transparent (zero false positives across full/minibrot/deep views, with a
+// ~100x margin); looser starts mislabeling slow-escaping boundary orbits.
+const PERIOD_EPS2 = 1e-20;
+
+// Skip the periodicity check until an orbit has survived this many iterations.
+// Fast-escaping exterior points (the bulk) never reach it, so they pay no
+// per-iteration periodicity overhead; only near-boundary / interior orbits do.
+const PERIOD_WARMUP = 64;
+
 // Sentinel returned by `escapeSmooth` for points that never escaped (in-set).
 // Every escaped point yields a finite smooth value, so === is unambiguous.
 const IN_SET = Infinity;
@@ -69,6 +86,26 @@ const IN_SET = Infinity;
 // complex-plane units) for the most recent escaped point. A module global to
 // keep the hot path allocation-free; embedded into the worker the same way.
 let deDist = 0;
+
+// Instrumentation side-channel: total iterations performed since last reset. A
+// deterministic, scheduling-noise-free measure of compute — the primary metric
+// for judging optimizations like periodicity checking (which cuts iterations on
+// interior points). Accumulated in escapeSmooth, summed per tile, embedded into
+// the worker like deDist.
+let iterAcc = 0;
+
+// Runtime toggle for periodicity checking, so we can A/B it (benchmark +
+// correctness). Set per tile from the worker message; embedded like the globals
+// above.
+let periodOn = true;
+
+// Outcome tallies (per point / sample — includes SSAA & border samples), reset
+// alongside iterAcc. Every point ends as one of: escaped (proven outside), in-set
+// via the cardioid/bulb shortcut, in-set via periodicity, or capped (hit maxIters
+// unresolved). Capped is the waste periodicity reclaims — each capped point burns
+// the full budget, so its share of iters is the headroom; watch `per` rise and
+// `cap`/iters fall as periodicity works.
+let escAcc = 0, inAcc = 0, perAcc = 0, capAcc = 0;
 
 // The heart of it: iterate z -> z^2 + c for a single point, returning the
 // continuous ("smooth") escape count (or IN_SET if bounded) and, as a side
@@ -83,12 +120,13 @@ function escapeSmooth(cr: number, ci: number, maxIters: number): number {
 	// them entirely. They're the most expensive points (they never escape), so
 	// short-circuiting them is what keeps the tiles reasonably balanced.
 	const b = cr + 1;
-	if (b * b + ci * ci < 0.0625) return IN_SET;            // period-2 bulb
+	if (b * b + ci * ci < 0.0625) { inAcc++; return IN_SET; }        // period-2 bulb
 	const xq = cr - 0.25;
 	const q = xq * xq + ci * ci;
-	if (q * (q + xq) < 0.25 * ci * ci) return IN_SET;       // main cardioid
+	if (q * (q + xq) < 0.25 * ci * ci) { inAcc++; return IN_SET; }   // main cardioid
 
 	let zx = 0, zy = 0, dzx = 0, dzy = 0, n = 0;
+	let refx = 0, refy = 0, checkAt = PERIOD_WARMUP;  // Brent periodicity: reference point + next save
 	while (n < maxIters) {
 		const x2 = zx * zx, y2 = zy * zy;
 		const mag2 = x2 + y2;
@@ -97,6 +135,7 @@ function escapeSmooth(cr: number, ci: number, maxIters: number): number {
 			const dmag = Math.sqrt(dzx * dzx + dzy * dzy);
 			deDist = dmag > 1e-300 ? 2 * zmag * Math.log(zmag) / dmag : 1e30;
 			const mu = n + 1 - Math.log(0.5 * Math.log(mag2)) / Math.LN2;
+			iterAcc += n; escAcc++;
 			return mu < 0 ? 0 : mu;
 		}
 		// derivative first (needs the current z): z' = 2*z*z' + 1
@@ -108,7 +147,14 @@ function escapeSmooth(cr: number, ci: number, maxIters: number): number {
 		zx = nzx; zy = nzy;
 		dzx = ndzx; dzy = ndzy;
 		n++;
+		if (periodOn && n >= PERIOD_WARMUP) {
+			// Settled back onto a saved orbit point => attracting cycle => in-set.
+			const rx = zx - refx, ry = zy - refy;
+			if (rx * rx + ry * ry < PERIOD_EPS2) { iterAcc += n; perAcc++; return IN_SET; }
+			if (n === checkAt) { refx = zx; refy = zy; checkAt *= 2; }  // refresh reference (Brent schedule)
+		}
 	}
+	iterAcc += n; capAcc++;
 	return IN_SET;
 }
 
@@ -362,12 +408,17 @@ interface TileMsg {
 	type: "tile"; gen: number;
 	ox: number; oy: number; tw: number; th: number;
 	canvasW: number; canvasH: number; view: View; maxIters: number; densityMul: number; mode: number;
+	usePeriod: boolean;
 }
 interface DoneMsg {
 	type: "done"; gen: number;
 	ox: number; oy: number; tw: number; th: number;
+	iters: number; esc: number; ins: number; per: number; cap: number;
 	buf: ArrayBuffer; mu: ArrayBuffer; de: ArrayBuffer;
 }
+
+// Per-generation instrumentation: total iterations + outcome tallies.
+interface GenStats { iters: number; esc: number; ins: number; per: number; cap: number; }
 
 // The worker body: the kernel + primitive (stringified from above) plus a tiny
 // message loop. It holds the current palette and renders whatever tile it's
@@ -380,19 +431,26 @@ function buildWorkerSource(): string {
 		"const DIST_SCALE = " + DIST_SCALE + ";",
 		"const SS = " + SS + ";",
 		"const EDGE_TH = " + EDGE_TH + ";",
+		"const PERIOD_EPS2 = " + PERIOD_EPS2 + ";",
+		"const PERIOD_WARMUP = " + PERIOD_WARMUP + ";",
 		"const IN_SET = Infinity;",
 		"let deDist = 0;",
+		"let periodOn = true;",
+		"let iterAcc = 0, escAcc = 0, inAcc = 0, perAcc = 0, capAcc = 0;",
 		escapeSmooth.toString(),
 		renderRegion.toString(),
 		"let PAL = null;",
 		"onmessage = function (e) {",
 		"  var m = e.data;",
 		"  if (m.type === 'palette') { PAL = m; return; }",
+		"  periodOn = m.usePeriod;",
 		"  var n = m.tw * m.th;",
 		"  var out = new Uint32Array(n), muF = new Float32Array(n), deF = new Float32Array(n);",
+		"  iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;",
 		"  renderRegion(out, muF, deF, m.tw, m.ox, m.oy, m.tw, m.th, m.canvasW, m.canvasH,",
 		"               m.view, m.maxIters, PAL.lut, PAL.inSet, m.densityMul, PAL.cyclic, m.mode);",
 		"  postMessage({ type: 'done', gen: m.gen, ox: m.ox, oy: m.oy, tw: m.tw, th: m.th,",
+		"                iters: iterAcc, esc: escAcc, ins: inAcc, per: perAcc, cap: capAcc,",
 		"                buf: out.buffer, mu: muF.buffer, de: deF.buffer }, [out.buffer, muF.buffer, deF.buffer]);",
 		"};",
 	].join("\n");
@@ -422,6 +480,13 @@ class FractalRenderer {
 	// thread instantly, without re-iterating.
 	private muField: Float32Array;
 	private deField: Float32Array;
+	// Instrumentation for the current generation: wall-clock + iteration totals +
+	// outcome tallies (escaped / proven in-set / capped).
+	private renderStart = 0;
+	private genStats: GenStats = { iters: 0, esc: 0, ins: 0, per: 0, cap: 0 };
+	private lastMs = 0;
+	private onComplete: (() => void) | null = null;
+	private usePeriod = true; // periodicity checking (A/B toggle via mandelPeriod())
 
 	public constructor(palette: Palette) {
 		this.palette = palette;
@@ -478,6 +543,11 @@ class FractalRenderer {
 	public setColorMode(mode: number): void {
 		this.mode = mode;
 		this.colorizeField();
+	}
+
+	// Toggle periodicity checking and re-render — for A/B benchmarking.
+	public setPeriod(on: boolean): void {
+		this.usePeriod = on;
 	}
 
 	// Switch to a different palette. Resets wrap/density to the palette's own
@@ -582,6 +652,45 @@ class FractalRenderer {
 		if (!this.wrap && this.mode === 0) this.colorizeField();
 	}
 
+	// Fired once a render generation fully lands (worker or sync path): auto-level
+	// the ramp, record timing, log stats when debugging, and resolve any waiter.
+	private onGenerationComplete(): void {
+		this.finalizeColors();
+		this.lastMs = performance.now() - this.renderStart;
+		if (DEBUG) this.logStats();
+		const cb = this.onComplete; this.onComplete = null;
+		if (cb) cb();
+	}
+
+	private logStats(): void {
+		console.log("[mandel] " + this.statLine());
+	}
+
+	// Human-readable one-liner of the current generation's stats. Shared by the
+	// ?debug per-render log and the bench summary. "capped % of iters" is the
+	// theoretical headroom for periodicity checking — the share of all iteration
+	// work spent on points that hit maxIters without resolving.
+	private statLine(): string {
+		const s = this.genStats;
+		const pts = s.esc + s.ins + s.per + s.cap || 1;
+		const px = canvas.width * canvas.height;
+		const cappedIterPct = s.iters ? (100 * s.cap * this.maxIters / s.iters) : 0;
+		return "zoom " + (DEFAULT_VIEW.spanX / this.view.spanX).toExponential(2) + "x · " +
+			this.lastMs.toFixed(1) + " ms · " + (s.iters / 1e6).toFixed(2) + "M iters (" +
+			(s.iters / px).toFixed(0) + "/px) · pts " + (100 * s.esc / pts).toFixed(0) + "% esc / " +
+			(100 * s.ins / pts).toFixed(0) + "% in / " + (100 * s.per / pts).toFixed(0) + "% period / " +
+			(100 * s.cap / pts).toFixed(0) + "% capped · capped burns " + cappedIterPct.toFixed(0) +
+			"% of iters · period=" + (this.usePeriod ? "on" : "off");
+	}
+
+	// Render the current view and resolve when it fully lands — for benchmarking.
+	public renderAndWait(view: View): Promise<{ ms: number; stats: GenStats; maxIters: number }> {
+		return new Promise((resolve) => {
+			this.onComplete = () => resolve({ ms: this.lastMs, stats: this.genStats, maxIters: this.maxIters });
+			this.render(view);
+		});
+	}
+
 	// Iterations grow with zoom depth (deeper => more, capped) unless overridden.
 	private itersForView(v: View): number {
 		const zoom = DEFAULT_VIEW.spanX / v.spanX;
@@ -603,6 +712,8 @@ class FractalRenderer {
 		this.maxIters = maxIters;
 		this.densityMul = this.densityMulFor(view);
 		this.gen++;
+		this.renderStart = performance.now();
+		this.genStats = { iters: 0, esc: 0, ins: 0, per: 0, cap: 0 };
 
 		if (this.workers.length === 0) { this.renderSync(); return; }
 
@@ -626,6 +737,7 @@ class FractalRenderer {
 			ox: tile.ox, oy: tile.oy, tw: tile.tw, th: tile.th,
 			canvasW: canvas.width, canvasH: canvas.height,
 			view: this.view, maxIters: this.maxIters, densityMul: this.densityMul, mode: this.mode,
+			usePeriod: this.usePeriod,
 		};
 		this.workers[i].postMessage(msg);
 	}
@@ -635,11 +747,13 @@ class FractalRenderer {
 			const img = new ImageData(new Uint8ClampedArray(m.buf), m.tw, m.th);
 			ctx.putImageData(img, m.ox, m.oy);
 			this.storeField(m.ox, m.oy, m.tw, m.th, new Float32Array(m.mu), new Float32Array(m.de));
+			const s = this.genStats;
+			s.iters += m.iters; s.esc += m.esc; s.ins += m.ins; s.per += m.per; s.cap += m.cap;
 		}
 		this.dispatch(i); // keep the worker fed from the current queue
-		// Last tile of this generation just landed — finalize (auto-level the ramp).
+		// Last tile of this generation just landed — finalize + report.
 		if (m.gen === this.gen && this.queue.length === 0 && this.idle.every((x) => x)) {
-			this.finalizeColors();
+			this.onGenerationComplete();
 		}
 	}
 
@@ -657,12 +771,15 @@ class FractalRenderer {
 		const W = canvas.width, H = canvas.height;
 		const image = ctx.getImageData(0, 0, W, H);
 		const data32 = new Uint32Array(image.data.buffer);
+		periodOn = this.usePeriod;
+		iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;
 		renderRegion(
 			data32, this.muField, this.deField, W, 0, 0, W, H, W, H, this.view, this.maxIters,
 			this.lut, this.inSet, this.densityMul, this.wrap, this.mode,
 		);
 		ctx.putImageData(image, 0, 0);
-		this.finalizeColors(); // auto-level the ramp on the no-workers path too
+		this.genStats = { iters: iterAcc, esc: escAcc, ins: inAcc, per: perAcc, cap: capAcc };
+		this.onGenerationComplete(); // auto-level + report on the no-workers path too
 	}
 }
 
@@ -671,8 +788,61 @@ class FractalRenderer {
 //---------------------------------------------------------------------------\\
 
 const renderer = new FractalRenderer(currentPalette);
-let view: View = { ...DEFAULT_VIEW };
+
+// View <-> URL. The address bar always reflects the current view (?cx&cy&span),
+// so any zoom is a permalink: copy it, or reload it verbatim to reproduce the
+// exact same view — essential for apples-to-apples before/after benchmarks.
+const CANVAS_ASPECT = canvas.width / canvas.height;
+function viewFromUrl(): View | null {
+	const p = new URLSearchParams(location.search);
+	const cx = parseFloat(p.get("cx") || ""), cy = parseFloat(p.get("cy") || ""), span = parseFloat(p.get("span") || "");
+	if (!isFinite(cx) || !isFinite(cy) || !isFinite(span) || span <= 0) return null;
+	return { cx, cy, spanX: span, spanY: span / CANVAS_ASPECT };
+}
+function syncUrl(v: View): void {
+	const p = new URLSearchParams(location.search);
+	p.set("cx", String(v.cx)); p.set("cy", String(v.cy)); p.set("span", String(v.spanX));
+	history.replaceState(null, "", "?" + p.toString());
+}
+
+let view: View = viewFromUrl() || { ...DEFAULT_VIEW };
+syncUrl(view);
 renderer.render(view);
+
+// Benchmark helper (console): re-render the current view n times and report the
+// timing spread plus the (deterministic) iteration total. Run it at a fixed URL
+// view to compare an optimization before/after — median ms is the number to
+// trust; iters is noise-free. e.g.  await mandelBench(9)
+const dev = window as unknown as {
+	mandelBench: (n?: number) => Promise<unknown>;
+	mandelPeriod: (on?: boolean) => void;
+};
+
+dev.mandelBench = async (n = 9) => {
+	const runs: number[] = [];
+	let stats: GenStats = { iters: 0, esc: 0, ins: 0, per: 0, cap: 0 }, maxIters = 0;
+	for (let i = 0; i < n; i++) {
+		const r = await renderer.renderAndWait(view);
+		runs.push(r.ms); stats = r.stats; maxIters = r.maxIters; // stats are deterministic; keep the last
+	}
+	runs.sort((a, b) => a - b);
+	const min = runs[0], median = runs[n >> 1], mean = runs.reduce((a, b) => a + b, 0) / n;
+	const px = canvas.width * canvas.height;
+	const pts = stats.esc + stats.ins + stats.per + stats.cap || 1;
+	const cappedIterPct = stats.iters ? (100 * stats.cap * maxIters / stats.iters) : 0;
+	console.log(
+		"[bench] n=" + n + " @ zoom " + (DEFAULT_VIEW.spanX / view.spanX).toExponential(2) + "x · median " +
+		median.toFixed(1) + " ms (min " + min.toFixed(1) + ", mean " + mean.toFixed(1) + ") · " +
+		(stats.iters / 1e6).toFixed(2) + "M iters (" + (stats.iters / px).toFixed(0) + "/px) · " +
+		(100 * stats.per / pts).toFixed(0) + "% period / " + (100 * stats.cap / pts).toFixed(0) +
+		"% capped, burns " + cappedIterPct.toFixed(0) + "% of iters",
+	);
+	return { min, median, mean, stats, cappedIterPct };
+};
+
+// Toggle periodicity checking for A/B benchmarking. e.g.
+//   mandelPeriod(false); await mandelBench(9);  mandelPeriod(true); await mandelBench(9)
+dev.mandelPeriod = (on = true) => { renderer.setPeriod(on); console.log("periodicity " + (on ? "ON" : "OFF")); };
 
 // Recolor on light/dark flip (matters for the theme-aware subtle palette).
 const themeMq = matchMedia("(prefers-color-scheme: dark)");
@@ -770,6 +940,7 @@ zoomButton.addEventListener("click", () => {
 		spanX: view.spanX * (r[2] / W),
 		spanY: view.spanY * (r[3] / H),
 	};
+	syncUrl(view);
 	renderer.render(view);
 	boxZoomer.clear();
 });
@@ -777,6 +948,7 @@ zoomButton.addEventListener("click", () => {
 const resetButton = document.querySelector(".reset-button") as HTMLElement;
 resetButton.addEventListener("click", () => {
 	view = { ...DEFAULT_VIEW };
+	syncUrl(view);
 	renderer.render(view);
 	boxZoomer.clear();
 });
