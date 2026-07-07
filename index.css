@@ -79,6 +79,32 @@ h1 {
 .btn:hover { color: #fff; border-color: #4c6ef5; background: #20242b; }
 .btn:focus-visible { outline: 2px solid #4c6ef5; outline-offset: 2px; }
 
+/* Color instrument: palette picker, wrap toggle, density slider. */
+.color-controls { flex-wrap: wrap; margin-top: 12px; }
+.field {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	font: 500 0.8rem/1 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+	letter-spacing: 0.04em;
+	color: #a9aab0;
+}
+.field.checkbox { cursor: pointer; }
+.field select {
+	font: inherit;
+	color: #cdd6e6;
+	background: #1a1c20;
+	border: 1px solid #2a2c31;
+	border-radius: 6px;
+	padding: 7px 10px;
+	cursor: pointer;
+	transition: border-color 0.15s ease, color 0.15s ease;
+}
+.field select:hover { color: #fff; border-color: #4c6ef5; }
+.field input[type="checkbox"] { accent-color: #4c6ef5; width: 15px; height: 15px; cursor: pointer; }
+.field input[type="range"] { accent-color: #4c6ef5; width: 104px; cursor: pointer; }
+.field :focus-visible { outline: 2px solid #4c6ef5; outline-offset: 2px; }
+
 @media (max-width: 560px) {
 	main { padding: 32px 16px; }
 }

@@ -214,10 +214,12 @@ function renderRegion(
 type RGB = [number, number, number];
 
 interface Palette {
-	cyclic: boolean;  // wrap the gradient (bands) or clamp it (single ramp)?
-	density: number;  // iterations per full gradient cycle / ramp length
-	// Build a 1D lookup table (and the in-set color) for the current theme.
-	build(ink: RGB, paper: RGB): { lut: Uint32Array; inSet: number };
+	cyclic: boolean;  // DEFAULT wrap (bands) vs clamp (single ramp); user-overridable
+	density: number;  // DEFAULT iterations per gradient cycle / ramp; user-overridable
+	// Build a 1D lookup table (+ in-set color) for the theme and the *effective*
+	// wrap. Taking wrap as an argument (rather than reading `cyclic`) is what lets
+	// a user flip bands<->ramp and get a freshly rebuilt, seamless LUT either way.
+	build(ink: RGB, paper: RGB, cyclic: boolean): { lut: Uint32Array; inSet: number };
 }
 
 const LUT_SIZE = 1024;
@@ -238,6 +240,38 @@ function cosPalette(t: number, a: RGB, b: RGB, c: RGB, d: RGB): RGB {
 		clamp255(255 * (a[1] + b[1] * Math.cos(TAU * (c[1] * t + d[1])))),
 		clamp255(255 * (a[2] + b[2] * Math.cos(TAU * (c[2] * t + d[2])))),
 	];
+}
+
+// Build a LUT by interpolating a gradient across arbitrary color stops (linear
+// per segment, faithful to the given colors). When cyclic, the first stop is
+// appended so the gradient loops back on itself — LUT[0] === LUT[last] — which
+// is what keeps wrapped (banded) rendering free of a hard seam.
+function buildStopsLut(stops: RGB[], cyclic: boolean): Uint32Array {
+	const pts = cyclic ? stops.concat([stops[0]]) : stops;
+	const segs = pts.length - 1;
+	const lut = new Uint32Array(LUT_SIZE);
+	for (let i = 0; i < LUT_SIZE; i++) {
+		const f = (i / (LUT_SIZE - 1)) * segs;   // position along the stop list
+		let si = f | 0;
+		if (si >= segs) si = segs - 1;           // clamp the final endpoint
+		const lt = f - si;                        // fraction within this segment
+		const a = pts[si], b = pts[si + 1];
+		lut[i] = pack(lerp(a[0], b[0], lt) | 0, lerp(a[1], b[1], lt) | 0, lerp(a[2], b[2], lt) | 0);
+	}
+	return lut;
+}
+
+// A palette defined by hex color stops. Interior stays black — the conventional
+// Mandelbrot look, with good contrast on any theme.
+function stopsPalette(hexes: string[], cyclic: boolean, density: number): Palette {
+	const stops = hexes.map((h) => hexToRgb(h, [0, 0, 0]));
+	return {
+		cyclic,
+		density,
+		build(_ink: RGB, _paper: RGB, wrap: boolean): { lut: Uint32Array; inSet: number } {
+			return { lut: buildStopsLut(stops, wrap), inSet: pack(0, 0, 0) };
+		},
+	};
 }
 
 const PALETTES: Record<string, Palette> = {
@@ -262,11 +296,12 @@ const PALETTES: Record<string, Palette> = {
 	subtle: {
 		cyclic: false,
 		density: 48,
-		build(ink: RGB, paper: RGB): { lut: Uint32Array; inSet: number } {
+		build(ink: RGB, paper: RGB, cyclic: boolean): { lut: Uint32Array; inSet: number } {
 			const lut = new Uint32Array(LUT_SIZE);
 			for (let i = 0; i < LUT_SIZE; i++) {
 				let t = i / (LUT_SIZE - 1);
-				t = t * t * (3 - 2 * t); // smoothstep for a soft falloff
+				if (cyclic) t = 1 - Math.abs(2 * t - 1); // triangle paper->ink->paper: loops seamlessly
+				t = t * t * (3 - 2 * t);                 // smoothstep for a soft falloff
 				lut[i] = pack(
 					clamp255(lerp(paper[0], ink[0], t)) | 0,
 					clamp255(lerp(paper[1], ink[1], t)) | 0,
@@ -276,6 +311,23 @@ const PALETTES: Record<string, Palette> = {
 			return { lut, inSet: pack(ink[0] | 0, ink[1] | 0, ink[2] | 0) };
 		},
 	},
+
+	// Jupiter — the Jovian band tones from my shell palette: warm creams, clay,
+	// gold and sage. Reads beautifully as cyclic bands.
+	jupiter: stopsPalette(
+		["#af9c7c", "#c9805f", "#f5d094", "#e7f2ed", "#a3a18f", "#76664f"], true, 40),
+
+	// Ember — a hot ramp: charred brown, oxblood, burnt orange, amber, pale gold.
+	ember: stopsPalette(
+		["#180a04", "#6e1a10", "#c9420a", "#f5911d", "#ffd98a"], true, 40),
+
+	// Abyss — cool deep sea: midnight navy, deep teal, teal, aqua, sea-foam.
+	abyss: stopsPalette(
+		["#07101c", "#0e3a54", "#1c7a8c", "#56c6c0", "#d6f0ea"], true, 40),
+
+	// Twilight — dusk / nebula: deep indigo, violet, orchid, rose, a warm peach glow.
+	twilight: stopsPalette(
+		["#140a24", "#45206b", "#8a3a8f", "#d05a86", "#f6c9a8"], true, 40),
 };
 
 let currentPalette: Palette = PALETTES.escape;
@@ -354,10 +406,18 @@ class FractalRenderer {
 	private view: View = { ...DEFAULT_VIEW };
 	private maxIters = ITER_BASE;
 	private palette: Palette;
+	private wrap: boolean;         // effective wrap (palette default; user-overridable)
+	private densityBase: number;   // effective density (palette default; user-overridable)
 	private lut!: Uint32Array;
 	private inSet = 0;
 	private densityMul = 1 / 32;
 	private mode = 0; // 0 = escape-time, 1 = distance
+	// Escape-count range of the current view, for the auto-leveled (non-cyclic)
+	// ramp. Recomputed from the field when each render completes; a monotonic
+	// ramp needs this or it clamps to one end once escape counts get large (which
+	// they do everywhere at deep zoom), collapsing to a flat fill.
+	private muLo = 0;
+	private muHi = 1;
 	// Stored per-pixel fields (1 sample) so coloring can be redone on the main
 	// thread instantly, without re-iterating.
 	private muField: Float32Array;
@@ -365,8 +425,10 @@ class FractalRenderer {
 
 	public constructor(palette: Palette) {
 		this.palette = palette;
+		this.wrap = palette.cyclic;
+		this.densityBase = palette.density;
 		this.rebuildPalette();
-		this.densityMul = 1 / palette.density;
+		this.densityMul = 1 / this.densityBase;
 		this.muField = new Float32Array(canvas.width * canvas.height);
 		this.deField = new Float32Array(canvas.width * canvas.height);
 		try {
@@ -391,7 +453,7 @@ class FractalRenderer {
 
 	private rebuildPalette(): void {
 		const { ink, paper } = themeColors();
-		const built = this.palette.build(ink, paper);
+		const built = this.palette.build(ink, paper, this.wrap);
 		this.lut = built.lut;
 		this.inSet = built.inSet;
 	}
@@ -399,7 +461,7 @@ class FractalRenderer {
 	// Each worker gets its own copy of the LUT (structured clone, ~4KB).
 	private sendPalette(): void {
 		const msg = {
-			type: "palette", lut: this.lut, inSet: this.inSet, cyclic: this.palette.cyclic,
+			type: "palette", lut: this.lut, inSet: this.inSet, cyclic: this.wrap,
 		};
 		for (const w of this.workers) w.postMessage(msg);
 	}
@@ -418,6 +480,36 @@ class FractalRenderer {
 		this.colorizeField();
 	}
 
+	// Switch to a different palette. Resets wrap/density to the palette's own
+	// defaults, then recolors instantly from the stored field.
+	public setPalette(palette: Palette): void {
+		this.palette = palette;
+		this.wrap = palette.cyclic;
+		this.densityBase = palette.density;
+		this.rebuildPalette();
+		this.sendPalette();
+		this.densityMul = this.densityMulFor(this.view);
+		this.colorizeField();
+	}
+
+	// Toggle wrap (cyclic bands vs. a single clamped ramp). Rebuilds the LUT so
+	// wrapping stays seamless, re-sends it to the workers, and recolors instantly.
+	public setWrap(wrap: boolean): void {
+		this.wrap = wrap;
+		this.rebuildPalette();
+		this.sendPalette();
+		this.densityMul = this.densityMulFor(this.view);
+		this.colorizeField();
+	}
+
+	// Set the base color density (band width, escape-time mode). Recolors
+	// instantly; the worker path picks it up on the next render.
+	public setDensity(density: number): void {
+		this.densityBase = density;
+		this.densityMul = this.densityMulFor(this.view);
+		this.colorizeField();
+	}
+
 	// Repaint the whole canvas from the stored 1-sample field with the current
 	// palette/mode — the coloring pass, run on the main thread, no iteration.
 	private colorizeField(): void {
@@ -425,9 +517,10 @@ class FractalRenderer {
 		const image = ctx.getImageData(0, 0, W, H);
 		const data32 = new Uint32Array(image.data.buffer);
 		const lut = this.lut, inSet = this.inSet, lastIdx = lut.length - 1;
-		const densityMul = this.densityMul, cyclic = this.palette.cyclic, mode = this.mode;
+		const densityMul = this.densityMul, cyclic = this.wrap, mode = this.mode;
 		const pixelSize = this.view.spanX / W;
 		const mu = this.muField, de = this.deField;
+		const lo = this.muLo, span = this.muHi > this.muLo ? this.muHi - this.muLo : 1;
 		for (let i = 0; i < N; i++) {
 			const m = mu[i];
 			if (m === Infinity) { data32[i] = inSet; continue; }
@@ -435,13 +528,58 @@ class FractalRenderer {
 				let td = Math.log(1 + de[i] / pixelSize) * DIST_SCALE;
 				td -= (td | 0);
 				data32[i] = lut[(td * lastIdx) | 0];
-			} else {
+			} else if (cyclic) {
 				let t = m * densityMul;
-				if (cyclic) t -= (t | 0); else if (t > 1) t = 1;
+				t -= (t | 0);
+				data32[i] = lut[(t * lastIdx) | 0];
+			} else {
+				// Auto-leveled ramp: normalize mu to the view's escape-count range
+				// so the gradient spans the visible structure at any depth instead
+				// of clamping to one end.
+				let t = (m - lo) / span;
+				t = t < 0 ? 0 : t > 1 ? 1 : t;
 				data32[i] = lut[(t * lastIdx) | 0];
 			}
 		}
 		ctx.putImageData(image, 0, 0);
+	}
+
+	// After a render completes, measure the escape-count range so the non-cyclic
+	// ramp can auto-level against it. Uses a histogram with 1%/99% clipping so a
+	// few near-boundary outliers (mu ~ maxIters right against the set) don't
+	// compress the whole gradient. Cheap: a couple of O(N) passes.
+	private computeLevels(): void {
+		const mu = this.muField, N = mu.length;
+		let mn = Infinity, mx = -Infinity, cnt = 0;
+		for (let i = 0; i < N; i++) {
+			const m = mu[i];
+			if (m !== Infinity) { cnt++; if (m < mn) mn = m; if (m > mx) mx = m; }
+		}
+		if (cnt === 0 || mx <= mn) { this.muLo = 0; this.muHi = 1; return; }
+		const BINS = 512;
+		const hist = new Uint32Array(BINS);
+		const scale = (BINS - 1) / (mx - mn);
+		for (let i = 0; i < N; i++) {
+			const m = mu[i];
+			if (m !== Infinity) hist[((m - mn) * scale) | 0]++;
+		}
+		const loTarget = cnt * 0.01, hiTarget = cnt * 0.99;
+		let acc = 0, loBin = 0, hiBin = BINS - 1;
+		for (let b = 0; b < BINS; b++) { acc += hist[b]; if (acc >= loTarget) { loBin = b; break; } }
+		acc = 0;
+		for (let b = 0; b < BINS; b++) { acc += hist[b]; if (acc >= hiTarget) { hiBin = b; break; } }
+		this.muLo = mn + loBin / scale;
+		this.muHi = mn + hiBin / scale;
+		if (this.muHi <= this.muLo) this.muHi = this.muLo + 1;
+	}
+
+	// Called once a render generation fully lands. Refresh the auto-level range
+	// (kept current so a later wrap-off switch has it), and for a non-cyclic
+	// escape-time view, repaint from the field so the ramp spans the structure —
+	// the workers colored progressively with a flat clamp; this snaps it right.
+	private finalizeColors(): void {
+		this.computeLevels();
+		if (!this.wrap && this.mode === 0) this.colorizeField();
 	}
 
 	// Iterations grow with zoom depth (deeper => more, capped) unless overridden.
@@ -454,10 +592,10 @@ class FractalRenderer {
 	// Stretch a cyclic palette's period with zoom so color stops wrapping many
 	// times per pixel deep in. Ramp (non-cyclic) palettes clamp, so leave them be.
 	private densityMulFor(v: View): number {
-		if (!this.palette.cyclic) return 1 / this.palette.density;
+		if (!this.wrap) return 1 / this.densityBase;
 		const zoom = DEFAULT_VIEW.spanX / v.spanX;
 		const stretch = zoom > 1 ? Math.pow(zoom, COLOR_STRETCH_EXP) : 1;
-		return 1 / (this.palette.density * stretch);
+		return 1 / (this.densityBase * stretch);
 	}
 
 	public render(view: View, maxIters = this.itersForView(view)): void {
@@ -499,6 +637,10 @@ class FractalRenderer {
 			this.storeField(m.ox, m.oy, m.tw, m.th, new Float32Array(m.mu), new Float32Array(m.de));
 		}
 		this.dispatch(i); // keep the worker fed from the current queue
+		// Last tile of this generation just landed — finalize (auto-level the ramp).
+		if (m.gen === this.gen && this.queue.length === 0 && this.idle.every((x) => x)) {
+			this.finalizeColors();
+		}
 	}
 
 	// Copy a tile's (mu, deDist) field into the persistent full-canvas buffers.
@@ -517,9 +659,10 @@ class FractalRenderer {
 		const data32 = new Uint32Array(image.data.buffer);
 		renderRegion(
 			data32, this.muField, this.deField, W, 0, 0, W, H, W, H, this.view, this.maxIters,
-			this.lut, this.inSet, this.densityMul, this.palette.cyclic, this.mode,
+			this.lut, this.inSet, this.densityMul, this.wrap, this.mode,
 		);
 		ctx.putImageData(image, 0, 0);
+		this.finalizeColors(); // auto-level the ramp on the no-workers path too
 	}
 }
 
@@ -649,5 +792,31 @@ if (modeButton) {
 		mode = mode ? 0 : 1;
 		renderer.setColorMode(mode);
 		sync();
+	});
+}
+
+// Palette instrument — palette picker, wrap toggle, density slider. All optional
+// (absent on pages without them); each recolors instantly from the stored field.
+const wrapToggle = document.querySelector(".wrap-toggle") as HTMLInputElement | null;
+if (wrapToggle) {
+	wrapToggle.checked = currentPalette.cyclic;
+	wrapToggle.addEventListener("change", () => renderer.setWrap(wrapToggle.checked));
+}
+
+const densitySlider = document.querySelector(".density-slider") as HTMLInputElement | null;
+if (densitySlider) {
+	densitySlider.value = String(currentPalette.density);
+	densitySlider.addEventListener("input", () => renderer.setDensity(Number(densitySlider.value)));
+}
+
+const paletteSelect = document.querySelector(".palette-select") as HTMLSelectElement | null;
+if (paletteSelect) {
+	paletteSelect.addEventListener("change", () => {
+		const p = PALETTES[paletteSelect.value];
+		if (!p) return;
+		renderer.setPalette(p);
+		// Sync the wrap/density controls to the newly selected palette's defaults.
+		if (wrapToggle) wrapToggle.checked = p.cyclic;
+		if (densitySlider) densitySlider.value = String(p.density);
 	});
 }

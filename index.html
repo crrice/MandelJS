@@ -24,6 +24,23 @@
 			<button class="btn reset-button" type="button">↺ reset</button>
 			<button class="btn mode-button" type="button">coloring: escape-time</button>
 		</div>
+
+		<div class="controls color-controls">
+			<label class="field">palette
+				<select class="palette-select">
+					<option value="escape">escape</option>
+					<option value="subtle">subtle</option>
+					<option value="jupiter">jupiter</option>
+					<option value="ember">ember</option>
+					<option value="abyss">abyss</option>
+					<option value="twilight">twilight</option>
+				</select>
+			</label>
+			<label class="field checkbox"><input class="wrap-toggle" type="checkbox" /> wrap</label>
+			<label class="field">density
+				<input class="density-slider" type="range" min="8" max="128" step="1" />
+			</label>
+		</div>
 	</main>
 
 	<script src="index.js"></script>
