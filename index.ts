@@ -748,9 +748,10 @@ class FractalRenderer {
 	private sharpenStage = 0;
 	private undetermined = 0;
 	public onProgress: ((p: { working: number; abandoned: number; sharpening: boolean; done: boolean }) => void) | null = null;
-	// Fired each render with whether this view uses double-double precision, so the UI
-	// can show a "high precision" badge (and explain the slower render) when DD engages.
-	public onPrecision: ((dd: boolean) => void) | null = null;
+	// Fired each render with the working precision in BITS (64 = f64, 128 = double-double,
+	// 192 = triple-double, …), so the UI can show it and explain the slower deep renders.
+	// Bits, not a bool, so it generalizes to future multi-double levels.
+	public onPrecision: ((bits: number) => void) | null = null;
 	// Live working count during a sharpening stage: seeded with the entering capped
 	// count, then decremented per tile in onDone so a long high-cap stage keeps the
 	// readout ticking instead of frozen until the whole stage finishes. lastEmit
@@ -1095,7 +1096,7 @@ class FractalRenderer {
 		this.densityMul = this.densityMulFor(view);
 		this.useDD = this.ddOverride !== null ? this.ddOverride : this.useDDFor(view);
 		this.periodEps2 = this.periodEps2For(view, this.useDD);   // DD lets ε tighten further
-		if (this.onPrecision) this.onPrecision(this.useDD);
+		if (this.onPrecision) this.onPrecision(this.useDD ? 128 : 64);   // 64×limbs
 		this.sharpenStage = 0;
 		this.undetermined = 0;
 		// Fresh view: clear any leftover sharpening readout until the first frame lands.
@@ -1274,7 +1275,10 @@ syncUrl(view);
 // would miss the initial (URL) frame, which is exactly when a deep permalink loads in DD.
 const precisionStatus = document.querySelector(".precision-status") as HTMLElement | null;
 if (precisionStatus) {
-	renderer.onPrecision = (dd) => { precisionStatus.textContent = dd ? "high precision" : ""; };
+	renderer.onPrecision = (bits) => {
+		precisionStatus.textContent = bits + "-bit";
+		precisionStatus.classList.toggle("is-elevated", bits > 64);   // amber/prominent past f64
+	};
 }
 
 renderer.render(view);
