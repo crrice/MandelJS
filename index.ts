@@ -39,7 +39,24 @@ const DEFAULT_VIEW: View = { cx: -1, cy: 0, spanX: 4, spanY: 2 };
 // views stay tolerable — the worker pool absorbs the extra cost.
 const ITER_BASE = 1000;   // full-view budget
 const ITER_SLOPE = 600;   // extra iterations per octave (2x) of zoom
-const ITER_CAP = 20000;   // ceiling
+const ITER_CAP = 20000;   // ceiling for the INITIAL pass (fast time-to-first-frame)
+
+// Progressive sharpening. The initial pass caps at ITER_CAP so the first frame
+// lands fast; points that hit the cap unresolved (CAPPED) are then re-iterated on
+// the idle worker pool at a cap that escalates ×SHARPEN_MULT per stage. Rather
+// than stop at a fixed cap, each stage decides whether the next is worth running:
+// keep going while it stays PRODUCTIVE (resolves a meaningful share of what
+// remained) OR CHEAP (a stage this fast is a free tickle — carry on even if it
+// resolved little); stop only when a stage is both unproductive and not cheap, or
+// when the cap reaches the precision ceiling. That ceiling is real, not arbitrary:
+// past it a point's float64 orbit error (~ε·|z'|) has grown to O(1), so more
+// iterations track a neighboring c, not this one — the point can't be decided
+// without more precision, only "abandoned". Re-runs whole capped tiles from
+// scratch (the wasted low-cap iters are a few %, not worth a resume-state buffer).
+const SHARPEN_MULT = 10;              // cap multiplier per sharpening stage
+const SHARPEN_CEILING = 100_000_000;  // past this, points are precision-limited, not iteration-limited
+const SHARPEN_MIN_YIELD = 0.01;       // a stage resolving < this share of what remained is "unproductive"
+const SHARPEN_CHEAP_MS = 150;         // ...but a stage faster than this is a free tickle — keep going anyway
 
 // Color-frequency control. Deep in, the smooth count changes so fast per pixel
 // that a fixed color cycle wraps many times between neighbors — chromatic
@@ -68,19 +85,37 @@ const BAILOUT2 = 256;
 // Periodicity checking. If an orbit returns within this squared distance of a
 // saved reference point, it has settled onto an attracting cycle -> the point is
 // in-set, so we stop early instead of burning the whole iteration budget.
-// EPS = 1e-10: an epsilon sweep showed this is the loosest value that stays
-// bit-transparent (zero false positives across full/minibrot/deep views, with a
-// ~100x margin); looser starts mislabeling slow-escaping boundary orbits.
-const PERIOD_EPS2 = 1e-20;
+// EPS: the squared distance threshold for "the orbit returned to a saved point".
+// This is DYNAMIC with zoom. At shallow zoom 1e-10 is the loosest bit-transparent
+// value (fast: catches cycles early). But deeper, orbits run for millions of
+// iterations and a chaotic exterior orbit brushes within 1e-10 of a past point by
+// sheer recurrence -> a false in-set that bloats the boundary (measured 4.5% on a
+// zoom-7e11 window). True attracting cycles converge to ~1e-15, far below the
+// brushes, so tightening ε with depth removes the false positives with zero missed
+// cycles (verified: 4.5% -> 0.04% at 1e-13, no in-set point lost). Below the noise
+// floor (~1e-14) tightening would start dropping true cycles — that seam is where
+// double-double precision would take over. PERIOD_EPS2 is the shallow base; the
+// live value is computed per view by periodEps2For().
+const PERIOD_EPS2 = 1e-20;          // base ε² (ε = 1e-10), used at shallow zoom
+const PERIOD_EPS2_FLOOR = 1e-28;    // tightest ε² (ε = 1e-14) — the f64 noise floor
+const PERIOD_EPS_ZOOM0 = 1e5;       // below this zoom, stay at the loose base
 
 // Skip the periodicity check until an orbit has survived this many iterations.
 // Fast-escaping exterior points (the bulk) never reach it, so they pay no
 // per-iteration periodicity overhead; only near-boundary / interior orbits do.
 const PERIOD_WARMUP = 64;
 
-// Sentinel returned by `escapeSmooth` for points that never escaped (in-set).
-// Every escaped point yields a finite smooth value, so === is unambiguous.
+// Sentinel returned by `escapeSmooth` for points PROVEN in-set — via the
+// cardioid/bulb shortcut or a detected attracting cycle. Every escaped point
+// yields a finite smooth value, so === is unambiguous.
 const IN_SET = Infinity;
+
+// Sentinel for points that hit the iteration cap UNRESOLVED — we don't yet know
+// if they're in or out. Distinct from IN_SET so progressive sharpening can find
+// exactly these points and re-iterate them at a higher cap; both color as the
+// in-set color provisionally. -Infinity so `isFinite` rejects both sentinels at
+// once wherever a real escape count is required (auto-leveling, ramp coloring).
+const CAPPED = -Infinity;
 
 // Side-channel output from `escapeSmooth`: the exterior distance estimate (in
 // complex-plane units) for the most recent escaped point. A module global to
@@ -98,6 +133,9 @@ let iterAcc = 0;
 // correctness). Set per tile from the worker message; embedded like the globals
 // above.
 let periodOn = true;
+// Live periodicity ε² (zoom-scaled). Set per tile from the worker message, like
+// periodOn; escapeSmooth reads this rather than the PERIOD_EPS2 constant.
+let periodEps2 = PERIOD_EPS2;
 
 // Outcome tallies (per point / sample — includes SSAA & border samples), reset
 // alongside iterAcc. Every point ends as one of: escaped (proven outside), in-set
@@ -124,6 +162,12 @@ function escapeSmooth(cr: number, ci: number, maxIters: number): number {
 	const xq = cr - 0.25;
 	const q = xq * xq + ci * ci;
 	if (q * (q + xq) < 0.25 * ci * ci) { inAcc++; return IN_SET; }   // main cardioid
+	// Real-axis membership. M ∩ ℝ = [-2, 1/4] exactly: a real orbit stays real and
+	// is trapped in [-2, 2], so every real c in this interval is proven in-set. This
+	// is what decides the chaotic real points (which iteration never can — they
+	// neither escape nor cycle), so they're classified correctly instead of counted
+	// as undetermined. Fires only for exactly-real samples, so it's ~free otherwise.
+	if (ci === 0 && cr >= -2 && cr <= 0.25) { inAcc++; return IN_SET; }
 
 	let zx = 0, zy = 0, dzx = 0, dzy = 0, n = 0;
 	let refx = 0, refy = 0, checkAt = PERIOD_WARMUP;  // Brent periodicity: reference point + next save
@@ -150,12 +194,12 @@ function escapeSmooth(cr: number, ci: number, maxIters: number): number {
 		if (periodOn && n >= PERIOD_WARMUP) {
 			// Settled back onto a saved orbit point => attracting cycle => in-set.
 			const rx = zx - refx, ry = zy - refy;
-			if (rx * rx + ry * ry < PERIOD_EPS2) { iterAcc += n; perAcc++; return IN_SET; }
+			if (rx * rx + ry * ry < periodEps2) { iterAcc += n; perAcc++; return IN_SET; }
 			if (n === checkAt) { refx = zx; refy = zy; checkAt *= 2; }  // refresh reference (Brent schedule)
 		}
 	}
 	iterAcc += n; capAcc++;
-	return IN_SET;
+	return CAPPED;   // hit the cap unresolved — sharpening may still settle it
 }
 
 // Fill a tile into `out` (a Uint32 buffer with row stride `outStride`). The
@@ -185,7 +229,7 @@ function renderRegion(
 	// Color from an already-computed (mu, deDist) sample. This IS the coloring —
 	// the main thread runs identical logic over the stored fields.
 	function colorOf(mu: number, de: number): number {
-		if (mu === IN_SET) return inSet;
+		if (mu === IN_SET || mu === CAPPED) return inSet;   // undetermined -> in-set color for now
 		if (mode === 1) {
 			let td = Math.log(1 + de / pixelSize) * DIST_SCALE;
 			td -= (td | 0);
@@ -215,8 +259,15 @@ function renderRegion(
 		const row = (j + 1) * sw;
 		const inY = j >= 0 && j < th;
 		for (let i = -1; i <= tw; i++) {
-			const cr = view.cx + ((ox + i) * invW - 0.5) * view.spanX;
-			const ci = view.cy + ((oy + j) * invH - 0.5) * view.spanY;
+			// Sample at the pixel CENTER (+0.5), not its corner. A single sample is
+			// the pixel's representative, and centering keeps the sample grid
+			// symmetric within the array, so a mirror-symmetric set (the Mandelbrot
+			// set about the real axis) renders as a true mirror — corner-sampling is
+			// offset half a pixel and, on an even-height axis-centered view, lands
+			// exactly on the real axis (a measure-zero line of undecidable-by-
+			// iteration points). SSAA below uses the same centered convention.
+			const cr = view.cx + ((ox + i + 0.5) * invW - 0.5) * view.spanX;
+			const ci = view.cy + ((oy + j + 0.5) * invH - 0.5) * view.spanY;
 			const mu = escapeSmooth(cr, ci, maxIters);
 			const de = deDist;
 			s1[row + i + 1] = colorOf(mu, de);
@@ -239,9 +290,9 @@ function renderRegion(
 				colorDiff(c, s1[si - sw]) > EDGE_TH)) {
 				let ar = 0, ag = 0, ab = 0;
 				for (let sy = 0; sy < SS; sy++) {
-					const fy = oy + ly + (sy + 0.5) * invSS - 0.5;
+					const fy = oy + ly + (sy + 0.5) * invSS;   // centered subsamples (match pass-1 +0.5)
 					for (let sx = 0; sx < SS; sx++) {
-						const cc = colorAt(ox + lx + (sx + 0.5) * invSS - 0.5, fy);
+						const cc = colorAt(ox + lx + (sx + 0.5) * invSS, fy);
 						ar += cc & 255; ag += (cc >> 8) & 255; ab += (cc >> 16) & 255;
 					}
 				}
@@ -250,6 +301,29 @@ function renderRegion(
 				out[off] = c;
 			}
 		}
+	}
+}
+
+// Sharpening primitive: re-iterate ONLY the still-CAPPED points of a tile at a
+// higher cap, instead of re-running the whole tile (which would waste ~60% of the
+// work re-resolving points that already settled at the lower cap). `idx` holds
+// the capped pixels' tile-local indices; results are written packed (muOut[k],
+// deOut[k]) aligned to idx. One sample each (no SSAA/border) — a capped pixel was
+// painted in-set, so any resolution is an improvement, and the next full render
+// restores anti-aliasing. Self-contained for stringification (escapeSmooth /
+// deDist), and centered sampling matches renderRegion.
+function sharpenPoints(
+	muOut: Float32Array, deOut: Float32Array, idx: Int32Array,
+	ox: number, oy: number, tw: number, canvasW: number, canvasH: number,
+	view: View, maxIters: number,
+): void {
+	const invW = 1 / canvasW, invH = 1 / canvasH;
+	for (let k = 0; k < idx.length; k++) {
+		const p = idx[k], lx = p % tw, ly = (p / tw) | 0;
+		const cr = view.cx + ((ox + lx + 0.5) * invW - 0.5) * view.spanX;
+		const ci = view.cy + ((oy + ly + 0.5) * invH - 0.5) * view.spanY;
+		muOut[k] = escapeSmooth(cr, ci, maxIters);
+		deOut[k] = deDist;
 	}
 }
 
@@ -408,17 +482,24 @@ interface TileMsg {
 	type: "tile"; gen: number;
 	ox: number; oy: number; tw: number; th: number;
 	canvasW: number; canvasH: number; view: View; maxIters: number; densityMul: number; mode: number;
-	usePeriod: boolean;
+	usePeriod: boolean; periodEps2: number;
+	idx?: Int32Array;   // present => sharpen job: re-iterate only these capped tile-local pixels
 }
 interface DoneMsg {
 	type: "done"; gen: number;
 	ox: number; oy: number; tw: number; th: number;
 	iters: number; esc: number; ins: number; per: number; cap: number;
-	buf: ArrayBuffer; mu: ArrayBuffer; de: ArrayBuffer;
+	mu: ArrayBuffer; de: ArrayBuffer;
+	buf?: ArrayBuffer;   // full-tile pixels (absent for sharpen results)
+	idx?: Int32Array;    // sharpen results: mu/de are packed per-capped-point, aligned to idx
 }
 
 // Per-generation instrumentation: total iterations + outcome tallies.
 interface GenStats { iters: number; esc: number; ins: number; per: number; cap: number; }
+
+// A unit of render work: a tile rectangle. With `idx` (capped tile-local pixel
+// indices) it's a sharpening job — only those points are re-iterated.
+interface TileJob { ox: number; oy: number; tw: number; th: number; idx?: Int32Array; }
 
 // The worker body: the kernel + primitive (stringified from above) plus a tiny
 // message loop. It holds the current palette and renders whatever tile it's
@@ -431,22 +512,33 @@ function buildWorkerSource(): string {
 		"const DIST_SCALE = " + DIST_SCALE + ";",
 		"const SS = " + SS + ";",
 		"const EDGE_TH = " + EDGE_TH + ";",
-		"const PERIOD_EPS2 = " + PERIOD_EPS2 + ";",
 		"const PERIOD_WARMUP = " + PERIOD_WARMUP + ";",
 		"const IN_SET = Infinity;",
+			"const CAPPED = -Infinity;",
 		"let deDist = 0;",
 		"let periodOn = true;",
+		"let periodEps2 = " + PERIOD_EPS2 + ";",   // zoom-scaled, set per tile
 		"let iterAcc = 0, escAcc = 0, inAcc = 0, perAcc = 0, capAcc = 0;",
 		escapeSmooth.toString(),
 		renderRegion.toString(),
+		sharpenPoints.toString(),
 		"let PAL = null;",
 		"onmessage = function (e) {",
 		"  var m = e.data;",
 		"  if (m.type === 'palette') { PAL = m; return; }",
 		"  periodOn = m.usePeriod;",
+		"  periodEps2 = m.periodEps2;",
+		"  iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;",
+		"  if (m.idx) {",   // sharpen: re-iterate only the listed capped points, packed results
+		"    var muS = new Float32Array(m.idx.length), deS = new Float32Array(m.idx.length);",
+		"    sharpenPoints(muS, deS, m.idx, m.ox, m.oy, m.tw, m.canvasW, m.canvasH, m.view, m.maxIters);",
+		"    postMessage({ type: 'done', gen: m.gen, ox: m.ox, oy: m.oy, tw: m.tw, th: m.th, idx: m.idx,",
+		"                  iters: iterAcc, esc: escAcc, ins: inAcc, per: perAcc, cap: capAcc,",
+		"                  mu: muS.buffer, de: deS.buffer }, [muS.buffer, deS.buffer]);",
+		"    return;",
+		"  }",
 		"  var n = m.tw * m.th;",
 		"  var out = new Uint32Array(n), muF = new Float32Array(n), deF = new Float32Array(n);",
-		"  iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;",
 		"  renderRegion(out, muF, deF, m.tw, m.ox, m.oy, m.tw, m.th, m.canvasW, m.canvasH,",
 		"               m.view, m.maxIters, PAL.lut, PAL.inSet, m.densityMul, PAL.cyclic, m.mode);",
 		"  postMessage({ type: 'done', gen: m.gen, ox: m.ox, oy: m.oy, tw: m.tw, th: m.th,",
@@ -459,7 +551,7 @@ function buildWorkerSource(): string {
 class FractalRenderer {
 	private workers: Worker[] = [];
 	private idle: boolean[] = [];
-	private queue: Array<{ ox: number; oy: number; tw: number; th: number }> = [];
+	private queue: TileJob[] = [];
 	private gen = 0;
 	private view: View = { ...DEFAULT_VIEW };
 	private maxIters = ITER_BASE;
@@ -487,6 +579,25 @@ class FractalRenderer {
 	private lastMs = 0;
 	private onComplete: (() => void) | null = null;
 	private usePeriod = true; // periodicity checking (A/B toggle via mandelPeriod())
+	private periodEps2 = PERIOD_EPS2; // zoom-scaled cycle-detection threshold (set per render)
+	// Progressive sharpening. After the initial (fast, low-cap) frame lands, the
+	// idle worker pool re-iterates the CAPPED tiles at an escalating cap. `stage`
+	// is the escalation step (0 = initial frame); `undetermined` is the live count
+	// of still-CAPPED pixels entering a stage. onProgress fires after every
+	// generation so the UI can split the undetermined count into two buckets:
+	// `working` (still being iterated) and `abandoned` (left capped once escalation
+	// stops — points the cost/precision policy gave up on). sharpenOn gates the
+	// whole feature (off for clean A/B benchmarking of the initial-frame path).
+	private sharpenOn = true;
+	private sharpenStage = 0;
+	private undetermined = 0;
+	public onProgress: ((p: { working: number; abandoned: number; sharpening: boolean; done: boolean }) => void) | null = null;
+	// Live working count during a sharpening stage: seeded with the entering capped
+	// count, then decremented per tile in onDone so a long high-cap stage keeps the
+	// readout ticking instead of frozen until the whole stage finishes. lastEmit
+	// throttles those per-tile emits to ~25 Hz.
+	private workingLive = 0;
+	private lastEmit = 0;
 
 	public constructor(palette: Palette) {
 		this.palette = palette;
@@ -593,7 +704,7 @@ class FractalRenderer {
 		const lo = this.muLo, span = this.muHi > this.muLo ? this.muHi - this.muLo : 1;
 		for (let i = 0; i < N; i++) {
 			const m = mu[i];
-			if (m === Infinity) { data32[i] = inSet; continue; }
+			if (!isFinite(m)) { data32[i] = inSet; continue; }   // IN_SET or CAPPED -> in-set color
 			if (mode === 1) {
 				let td = Math.log(1 + de[i] / pixelSize) * DIST_SCALE;
 				td -= (td | 0);
@@ -623,7 +734,7 @@ class FractalRenderer {
 		let mn = Infinity, mx = -Infinity, cnt = 0;
 		for (let i = 0; i < N; i++) {
 			const m = mu[i];
-			if (m !== Infinity) { cnt++; if (m < mn) mn = m; if (m > mx) mx = m; }
+			if (isFinite(m)) { cnt++; if (m < mn) mn = m; if (m > mx) mx = m; }
 		}
 		if (cnt === 0 || mx <= mn) { this.muLo = 0; this.muHi = 1; return; }
 		const BINS = 512;
@@ -631,7 +742,7 @@ class FractalRenderer {
 		const scale = (BINS - 1) / (mx - mn);
 		for (let i = 0; i < N; i++) {
 			const m = mu[i];
-			if (m !== Infinity) hist[((m - mn) * scale) | 0]++;
+			if (isFinite(m)) hist[((m - mn) * scale) | 0]++;
 		}
 		const loTarget = cnt * 0.01, hiTarget = cnt * 0.99;
 		let acc = 0, loBin = 0, hiBin = BINS - 1;
@@ -660,7 +771,80 @@ class FractalRenderer {
 		if (DEBUG) this.logStats();
 		const cb = this.onComplete; this.onComplete = null;
 		if (cb) cb();
+		this.afterGeneration();
 	}
+
+	// Scan the stored field for still-undetermined (CAPPED) pixels: the total count
+	// (for the UI countdown) and the tiles containing any, ordered hardest-first
+	// (most capped pixels). That ordering makes the sharpening queue run
+	// longest-processing-time-first, which a scheduling sim showed erases the
+	// ~19% worker-idle tail a naive row-major order leaves on deep views.
+	private scanCapped(): { count: number; tiles: TileJob[] } {
+		const W = canvas.width, H = canvas.height, mu = this.muField;
+		const tiles: TileJob[] = [];
+		let total = 0;
+		for (let oy = 0; oy < H; oy += TILE_SIZE) {
+			const th = Math.min(TILE_SIZE, H - oy);
+			for (let ox = 0; ox < W; ox += TILE_SIZE) {
+				const tw = Math.min(TILE_SIZE, W - ox);
+				const idxArr: number[] = [];
+				for (let r = 0; r < th; r++) {
+					const row = (oy + r) * W + ox;
+					for (let k = 0; k < tw; k++) if (mu[row + k] === CAPPED) idxArr.push(r * tw + k);
+				}
+				if (idxArr.length > 0) { tiles.push({ ox, oy, tw, th, idx: Int32Array.from(idxArr) }); total += idxArr.length; }
+			}
+		}
+		tiles.sort((a, b) => b.idx!.length - a.idx!.length); // LPT: hardest tiles first
+		return { count: total, tiles };
+	}
+
+	// Post-generation hook: refresh the undetermined count, drive the UI, and — if
+	// anything is still capped and we haven't reached the target cap — kick the next
+	// sharpening stage on the (now idle) pool at a higher cap over just those tiles.
+	// A superseding view bumps the generation, so a stage scheduled here is
+	// abandoned before it paints if the user has moved on.
+	private afterGeneration(): void {
+		if (this.workers.length === 0 || !this.sharpenOn) return;
+		const prev = this.undetermined;                       // capped count entering this stage
+		const { count, tiles } = this.scanCapped();           // capped count after it
+		const resolved = this.sharpenStage === 0 ? 0 : prev - count;
+		this.undetermined = count;
+		const done = this.sharpenDone(count, prev, tiles.length, resolved);
+		// While sharpening, the survivors are "working"; once we stop, whatever is
+		// still capped becomes "abandoned" — so the working bucket ticks down to 0
+		// as points either resolve or get given up on.
+		if (this.onProgress) {
+			this.onProgress(done
+				? { working: 0, abandoned: count, sharpening: false, done: true }
+				: { working: count, abandoned: 0, sharpening: true, done: false });
+		}
+		if (done) return;
+		this.sharpenStage++;
+		this.workingLive = count;   // entering capped count; onDone ticks it down live per tile
+		const nextCap = Math.min(SHARPEN_CEILING, Math.round(this.maxIters * SHARPEN_MULT));
+		this.beginGeneration(nextCap, tiles);   // each tile carries its capped-point idx
+	}
+
+	// Whether to stop escalating. Continue while the last stage stayed worth it —
+	// it resolved a meaningful share of what remained (productive) OR was fast
+	// enough to be a free tickle (cheap). Stop only when a stage is both
+	// unproductive and not cheap, or when the cap hits the precision ceiling (past
+	// which more float64 iterations can't decide a point), or nothing is left.
+	// Always run at least one sharpening pass.
+	private sharpenDone(count: number, prev: number, tileCount: number, resolved: number): boolean {
+		if (count === 0 || tileCount === 0) return true;
+		if (this.sharpenStage === 0) return false;
+		if (this.maxIters >= SHARPEN_CEILING) return true;
+		const yielded = prev > 0 ? resolved / prev : 0;
+		const cheap = this.lastMs < SHARPEN_CHEAP_MS;
+		const productive = yielded >= SHARPEN_MIN_YIELD;
+		return !(cheap || productive);
+	}
+
+	// Toggle progressive sharpening (default on). Off = the initial pass only —
+	// for clean A/B benchmarking of the first-frame path.
+	public setSharpen(on: boolean): void { this.sharpenOn = on; }
 
 	private logStats(): void {
 		console.log("[mandel] " + this.statLine());
@@ -698,6 +882,19 @@ class FractalRenderer {
 		return Math.min(ITER_CAP, Math.round(ITER_BASE + ITER_SLOPE * Math.log2(zoom)));
 	}
 
+	// Cycle-detection ε² tightens with zoom. Longer deep-zoom orbits let a chaotic
+	// exterior orbit brush within the loose threshold by recurrence (false in-set),
+	// so above ZOOM0 we shrink ε² ∝ (zoom)^-0.8 (ε ∝ zoom^-0.4), floored at the f64
+	// noise level. Calibrated so the loose base holds until ~1e5 and reaches ~1e-13
+	// (ε) near 1e12 — which drove a zoom-7e11 window's false-black from 4.5% to 0.04%
+	// with zero true cycles lost.
+	private periodEps2For(v: View): number {
+		const zoom = DEFAULT_VIEW.spanX / v.spanX;
+		if (zoom <= PERIOD_EPS_ZOOM0) return PERIOD_EPS2;
+		const e2 = PERIOD_EPS2 * Math.pow(PERIOD_EPS_ZOOM0 / zoom, 0.8);
+		return e2 < PERIOD_EPS2_FLOOR ? PERIOD_EPS2_FLOOR : e2;
+	}
+
 	// Stretch a cyclic palette's period with zoom so color stops wrapping many
 	// times per pixel deep in. Ramp (non-cyclic) palettes clamp, so leave them be.
 	private densityMulFor(v: View): number {
@@ -709,21 +906,41 @@ class FractalRenderer {
 
 	public render(view: View, maxIters = this.itersForView(view)): void {
 		this.view = view;
-		this.maxIters = maxIters;
 		this.densityMul = this.densityMulFor(view);
+		this.periodEps2 = this.periodEps2For(view);
+		this.sharpenStage = 0;
+		this.undetermined = 0;
+		// Fresh view: clear any leftover sharpening readout until the first frame lands.
+		if (this.onProgress) this.onProgress({ working: 0, abandoned: 0, sharpening: false, done: false });
+
+		if (this.workers.length === 0) {
+			this.maxIters = maxIters;
+			this.gen++;
+			this.renderStart = performance.now();
+			this.genStats = { iters: 0, esc: 0, ins: 0, per: 0, cap: 0 };
+			this.renderSync();
+			return;
+		}
+
+		// Full-canvas tile queue for the initial pass (no idx => full render).
+		const W = canvas.width, H = canvas.height;
+		const tiles: TileJob[] = [];
+		for (let oy = 0; oy < H; oy += TILE_SIZE)
+			for (let ox = 0; ox < W; ox += TILE_SIZE)
+				tiles.push({ ox, oy, tw: Math.min(TILE_SIZE, W - ox), th: Math.min(TILE_SIZE, H - oy) });
+		this.beginGeneration(maxIters, tiles);
+	}
+
+	// Start a new render generation over a given tile queue at a given cap. Shared
+	// by the initial full-canvas render and each sharpening pass. Bumping the
+	// generation id is what makes a superseding view (or the next stage) abandon
+	// any stale in-flight tiles automatically.
+	private beginGeneration(maxIters: number, tiles: TileJob[]): void {
+		this.maxIters = maxIters;
 		this.gen++;
 		this.renderStart = performance.now();
 		this.genStats = { iters: 0, esc: 0, ins: 0, per: 0, cap: 0 };
-
-		if (this.workers.length === 0) { this.renderSync(); return; }
-
-		// Fresh tile queue for this generation.
-		this.queue = [];
-		const W = canvas.width, H = canvas.height;
-		for (let oy = 0; oy < H; oy += TILE_SIZE)
-			for (let ox = 0; ox < W; ox += TILE_SIZE)
-				this.queue.push({ ox, oy, tw: Math.min(TILE_SIZE, W - ox), th: Math.min(TILE_SIZE, H - oy) });
-
+		this.queue = tiles;
 		// Kick the idle workers; busy ones pull from the new queue as they finish.
 		for (let i = 0; i < this.workers.length; i++) if (this.idle[i]) this.dispatch(i);
 	}
@@ -737,16 +954,16 @@ class FractalRenderer {
 			ox: tile.ox, oy: tile.oy, tw: tile.tw, th: tile.th,
 			canvasW: canvas.width, canvasH: canvas.height,
 			view: this.view, maxIters: this.maxIters, densityMul: this.densityMul, mode: this.mode,
-			usePeriod: this.usePeriod,
+			usePeriod: this.usePeriod, periodEps2: this.periodEps2,
 		};
+		if (tile.idx) msg.idx = tile.idx;   // sharpen job: only these capped points
 		this.workers[i].postMessage(msg);
 	}
 
 	private onDone(i: number, m: DoneMsg): void {
 		if (m.gen === this.gen) { // drop stale tiles from a superseded view
-			const img = new ImageData(new Uint8ClampedArray(m.buf), m.tw, m.th);
-			ctx.putImageData(img, m.ox, m.oy);
-			this.storeField(m.ox, m.oy, m.tw, m.th, new Float32Array(m.mu), new Float32Array(m.de));
+			if (m.idx) this.applySharpen(m);
+			else this.applyTile(m);
 			const s = this.genStats;
 			s.iters += m.iters; s.esc += m.esc; s.ins += m.ins; s.per += m.per; s.cap += m.cap;
 		}
@@ -755,6 +972,60 @@ class FractalRenderer {
 		if (m.gen === this.gen && this.queue.length === 0 && this.idle.every((x) => x)) {
 			this.onGenerationComplete();
 		}
+	}
+
+	// Initial/full render of a tile: blit its pixels and stash its (mu, deDist) field.
+	private applyTile(m: DoneMsg): void {
+		ctx.putImageData(new ImageData(new Uint8ClampedArray(m.buf!), m.tw, m.th), m.ox, m.oy);
+		this.storeField(m.ox, m.oy, m.tw, m.th, new Float32Array(m.mu), new Float32Array(m.de));
+	}
+
+	// Sharpening result: only the tile's capped points were re-iterated (mu/de packed,
+	// aligned to idx). Update those field cells, recolor the ones that just resolved
+	// (leave still-capped pixels black), and tick the live working count down by how
+	// many resolved. Repaints only the changed pixels via a per-tile getImageData/
+	// putImageData, so already-resolved neighbours keep the SSAA from the full render.
+	private applySharpen(m: DoneMsg): void {
+		const W = canvas.width, idx = m.idx!, mu = new Float32Array(m.mu), de = new Float32Array(m.de);
+		const img = ctx.getImageData(m.ox, m.oy, m.tw, m.th);
+		const data32 = new Uint32Array(img.data.buffer);
+		let resolved = 0;
+		for (let k = 0; k < idx.length; k++) {
+			const p = idx[k], gpos = (m.oy + ((p / m.tw) | 0)) * W + m.ox + (p % m.tw);
+			const val = mu[k];
+			this.muField[gpos] = val; this.deField[gpos] = de[k];
+			if (val !== CAPPED) { data32[p] = this.pixelColor(val, de[k]); resolved++; }  // resolved -> recolor
+		}
+		if (resolved > 0) ctx.putImageData(img, m.ox, m.oy);
+		if (this.onProgress) {   // live countdown: working shrinks by however many resolved
+			this.workingLive -= resolved;
+			const now = performance.now();
+			if (now - this.lastEmit > 40) {
+				this.lastEmit = now;
+				this.onProgress({ working: this.workingLive, abandoned: 0, sharpening: true, done: false });
+			}
+		}
+	}
+
+	// Color one field sample — the per-pixel half of colorizeField, reused to repaint
+	// sharpened pixels. MUST stay in sync with colorizeField's loop.
+	private pixelColor(m: number, deVal: number): number {
+		if (!isFinite(m)) return this.inSet;   // IN_SET or CAPPED -> in-set color
+		const lut = this.lut, lastIdx = lut.length - 1;
+		if (this.mode === 1) {
+			let td = Math.log(1 + deVal / (this.view.spanX / canvas.width)) * DIST_SCALE;
+			td -= (td | 0);
+			return lut[(td * lastIdx) | 0];
+		}
+		if (this.wrap) {
+			let t = m * this.densityMul;
+			t -= (t | 0);
+			return lut[(t * lastIdx) | 0];
+		}
+		const lo = this.muLo, span = this.muHi > this.muLo ? this.muHi - this.muLo : 1;
+		let t = (m - lo) / span;
+		t = t < 0 ? 0 : t > 1 ? 1 : t;
+		return lut[(t * lastIdx) | 0];
 	}
 
 	// Copy a tile's (mu, deDist) field into the persistent full-canvas buffers.
@@ -772,6 +1043,7 @@ class FractalRenderer {
 		const image = ctx.getImageData(0, 0, W, H);
 		const data32 = new Uint32Array(image.data.buffer);
 		periodOn = this.usePeriod;
+		periodEps2 = this.periodEps2;
 		iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;
 		renderRegion(
 			data32, this.muField, this.deField, W, 0, 0, W, H, W, H, this.view, this.maxIters,
@@ -816,9 +1088,11 @@ renderer.render(view);
 const dev = window as unknown as {
 	mandelBench: (n?: number) => Promise<unknown>;
 	mandelPeriod: (on?: boolean) => void;
+	mandelSharpen: (on?: boolean) => void;
 };
 
 dev.mandelBench = async (n = 9) => {
+	renderer.setSharpen(false); // measure the initial-frame path only, no idle passes
 	const runs: number[] = [];
 	let stats: GenStats = { iters: 0, esc: 0, ins: 0, per: 0, cap: 0 }, maxIters = 0;
 	for (let i = 0; i < n; i++) {
@@ -837,12 +1111,34 @@ dev.mandelBench = async (n = 9) => {
 		(100 * stats.per / pts).toFixed(0) + "% period / " + (100 * stats.cap / pts).toFixed(0) +
 		"% capped, burns " + cappedIterPct.toFixed(0) + "% of iters",
 	);
+	renderer.setSharpen(true);
 	return { min, median, mean, stats, cappedIterPct };
 };
 
 // Toggle periodicity checking for A/B benchmarking. e.g.
 //   mandelPeriod(false); await mandelBench(9);  mandelPeriod(true); await mandelBench(9)
 dev.mandelPeriod = (on = true) => { renderer.setPeriod(on); console.log("periodicity " + (on ? "ON" : "OFF")); };
+
+// Toggle progressive sharpening (idle re-iteration of undetermined points). e.g.
+//   mandelSharpen(false)  // freeze at the initial frame
+dev.mandelSharpen = (on = true) => { renderer.setSharpen(on); console.log("sharpening " + (on ? "ON" : "OFF")); };
+
+// Progressive-sharpening readout (optional element). Splits the undetermined
+// points into `working` (still being iterated) and `abandoned` (given up on once
+// escalation stops). Appears with the first frame; the working count ticks down
+// as points resolve, then drops to 0 as the remainder transfers to abandoned;
+// resets on a new view. `is-active` = workers still refining, `is-done` = settled.
+const sharpenStatus = document.querySelector(".sharpen-status") as HTMLElement | null;
+if (sharpenStatus) {
+	renderer.onProgress = ({ working, abandoned, sharpening, done }) => {
+		// Always visible for now (even at 0 · 0): the working count ticks down live
+		// as points resolve, then transfers to abandoned when escalation stops.
+		sharpenStatus.textContent =
+			working.toLocaleString() + " working · " + abandoned.toLocaleString() + " abandoned";
+		sharpenStatus.classList.toggle("is-active", sharpening);
+		sharpenStatus.classList.toggle("is-done", done);
+	};
+}
 
 // Recolor on light/dark flip (matters for the theme-aware subtle palette).
 const themeMq = matchMedia("(prefers-color-scheme: dark)");

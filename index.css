@@ -58,6 +58,41 @@ h1 {
 }
 .easel > canvas { position: absolute; top: 0; left: 0; }
 
+/* Progressive-sharpening readout: the undetermined-point count, over the canvas.
+   Appears with the first frame and counts down as idle passes resolve points;
+   empty (JS clears the text) => faded out. The leading dot pulses while workers
+   are still refining, turns solid green when the view has settled. */
+.sharpen-status {
+	position: absolute;
+	left: 10px;
+	bottom: 10px;
+	z-index: 2;
+	pointer-events: none;
+	font: 500 0.72rem/1 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+	letter-spacing: 0.04em;
+	color: #cdd6e6;
+	background: rgba(10, 11, 14, 0.62);
+	border: 1px solid #2a2c31;
+	border-radius: 5px;
+	padding: 5px 8px 5px 7px;
+	opacity: 0;
+	transition: opacity 0.25s ease;
+}
+.sharpen-status:not(:empty) { opacity: 1; }
+.sharpen-status::before {
+	content: "";
+	display: inline-block;
+	width: 6px; height: 6px;
+	margin-right: 6px;
+	border-radius: 50%;
+	background: #4c6ef5;
+	vertical-align: middle;
+}
+.sharpen-status.is-active::before { animation: sharpen-pulse 1s ease-in-out infinite; }
+.sharpen-status.is-done::before { background: #3ba55d; animation: none; }
+@keyframes sharpen-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
+@media (prefers-reduced-motion: reduce) { .sharpen-status.is-active::before { animation: none; } }
+
 .controls {
 	display: flex;
 	gap: 12px;
