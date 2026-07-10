@@ -332,6 +332,36 @@ function escapeSmoothDD(crhi: number, crlo: number, cihi: number, cilo: number, 
 	return CAPPED;
 }
 
+// The ONE coloring transfer function: a (mu, deDist) sample -> packed RGBA. Every
+// path routes through this — renderRegion (worker) and colorizeField / pixelColor
+// (main thread) — so escape-time bands, distance coloring, and the auto-leveled ramp
+// can never drift out of sync (they used to be three hand-synced copies). Non-cyclic
+// escape-time uses a linear level window [lvlLo, lvlLo+lvlSpan]: the main thread passes
+// the view's auto-leveled mu range; the worker, which can't see that range, passes
+// (0, 1/densityMul) — algebraically a flat clamp. Self-contained for stringification
+// (DIST_SCALE only).
+function colorSample(
+	mu: number, de: number, lut: Uint32Array, inSet: number,
+	mode: number, cyclic: boolean, densityMul: number,
+	pixelSize: number, lvlLo: number, lvlSpan: number,
+): number {
+	if (!isFinite(mu)) return inSet;                        // IN_SET or CAPPED -> in-set color
+	const lastIdx = lut.length - 1;
+	if (mode === 1) {                                        // distance estimate
+		let td = Math.log(1 + de / pixelSize) * DIST_SCALE;
+		td -= (td | 0);
+		return lut[(td * lastIdx) | 0];
+	}
+	if (cyclic) {                                            // escape-time, wrapped bands
+		let t = mu * densityMul;
+		t -= (t | 0);
+		return lut[(t * lastIdx) | 0];
+	}
+	let t = (mu - lvlLo) / lvlSpan;                          // escape-time, clamped level window
+	t = t < 0 ? 0 : t > 1 ? 1 : t;
+	return lut[(t * lastIdx) | 0];
+}
+
 // Fill a tile into `out` (a Uint32 buffer with row stride `outStride`). The
 // tile's top-left sits at (ox, oy) in the full canvas, which — together with
 // canvasW/canvasH — is what maps pixels into the complex plane; the output
@@ -352,22 +382,13 @@ function renderRegion(
 	lut: Uint32Array, inSet: number, densityMul: number, cyclic: boolean, mode: number,
 ): void {
 	const invW = 1 / canvasW, invH = 1 / canvasH;
-	const lastIdx = lut.length - 1;
 	const pixelSize = view.spanX * invW;                   // for distance mode
 	const invSS = 1 / SS, nSub = SS * SS;
 
-	// Color from an already-computed (mu, deDist) sample. This IS the coloring —
-	// the main thread runs identical logic over the stored fields.
+	// Color a computed (mu, deDist) sample via the shared colorSample. The worker can't
+	// see the view's auto-level range, so it passes (0, 1/densityMul) — a flat clamp.
 	function colorOf(mu: number, de: number): number {
-		if (mu === IN_SET || mu === CAPPED) return inSet;   // undetermined -> in-set color for now
-		if (mode === 1) {
-			let td = Math.log(1 + de / pixelSize) * DIST_SCALE;
-			td -= (td | 0);
-			return lut[(td * lastIdx) | 0];
-		}
-		let t = mu * densityMul;
-		if (cyclic) t -= (t | 0); else if (t > 1) t = 1;
-		return lut[(t * lastIdx) | 0];
+		return colorSample(mu, de, lut, inSet, mode, cyclic, densityMul, pixelSize, 0, 1 / densityMul);
 	}
 	// Escape value at a canvas-space sample (px,py already pixel/subpixel-centered).
 	// Below the f64 wall (useDD) the coordinate is built in double-double —
@@ -673,6 +694,7 @@ function buildWorkerSource(): string {
 		ddMul.toString(),
 		ddSq.toString(),
 		escapeSmoothDD.toString(),
+		colorSample.toString(),
 		renderRegion.toString(),
 		sharpenPoints.toString(),
 		"let PAL = null;",
@@ -863,30 +885,16 @@ class FractalRenderer {
 		const W = canvas.width, H = canvas.height, N = W * H;
 		const image = ctx.getImageData(0, 0, W, H);
 		const data32 = new Uint32Array(image.data.buffer);
-		const lut = this.lut, inSet = this.inSet, lastIdx = lut.length - 1;
+		const lut = this.lut, inSet = this.inSet;
 		const densityMul = this.densityMul, cyclic = this.wrap, mode = this.mode;
 		const pixelSize = this.view.spanX / W;
 		const mu = this.muField, de = this.deField;
+		// Auto-leveled range for the non-cyclic escape-time ramp — normalizes mu to the
+		// view's escape-count range so the gradient spans the visible structure at any
+		// depth; cyclic and distance modes ignore it (see colorSample).
 		const lo = this.muLo, span = this.muHi > this.muLo ? this.muHi - this.muLo : 1;
 		for (let i = 0; i < N; i++) {
-			const m = mu[i];
-			if (!isFinite(m)) { data32[i] = inSet; continue; }   // IN_SET or CAPPED -> in-set color
-			if (mode === 1) {
-				let td = Math.log(1 + de[i] / pixelSize) * DIST_SCALE;
-				td -= (td | 0);
-				data32[i] = lut[(td * lastIdx) | 0];
-			} else if (cyclic) {
-				let t = m * densityMul;
-				t -= (t | 0);
-				data32[i] = lut[(t * lastIdx) | 0];
-			} else {
-				// Auto-leveled ramp: normalize mu to the view's escape-count range
-				// so the gradient spans the visible structure at any depth instead
-				// of clamping to one end.
-				let t = (m - lo) / span;
-				t = t < 0 ? 0 : t > 1 ? 1 : t;
-				data32[i] = lut[(t * lastIdx) | 0];
-			}
+			data32[i] = colorSample(mu[i], de[i], lut, inSet, mode, cyclic, densityMul, pixelSize, lo, span);
 		}
 		ctx.putImageData(image, 0, 0);
 	}
@@ -1196,25 +1204,12 @@ class FractalRenderer {
 		}
 	}
 
-	// Color one field sample — the per-pixel half of colorizeField, reused to repaint
-	// sharpened pixels. MUST stay in sync with colorizeField's loop.
+	// Color one field sample (repaints a sharpened pixel) via the shared colorSample —
+	// the same function colorizeField and the worker use, so they can't diverge.
 	private pixelColor(m: number, deVal: number): number {
-		if (!isFinite(m)) return this.inSet;   // IN_SET or CAPPED -> in-set color
-		const lut = this.lut, lastIdx = lut.length - 1;
-		if (this.mode === 1) {
-			let td = Math.log(1 + deVal / (this.view.spanX / canvas.width)) * DIST_SCALE;
-			td -= (td | 0);
-			return lut[(td * lastIdx) | 0];
-		}
-		if (this.wrap) {
-			let t = m * this.densityMul;
-			t -= (t | 0);
-			return lut[(t * lastIdx) | 0];
-		}
 		const lo = this.muLo, span = this.muHi > this.muLo ? this.muHi - this.muLo : 1;
-		let t = (m - lo) / span;
-		t = t < 0 ? 0 : t > 1 ? 1 : t;
-		return lut[(t * lastIdx) | 0];
+		return colorSample(m, deVal, this.lut, this.inSet, this.mode, this.wrap, this.densityMul,
+			this.view.spanX / canvas.width, lo, span);
 	}
 
 	// Copy a tile's (mu, deDist) field into the persistent full-canvas buffers.
