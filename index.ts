@@ -98,12 +98,27 @@ const BAILOUT2 = 256;
 // live value is computed per view by periodEps2For().
 const PERIOD_EPS2 = 1e-20;          // base ε² (ε = 1e-10), used at shallow zoom
 const PERIOD_EPS2_FLOOR = 1e-28;    // tightest ε² (ε = 1e-14) — the f64 noise floor
+// Under double-double, the orbit difference z−z_ref is resolved to ~1e-32, so ε can
+// tighten far past the f64 floor. Floored near the DD noise limit (ε ≈ 1e-28); a sweep
+// showed the deep-zoom false-black vanishes by ε² ≈ 1e-31 and no true cycles drop even
+// at 1e-56, so this floor is never the binding constraint within DD's usable range.
+const PERIOD_EPS2_FLOOR_DD = 1e-56;
 const PERIOD_EPS_ZOOM0 = 1e5;       // below this zoom, stay at the loose base
 
 // Skip the periodicity check until an orbit has survived this many iterations.
 // Fast-escaping exterior points (the bulk) never reach it, so they pay no
 // per-iteration periodicity overhead; only near-boundary / interior orbits do.
 const PERIOD_WARMUP = 64;
+
+// Double-double (DD) precision gate. Past a certain depth f64 runs out of mantissa
+// — the pixel step drops below the ULP of the coordinate (adjacent pixels collide)
+// AND the orbit's rounding error, Lyapunov-amplified, swamps the boundary test. The
+// orbit is then run in ~106-bit double-double arithmetic (a pair of f64s). DD costs
+// ~15-20x/op (no hardware FMA in JS -> Dekker two-product), so it's gated to only
+// the views that need it: engage when the pixel step falls within this factor of the
+// coordinate ULP — a few octaves before the hard wall, so the crossover is seamless.
+// Tunable; mandelDD() forces on/off/auto for A/B.
+const DD_SWITCH_RATIO = 8;
 
 // Sentinel returned by `escapeSmooth` for points PROVEN in-set — via the
 // cardioid/bulb shortcut or a detected attracting cycle. Every escaped point
@@ -136,6 +151,15 @@ let periodOn = true;
 // Live periodicity ε² (zoom-scaled). Set per tile from the worker message, like
 // periodOn; escapeSmooth reads this rather than the PERIOD_EPS2 constant.
 let periodEps2 = PERIOD_EPS2;
+// Whether the current tile runs the orbit in double-double precision (deep views
+// only). Set per tile from the worker message, like periodOn; renderRegion reads it
+// to pick the f64 or DD sample path.
+let useDD = false;
+// DD op result scratch (hi, lo). The DD primitives write their two-limb result here
+// instead of allocating a pair — keeps the hot path allocation-free, same trick as
+// deDist. Copy _dhi/_dlo into locals immediately after each call (they're clobbered
+// by the next DD op).
+let _dhi = 0, _dlo = 0;
 
 // Outcome tallies (per point / sample — includes SSAA & border samples), reset
 // alongside iterAcc. Every point ends as one of: escaped (proven outside), in-set
@@ -202,6 +226,112 @@ function escapeSmooth(cr: number, ci: number, maxIters: number): number {
 	return CAPPED;   // hit the cap unresolved — sharpening may still settle it
 }
 
+//---------------------------------------------------------------------------\\
+// Double-double arithmetic — a real number carried as an unevaluated sum of two
+// f64s (hi + lo, |lo| <= 0.5 ulp(hi)), giving ~106 bits of mantissa. No hardware
+// FMA in JS, so products use Dekker's two-product via the 2^27+1 Veltkamp split.
+// Each op writes its two-limb result to the _dhi/_dlo scratch globals (no
+// allocation); callers copy those into locals before the next op. Self-contained
+// for stringification (only _dhi/_dlo, no other outer refs).
+//---------------------------------------------------------------------------\\
+
+const DD_SPLIT = 134217729;   // 2^27 + 1, the f64 Veltkamp splitter
+
+// (ahi,alo) + (bhi,blo). Knuth twoSum on the hi limbs, fold in the lo limbs, renormalize.
+function ddAdd(ahi: number, alo: number, bhi: number, blo: number): void {
+	const s = ahi + bhi;
+	const v = s - ahi;
+	let e = (ahi - (s - v)) + (bhi - v);   // exact error of ahi+bhi
+	e += alo + blo;
+	_dhi = s + e;
+	_dlo = e - (_dhi - s);                  // quickTwoSum(s, e)
+}
+
+// (ahi,alo) * (bhi,blo). Dekker twoProduct on the hi limbs + the cross terms.
+function ddMul(ahi: number, alo: number, bhi: number, blo: number): void {
+	const p = ahi * bhi;
+	const sa = DD_SPLIT * ahi, ah = sa - (sa - ahi), al = ahi - ah;
+	const sb = DD_SPLIT * bhi, bh = sb - (sb - bhi), bl = bhi - bh;
+	let e = ((ah * bh - p) + ah * bl + al * bh) + al * bl;   // exact error of ahi*bhi
+	e += ahi * blo + alo * bhi;
+	_dhi = p + e;
+	_dlo = e - (_dhi - p);
+}
+
+// (ahi,alo)^2 — a cheaper twoProduct with b == a.
+function ddSq(ahi: number, alo: number): void {
+	const p = ahi * ahi;
+	const sa = DD_SPLIT * ahi, ah = sa - (sa - ahi), al = ahi - ah;
+	let e = ((ah * ah - p) + 2 * ah * al) + al * al;
+	e += 2 * ahi * alo;
+	_dhi = p + e;
+	_dlo = e - (_dhi - p);
+}
+
+// The DD twin of escapeSmooth: same classification, but the orbit z -> z^2 + c runs
+// in double-double from a DD coordinate (crhi,crlo)+(cihi,cilo). This is what beats
+// BOTH deep-zoom walls at once — the DD coordinate distinguishes pixels the f64 grid
+// collapses (spatial wall), and the DD orbit keeps the boundary test above its noise
+// far longer (membership wall). The derivative z' (for the distance estimate) is also
+// carried in double-double (z'_{n+1} = 2*z*z' + 1), so distance-estimate coloring is
+// accurate at depth too, not just escape-time — deDist is computed from the DD z and z'.
+// Interior/real-axis shortcuts run on the hi limbs (coarse regions, f64 suffices).
+// The periodicity difference z_n - z_ref is formed in DD: that subtraction is a
+// catastrophic-cancellation site (two near-equal O(1) values), so doing it in DD is
+// exactly what lets cycle detection keep working past the f64 wall.
+function escapeSmoothDD(crhi: number, crlo: number, cihi: number, cilo: number, maxIters: number): number {
+	const b = crhi + 1;
+	if (b * b + cihi * cihi < 0.0625) { inAcc++; return IN_SET; }        // period-2 bulb
+	const xq = crhi - 0.25;
+	const q = xq * xq + cihi * cihi;
+	if (q * (q + xq) < 0.25 * cihi * cihi) { inAcc++; return IN_SET; }   // main cardioid
+	if (cihi === 0 && cilo === 0 && crhi >= -2 && crhi <= 0.25) { inAcc++; return IN_SET; }
+
+	let zrhi = 0, zrlo = 0, zihi = 0, zilo = 0;   // z (double-double)
+	let dzxhi = 0, dzxlo = 0, dzyhi = 0, dzylo = 0, n = 0;   // z' (double-double)
+	let refxhi = 0, refxlo = 0, refyhi = 0, refylo = 0, checkAt = PERIOD_WARMUP;
+	while (n < maxIters) {
+		ddSq(zrhi, zrlo); const zr2hi = _dhi, zr2lo = _dlo;   // zr^2
+		ddSq(zihi, zilo); const zi2hi = _dhi, zi2lo = _dlo;   // zi^2
+		const mag2 = zr2hi + zi2hi;                            // hi limb suffices vs the coarse bailout
+		if (mag2 > BAILOUT2) {
+			const zmag = Math.sqrt(mag2);
+			const dmag = Math.sqrt(dzxhi * dzxhi + dzyhi * dzyhi);   // hi limbs — DE is a smooth shading
+			deDist = dmag > 1e-300 ? 2 * zmag * Math.log(zmag) / dmag : 1e30;
+			const mu = n + 1 - Math.log(0.5 * Math.log(mag2)) / Math.LN2;
+			iterAcc += n; escAcc++;
+			return mu < 0 ? 0 : mu;
+		}
+		// derivative z' = 2*z*z' + 1 (all DD; needs current z, before the z update below)
+		ddMul(zrhi, zrlo, dzxhi, dzxlo); const zdx_hi = _dhi, zdx_lo = _dlo;   // zr*dzx
+		ddMul(zihi, zilo, dzyhi, dzylo); const zdy_hi = _dhi, zdy_lo = _dlo;   // zi*dzy
+		ddAdd(zdx_hi, zdx_lo, -zdy_hi, -zdy_lo);                                // zr*dzx - zi*dzy
+		let ndzxhi = 2 * _dhi, ndzxlo = 2 * _dlo;                              // *2 (exact)
+		ddAdd(ndzxhi, ndzxlo, 1, 0); ndzxhi = _dhi; ndzxlo = _dlo;             // +1
+		ddMul(zrhi, zrlo, dzyhi, dzylo); const zey_hi = _dhi, zey_lo = _dlo;   // zr*dzy
+		ddMul(zihi, zilo, dzxhi, dzxlo); const zex_hi = _dhi, zex_lo = _dlo;   // zi*dzx
+		ddAdd(zey_hi, zey_lo, zex_hi, zex_lo);                                  // zr*dzy + zi*dzx
+		let ndzyhi = 2 * _dhi, ndzylo = 2 * _dlo;                              // *2 (exact)
+		// zr' = zr^2 - zi^2 + cr   (all DD)
+		ddAdd(zr2hi, zr2lo, -zi2hi, -zi2lo); let nrhi = _dhi, nrlo = _dlo;
+		ddAdd(nrhi, nrlo, crhi, crlo); nrhi = _dhi; nrlo = _dlo;
+		// zi' = 2*zr*zi + ci       (all DD; the *2 is exact)
+		ddMul(zrhi, zrlo, zihi, zilo); let nihi = 2 * _dhi, nilo = 2 * _dlo;
+		ddAdd(nihi, nilo, cihi, cilo); nihi = _dhi; nilo = _dlo;
+		zrhi = nrhi; zrlo = nrlo; zihi = nihi; zilo = nilo;
+		dzxhi = ndzxhi; dzxlo = ndzxlo; dzyhi = ndzyhi; dzylo = ndzylo;
+		n++;
+		if (periodOn && n >= PERIOD_WARMUP) {
+			ddAdd(zrhi, zrlo, -refxhi, -refxlo); const drhi = _dhi;   // (zr - refx) in DD; hi limb holds the tiny diff
+			ddAdd(zihi, zilo, -refyhi, -refylo); const dihi = _dhi;
+			if (drhi * drhi + dihi * dihi < periodEps2) { iterAcc += n; perAcc++; return IN_SET; }
+			if (n === checkAt) { refxhi = zrhi; refxlo = zrlo; refyhi = zihi; refylo = zilo; checkAt *= 2; }
+		}
+	}
+	iterAcc += n; capAcc++;
+	return CAPPED;
+}
+
 // Fill a tile into `out` (a Uint32 buffer with row stride `outStride`). The
 // tile's top-left sits at (ox, oy) in the full canvas, which — together with
 // canvasW/canvasH — is what maps pixels into the complex plane; the output
@@ -239,10 +369,22 @@ function renderRegion(
 		if (cyclic) t -= (t | 0); else if (t > 1) t = 1;
 		return lut[(t * lastIdx) | 0];
 	}
+	// Escape value at a canvas-space sample (px,py already pixel/subpixel-centered).
+	// Below the f64 wall (useDD) the coordinate is built in double-double —
+	// c = cx (+) offset via twoSum — and iterated in DD; otherwise the plain f64
+	// path, which stays bit-identical to the pre-DD engine. Sets deDist either way.
+	function escapeAt(px: number, py: number): number {
+		const offX = (px * invW - 0.5) * view.spanX;
+		const offY = (py * invH - 0.5) * view.spanY;
+		if (useDD) {
+			ddAdd(view.cx, 0, offX, 0); const crhi = _dhi, crlo = _dlo;
+			ddAdd(view.cy, 0, offY, 0); const cihi = _dhi, cilo = _dlo;
+			return escapeSmoothDD(crhi, crlo, cihi, cilo, maxIters);
+		}
+		return escapeSmooth(view.cx + offX, view.cy + offY, maxIters);
+	}
 	function colorAt(fx: number, fy: number): number {
-		const cr = view.cx + (fx * invW - 0.5) * view.spanX;
-		const ci = view.cy + (fy * invH - 0.5) * view.spanY;
-		const mu = escapeSmooth(cr, ci, maxIters);
+		const mu = escapeAt(fx, fy);
 		return colorOf(mu, deDist);
 	}
 	function colorDiff(a: number, b: number): number {
@@ -266,9 +408,7 @@ function renderRegion(
 			// offset half a pixel and, on an even-height axis-centered view, lands
 			// exactly on the real axis (a measure-zero line of undecidable-by-
 			// iteration points). SSAA below uses the same centered convention.
-			const cr = view.cx + ((ox + i + 0.5) * invW - 0.5) * view.spanX;
-			const ci = view.cy + ((oy + j + 0.5) * invH - 0.5) * view.spanY;
-			const mu = escapeSmooth(cr, ci, maxIters);
+			const mu = escapeAt(ox + i + 0.5, oy + j + 0.5);
 			const de = deDist;
 			s1[row + i + 1] = colorOf(mu, de);
 			if (inY && i >= 0 && i < tw) { const p = j * tw + i; muOut[p] = mu; deOut[p] = de; }
@@ -320,9 +460,15 @@ function sharpenPoints(
 	const invW = 1 / canvasW, invH = 1 / canvasH;
 	for (let k = 0; k < idx.length; k++) {
 		const p = idx[k], lx = p % tw, ly = (p / tw) | 0;
-		const cr = view.cx + ((ox + lx + 0.5) * invW - 0.5) * view.spanX;
-		const ci = view.cy + ((oy + ly + 0.5) * invH - 0.5) * view.spanY;
-		muOut[k] = escapeSmooth(cr, ci, maxIters);
+		const offX = ((ox + lx + 0.5) * invW - 0.5) * view.spanX;
+		const offY = ((oy + ly + 0.5) * invH - 0.5) * view.spanY;
+		if (useDD) {
+			ddAdd(view.cx, 0, offX, 0); const crhi = _dhi, crlo = _dlo;
+			ddAdd(view.cy, 0, offY, 0); const cihi = _dhi, cilo = _dlo;
+			muOut[k] = escapeSmoothDD(crhi, crlo, cihi, cilo, maxIters);
+		} else {
+			muOut[k] = escapeSmooth(view.cx + offX, view.cy + offY, maxIters);
+		}
 		deOut[k] = deDist;
 	}
 }
@@ -482,7 +628,7 @@ interface TileMsg {
 	type: "tile"; gen: number;
 	ox: number; oy: number; tw: number; th: number;
 	canvasW: number; canvasH: number; view: View; maxIters: number; densityMul: number; mode: number;
-	usePeriod: boolean; periodEps2: number;
+	usePeriod: boolean; periodEps2: number; useDD: boolean;
 	idx?: Int32Array;   // present => sharpen job: re-iterate only these capped tile-local pixels
 }
 interface DoneMsg {
@@ -518,8 +664,15 @@ function buildWorkerSource(): string {
 		"let deDist = 0;",
 		"let periodOn = true;",
 		"let periodEps2 = " + PERIOD_EPS2 + ";",   // zoom-scaled, set per tile
+		"let useDD = false;",                       // deep-view precision, set per tile
+		"let _dhi = 0, _dlo = 0;",                  // DD op scratch
+		"const DD_SPLIT = " + DD_SPLIT + ";",
 		"let iterAcc = 0, escAcc = 0, inAcc = 0, perAcc = 0, capAcc = 0;",
 		escapeSmooth.toString(),
+		ddAdd.toString(),
+		ddMul.toString(),
+		ddSq.toString(),
+		escapeSmoothDD.toString(),
 		renderRegion.toString(),
 		sharpenPoints.toString(),
 		"let PAL = null;",
@@ -528,6 +681,7 @@ function buildWorkerSource(): string {
 		"  if (m.type === 'palette') { PAL = m; return; }",
 		"  periodOn = m.usePeriod;",
 		"  periodEps2 = m.periodEps2;",
+		"  useDD = m.useDD;",
 		"  iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;",
 		"  if (m.idx) {",   // sharpen: re-iterate only the listed capped points, packed results
 		"    var muS = new Float32Array(m.idx.length), deS = new Float32Array(m.idx.length);",
@@ -580,6 +734,8 @@ class FractalRenderer {
 	private onComplete: (() => void) | null = null;
 	private usePeriod = true; // periodicity checking (A/B toggle via mandelPeriod())
 	private periodEps2 = PERIOD_EPS2; // zoom-scaled cycle-detection threshold (set per render)
+	private useDD = false; // double-double orbit precision (auto per view; set per render)
+	private ddOverride: boolean | null = null; // mandelDD() force on/off; null = auto-gate
 	// Progressive sharpening. After the initial (fast, low-cap) frame lands, the
 	// idle worker pool re-iterates the CAPPED tiles at an escalating cap. `stage`
 	// is the escalation step (0 = initial frame); `undetermined` is the live count
@@ -592,6 +748,9 @@ class FractalRenderer {
 	private sharpenStage = 0;
 	private undetermined = 0;
 	public onProgress: ((p: { working: number; abandoned: number; sharpening: boolean; done: boolean }) => void) | null = null;
+	// Fired each render with whether this view uses double-double precision, so the UI
+	// can show a "high precision" badge (and explain the slower render) when DD engages.
+	public onPrecision: ((dd: boolean) => void) | null = null;
 	// Live working count during a sharpening stage: seeded with the entering capped
 	// count, then decremented per tile in onDone so a long high-cap stage keeps the
 	// readout ticking instead of frozen until the whole stage finishes. lastEmit
@@ -659,6 +818,12 @@ class FractalRenderer {
 	// Toggle periodicity checking and re-render — for A/B benchmarking.
 	public setPeriod(on: boolean): void {
 		this.usePeriod = on;
+	}
+
+	// Force double-double precision on/off, or null to restore auto-gating by zoom.
+	// For A/B on the wall window (mandelDD(false) vs mandelDD(true)).
+	public setDD(on: boolean | null): void {
+		this.ddOverride = on;
 	}
 
 	// Switch to a different palette. Resets wrap/density to the palette's own
@@ -864,7 +1029,8 @@ class FractalRenderer {
 			(s.iters / px).toFixed(0) + "/px) · pts " + (100 * s.esc / pts).toFixed(0) + "% esc / " +
 			(100 * s.ins / pts).toFixed(0) + "% in / " + (100 * s.per / pts).toFixed(0) + "% period / " +
 			(100 * s.cap / pts).toFixed(0) + "% capped · capped burns " + cappedIterPct.toFixed(0) +
-			"% of iters · period=" + (this.usePeriod ? "on" : "off");
+			"% of iters · period=" + (this.usePeriod ? "on" : "off") +
+			" · prec=" + (this.useDD ? "dd" : "f64");
 	}
 
 	// Render the current view and resolve when it fully lands — for benchmarking.
@@ -888,11 +1054,31 @@ class FractalRenderer {
 	// noise level. Calibrated so the loose base holds until ~1e5 and reaches ~1e-13
 	// (ε) near 1e12 — which drove a zoom-7e11 window's false-black from 4.5% to 0.04%
 	// with zero true cycles lost.
-	private periodEps2For(v: View): number {
+	//
+	// Under DD the f64 floor (1e-28) is too loose — measured 12.7% false-black at
+	// zoom ~1e16 — because false-black from exterior orbits shadowing a nearby cycle
+	// demands ε tighten FASTER with depth than the f64 0.8-rate. So DD views use a
+	// steeper 1.3-rate to a much lower floor; the orbit difference is DD-accurate, so
+	// this stays above the noise (a sweep confirmed 0% false-black and 0 dropped cycles).
+	private periodEps2For(v: View, useDD: boolean): number {
 		const zoom = DEFAULT_VIEW.spanX / v.spanX;
 		if (zoom <= PERIOD_EPS_ZOOM0) return PERIOD_EPS2;
+		if (useDD) {
+			const e2 = PERIOD_EPS2 * Math.pow(PERIOD_EPS_ZOOM0 / zoom, 1.3);
+			return e2 < PERIOD_EPS2_FLOOR_DD ? PERIOD_EPS2_FLOOR_DD : e2;
+		}
 		const e2 = PERIOD_EPS2 * Math.pow(PERIOD_EPS_ZOOM0 / zoom, 0.8);
 		return e2 < PERIOD_EPS2_FLOOR ? PERIOD_EPS2_FLOOR : e2;
+	}
+
+	// Auto-gate double-double: engage once the pixel step nears the coordinate ULP —
+	// i.e. f64 is running out of resolution to tell adjacent pixels apart. Uses the
+	// larger-magnitude axis (its ULP is coarser, so it hits the wall first). A few
+	// octaves of margin (DD_SWITCH_RATIO) so DD is already on before the artifacts.
+	private useDDFor(v: View): boolean {
+		const step = v.spanX / canvas.width;
+		const ulp = Math.max(Math.abs(v.cx), Math.abs(v.cy)) * Number.EPSILON;
+		return step < ulp * DD_SWITCH_RATIO;
 	}
 
 	// Stretch a cyclic palette's period with zoom so color stops wrapping many
@@ -907,7 +1093,9 @@ class FractalRenderer {
 	public render(view: View, maxIters = this.itersForView(view)): void {
 		this.view = view;
 		this.densityMul = this.densityMulFor(view);
-		this.periodEps2 = this.periodEps2For(view);
+		this.useDD = this.ddOverride !== null ? this.ddOverride : this.useDDFor(view);
+		this.periodEps2 = this.periodEps2For(view, this.useDD);   // DD lets ε tighten further
+		if (this.onPrecision) this.onPrecision(this.useDD);
 		this.sharpenStage = 0;
 		this.undetermined = 0;
 		// Fresh view: clear any leftover sharpening readout until the first frame lands.
@@ -954,7 +1142,7 @@ class FractalRenderer {
 			ox: tile.ox, oy: tile.oy, tw: tile.tw, th: tile.th,
 			canvasW: canvas.width, canvasH: canvas.height,
 			view: this.view, maxIters: this.maxIters, densityMul: this.densityMul, mode: this.mode,
-			usePeriod: this.usePeriod, periodEps2: this.periodEps2,
+			usePeriod: this.usePeriod, periodEps2: this.periodEps2, useDD: this.useDD,
 		};
 		if (tile.idx) msg.idx = tile.idx;   // sharpen job: only these capped points
 		this.workers[i].postMessage(msg);
@@ -1044,6 +1232,7 @@ class FractalRenderer {
 		const data32 = new Uint32Array(image.data.buffer);
 		periodOn = this.usePeriod;
 		periodEps2 = this.periodEps2;
+		useDD = this.useDD;
 		iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;
 		renderRegion(
 			data32, this.muField, this.deField, W, 0, 0, W, H, W, H, this.view, this.maxIters,
@@ -1079,6 +1268,15 @@ function syncUrl(v: View): void {
 
 let view: View = viewFromUrl() || { ...DEFAULT_VIEW };
 syncUrl(view);
+
+// High-precision (double-double) badge: lit when a view is deep enough to switch to DD.
+// Wired BEFORE the first render — onPrecision fires inside render(), so a later hookup
+// would miss the initial (URL) frame, which is exactly when a deep permalink loads in DD.
+const precisionStatus = document.querySelector(".precision-status") as HTMLElement | null;
+if (precisionStatus) {
+	renderer.onPrecision = (dd) => { precisionStatus.textContent = dd ? "high precision" : ""; };
+}
+
 renderer.render(view);
 
 // Benchmark helper (console): re-render the current view n times and report the
@@ -1089,6 +1287,7 @@ const dev = window as unknown as {
 	mandelBench: (n?: number) => Promise<unknown>;
 	mandelPeriod: (on?: boolean) => void;
 	mandelSharpen: (on?: boolean) => void;
+	mandelDD: (on?: boolean | null) => void;
 };
 
 dev.mandelBench = async (n = 9) => {
@@ -1122,6 +1321,14 @@ dev.mandelPeriod = (on = true) => { renderer.setPeriod(on); console.log("periodi
 // Toggle progressive sharpening (idle re-iteration of undetermined points). e.g.
 //   mandelSharpen(false)  // freeze at the initial frame
 dev.mandelSharpen = (on = true) => { renderer.setSharpen(on); console.log("sharpening " + (on ? "ON" : "OFF")); };
+
+// Force double-double precision for A/B on the wall window (null = auto-gate by zoom).
+//   mandelDD(false); await mandelBench(9);  mandelDD(true); await mandelBench(9);  mandelDD(null)
+dev.mandelDD = (on = true) => {
+	renderer.setDD(on);
+	console.log("DD precision " + (on === null ? "AUTO (zoom-gated)" : on ? "forced ON" : "forced OFF"));
+	renderer.render(view);
+};
 
 // Progressive-sharpening readout (optional element). Splits the undetermined
 // points into `working` (still being iterated) and `abandoned` (given up on once
