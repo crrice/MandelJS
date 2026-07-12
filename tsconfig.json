@@ -7,5 +7,5 @@
 		"strict": true,
 		"noImplicitReturns": true
 	},
-	"files": ["kernel.ts", "palette.ts", "index.ts"]
+	"files": ["kernel.ts", "palette.ts", "renderer.ts", "index.ts"]
 }
