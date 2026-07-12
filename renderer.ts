@@ -5,6 +5,52 @@
 // and palette.ts (LUTs); reads the canvas/ctx handles defined in index.ts.
 
 //---------------------------------------------------------------------------\\
+// Renderer tuning — iteration budget, sharpening schedule, color density, DD gate.
+//---------------------------------------------------------------------------\\
+
+// Iteration budget scales with zoom: deeper views need more iterations or the
+// boundary filaments blob into solid "fuzz" (points that would escape just
+// later get mislabeled in-set). Grows per octave of zoom, capped so very deep
+// views stay tolerable — the worker pool absorbs the extra cost.
+const ITER_BASE = 1000;   // full-view budget
+const ITER_SLOPE = 600;   // extra iterations per octave (2x) of zoom
+const ITER_CAP = 20000;   // ceiling for the INITIAL pass (fast time-to-first-frame)
+
+// Progressive sharpening. The initial pass caps at ITER_CAP so the first frame
+// lands fast; points that hit the cap unresolved (CAPPED) are then re-iterated on
+// the idle worker pool at a cap that escalates ×SHARPEN_MULT per stage. Rather
+// than stop at a fixed cap, each stage decides whether the next is worth running:
+// keep going while it stays PRODUCTIVE (resolves a meaningful share of what
+// remained) OR CHEAP (a stage this fast is a free tickle — carry on even if it
+// resolved little); stop only when a stage is both unproductive and not cheap, or
+// when the cap reaches the precision ceiling. That ceiling is real, not arbitrary:
+// past it a point's float64 orbit error (~ε·|z'|) has grown to O(1), so more
+// iterations track a neighboring c, not this one — the point can't be decided
+// without more precision, only "abandoned". Re-runs whole capped tiles from
+// scratch (the wasted low-cap iters are a few %, not worth a resume-state buffer).
+const SHARPEN_MULT = 10;              // cap multiplier per sharpening stage
+const SHARPEN_CEILING = 100_000_000;  // past this, points are precision-limited, not iteration-limited
+const SHARPEN_MIN_YIELD = 0.01;       // a stage resolving < this share of what remained is "unproductive"
+const SHARPEN_CHEAP_MS = 150;         // ...but a stage faster than this is a free tickle — keep going anyway
+
+// Color-frequency control. Deep in, the smooth count changes so fast per pixel
+// that a fixed color cycle wraps many times between neighbors — chromatic
+// static. Stretch the cycle with zoom (identity at the full view) to hold the
+// color gradient's per-pixel rate roughly constant. The exponent ~matches how
+// fast the per-pixel delta grows with zoom.
+const COLOR_STRETCH_EXP = 0.3;
+
+// Double-double (DD) precision gate. Past a certain depth f64 runs out of mantissa
+// — the pixel step drops below the ULP of the coordinate (adjacent pixels collide)
+// AND the orbit's rounding error, Lyapunov-amplified, swamps the boundary test. The
+// orbit is then run in ~106-bit double-double arithmetic (a pair of f64s). DD costs
+// ~15-20x/op (no hardware FMA in JS -> Dekker two-product), so it's gated to only
+// the views that need it: engage when the pixel step falls within this factor of the
+// coordinate ULP — a few octaves before the hard wall, so the crossover is seamless.
+// Tunable; mandelDD() forces on/off/auto for A/B.
+const DD_SWITCH_RATIO = 8;
+
+//---------------------------------------------------------------------------\\
 // Worker pool
 //---------------------------------------------------------------------------\\
 
