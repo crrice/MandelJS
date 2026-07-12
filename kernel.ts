@@ -9,13 +9,15 @@
 //---------------------------------------------------------------------------\\
 
 interface View {
-	cx: number;    // center, real axis
-	cy: number;    // center, imaginary axis
+	cx: number;    // center real axis — HI limb of a double-double
+	cxLo: number;  // center real axis — LO limb. Center carried in DD so box-zoom can position it past
+	cy: number;    // center imaginary axis — HI limb          the f64 wall (span stays f64: it's a magnitude)
+	cyLo: number;  // center imaginary axis — LO limb
 	spanX: number; // width of the view in the complex plane
 	spanY: number; // height of the view in the complex plane
 }
 
-const DEFAULT_VIEW: View = { cx: -1, cy: 0, spanX: 4, spanY: 2 };
+const DEFAULT_VIEW: View = { cx: -1, cxLo: 0, cy: 0, cyLo: 0, spanX: 4, spanY: 2 };
 
 // Distance-coloring mode: smooth bands by log(distance in pixels). Higher =
 // more bands. (Escape-time mode ignores this.)
@@ -106,6 +108,18 @@ let bandMap = 0;
 // deDist. Copy _dhi/_dlo into locals immediately after each call (they're clobbered
 // by the next DD op).
 let _dhi = 0, _dlo = 0;
+
+// Perturbation (deep-zoom fast path): iterate each pixel as its deviation δ from ONE shared
+// high-precision reference orbit, in plain f64 — ~30x cheaper than a per-pixel DD orbit.
+// `usePert` gates it. `refZx/refZy` hold the reference orbit (f64 hi-limbs, length refLen);
+// `refOffX/refOffY` its offset from the view center; computed once per generation by
+// computeRef(). `pertRhoThresh` is the error-bound flag: a pixel whose accumulated relative
+// error exceeds it returns CAPPED, so idle-sharpening re-resolves it exactly in DD.
+let usePert = false;
+let refZx = new Float64Array(1), refZy = new Float64Array(1), refLen = 0;
+let refZxl = new Float64Array(1), refZyl = new Float64Array(1);   // reference lo-limbs (DD) for z-periodicity
+let refOffX = 0, refOffY = 0;
+let pertRhoThresh = 0.1;
 
 // Outcome tallies (per point / sample — includes SSAA & border samples), reset
 // alongside iterAcc. Every point ends as one of: escaped (proven outside), in-set
@@ -278,6 +292,119 @@ function escapeSmoothDD(crhi: number, crlo: number, cihi: number, cilo: number, 
 	return CAPPED;
 }
 
+//---------------------------------------------------------------------------\\
+// Perturbation — one shared reference orbit + cheap per-pixel f64 deviations.
+//---------------------------------------------------------------------------\\
+
+// Escape length of a DD candidate: the iteration it escapes, or maxIters if bounded. Used
+// to pick a non-escaping reference (so the orbit is long enough for every pixel). No
+// smooth/derivative/tallies — just the membership test. Stringify-safe (dd ops + BAILOUT2).
+function refOrbitLen(crhi: number, crlo: number, cihi: number, cilo: number, maxIters: number): number {
+	let zxh = 0, zxl = 0, zyh = 0, zyl = 0;
+	for (let n = 0; n < maxIters; n++) {
+		if (zxh * zxh + zyh * zyh > BAILOUT2) return n;
+		ddSq(zxh, zxl); const x2h = _dhi, x2l = _dlo;
+		ddSq(zyh, zyl); const y2h = _dhi, y2l = _dlo;
+		ddAdd(x2h, x2l, -y2h, -y2l); let rh = _dhi, rl = _dlo; ddAdd(rh, rl, crhi, crlo); rh = _dhi; rl = _dlo;
+		ddMul(zxh, zxl, zyh, zyl); let ih = 2 * _dhi, il = 2 * _dlo; ddAdd(ih, il, cihi, cilo); ih = _dhi; il = _dlo;
+		zxh = rh; zxl = rl; zyh = ih; zyl = il;
+	}
+	return maxIters;
+}
+
+// Compute the view's shared reference orbit: a coarse probe finds a non-escaping (deep)
+// point, then its DD orbit is stored as f64 hi-limbs in refZx/refZy (length refLen) with the
+// point's offset from the view center in refOffX/refOffY. Call once per generation before the
+// tiles render. Stringify-safe (refOrbitLen + dd ops + BAILOUT2 + Float64Array).
+function computeRef(view: View, maxIters: number): void {
+	const PW = 8, PH = 8;
+	let bx = 0, by = 0, best = -1;
+	for (let j = 0; j < PH && best < maxIters; j++) {
+		for (let i = 0; i < PW; i++) {
+			const ox = ((i + 0.5) / PW - 0.5) * view.spanX, oy = ((j + 0.5) / PH - 0.5) * view.spanY;
+			ddAdd(view.cx, view.cxLo, ox, 0); const crhi = _dhi, crlo = _dlo;
+			ddAdd(view.cy, view.cyLo, oy, 0); const cihi = _dhi, cilo = _dlo;
+			const len = refOrbitLen(crhi, crlo, cihi, cilo, maxIters);
+			if (len > best) { best = len; bx = ox; by = oy; }
+			if (len >= maxIters) break;
+		}
+	}
+	refOffX = bx; refOffY = by;
+	if (refZx.length < maxIters + 1) { refZx = new Float64Array(maxIters + 1); refZy = new Float64Array(maxIters + 1); refZxl = new Float64Array(maxIters + 1); refZyl = new Float64Array(maxIters + 1); }
+	ddAdd(view.cx, view.cxLo, bx, 0); const crhi = _dhi, crlo = _dlo;
+	ddAdd(view.cy, view.cyLo, by, 0); const cihi = _dhi, cilo = _dlo;
+	let zxh = 0, zxl = 0, zyh = 0, zyl = 0; refLen = maxIters;
+	for (let n = 0; n < maxIters; n++) {
+		refZx[n] = zxh; refZy[n] = zyh; refZxl[n] = zxl; refZyl[n] = zyl;
+		if (zxh * zxh + zyh * zyh > BAILOUT2) { refLen = n; break; }
+		ddSq(zxh, zxl); const x2h = _dhi, x2l = _dlo;
+		ddSq(zyh, zyl); const y2h = _dhi, y2l = _dlo;
+		ddAdd(x2h, x2l, -y2h, -y2l); let rh = _dhi, rl = _dlo; ddAdd(rh, rl, crhi, crlo); rh = _dhi; rl = _dlo;
+		ddMul(zxh, zxl, zyh, zyl); let ih = 2 * _dhi, il = 2 * _dlo; ddAdd(ih, il, cihi, cilo); ih = _dhi; il = _dlo;
+		zxh = rh; zxl = rl; zyh = ih; zyl = il;
+	}
+	refZx[refLen] = zxh; refZy[refLen] = zyh; refZxl[refLen] = zxl; refZyl[refLen] = zyl;
+}
+
+// Perturbation escape: iterate the pixel deviation δ (f64) off the reference, carrying a
+// derivative (for deDist) and a running error bound. Returns the smooth escape count (same
+// convention as escapeSmoothDD), IN_SET via the interior shortcuts, or CAPPED — the latter
+// for non-escaping points AND glitch-flagged ones (accumulated relative error e/|δ| >
+// pertRhoThresh), so idle-sharpening resolves those exactly in DD. cr/ci = full pixel
+// coordinate (shortcuts only); dcx/dcy = δc = pixel − reference. Stringify-safe (Math/Number).
+function escapeSmoothPert(cr: number, ci: number, dcx: number, dcy: number, maxIters: number): number {
+	const b = cr + 1;
+	if (b * b + ci * ci < 0.0625) { inAcc++; return IN_SET; }
+	const xq = cr - 0.25, q = xq * xq + ci * ci;
+	if (q * (q + xq) < 0.25 * ci * ci) { inAcc++; return IN_SET; }
+	if (ci === 0 && cr >= -2 && cr <= 0.25) { inAcc++; return IN_SET; }
+
+	const EPS = Number.EPSILON, adc = Math.sqrt(dcx * dcx + dcy * dcy);
+	let dx = 0, dy = 0, e = 0, dzx = 0, dzy = 0, n = 0;
+	let szxh = 0, szxl = 0, szyh = 0, szyl = 0, pSaved = false, checkAt = PERIOD_WARMUP;   // z-periodicity (Brent, DD ref)
+	const lim = maxIters < refLen ? maxIters : refLen;
+	while (n < lim) {
+		const Zx = refZx[n], Zy = refZy[n];
+		const zx = Zx + dx, zy = Zy + dy;
+		const z2 = zx * zx + zy * zy;
+		const dm = Math.sqrt(dx * dx + dy * dy);
+		if (z2 > BAILOUT2) {
+			if (dm > 0 && e / dm > pertRhoThresh) { iterAcc += n; capAcc++; return CAPPED; }   // glitch → DD in sharpening
+			const zmag = Math.sqrt(z2), dmag = Math.sqrt(dzx * dzx + dzy * dzy);
+			deDist = dmag > 1e-300 ? 2 * zmag * Math.log(zmag) / dmag : 1e30;
+			const mu = n + 1 - Math.log(0.5 * Math.log(z2)) / Math.LN2;
+			iterAcc += n; escAcc++;
+			return mu < 0 ? 0 : mu;
+		}
+		const zm = Math.sqrt(Zx * Zx + Zy * Zy);
+		e = 2 * Math.sqrt(z2) * e + EPS * (2 * zm * dm + dm * dm + adc);            // error: amplify + inject
+		const ndzx = 2 * (zx * dzx - zy * dzy) + 1, ndzy = 2 * (zx * dzy + zy * dzx);   // z' = 2·z·z' + 1
+		dzx = ndzx; dzy = ndzy;
+		const ndx = 2 * (Zx * dx - Zy * dy) + (dx * dx - dy * dy) + dcx;            // δ' = 2·Z·δ + δ² + δc
+		const ndy = 2 * (Zx * dy + Zy * dx) + 2 * dx * dy + dcy;
+		dx = ndx; dy = ndy;
+		n++;
+		// Interior via REAL z-periodicity (Brent): compare z_n to a saved point. The O(1) reference
+		// difference (Z_n − Z_saved) is formed in DD so the test stays precise past the f64 wall; the
+		// δ diff is f64. Resolves in-set minibrot points in the cheap pass instead of via DD sharpening.
+		if (periodOn && n >= PERIOD_WARMUP && n <= refLen) {
+			const nxh = refZx[n], nxl = refZxl[n], nyh = refZy[n], nyl = refZyl[n];
+			if (pSaved) {
+				ddAdd(nxh, nxl, -szxh, -szxl); ddAdd(_dhi, _dlo, dx, 0); const drx = _dhi;   // (z_n − z_saved).x, DD
+				ddAdd(nyh, nyl, -szyh, -szyl); ddAdd(_dhi, _dlo, dy, 0); const dry = _dhi;
+				if (drx * drx + dry * dry < periodEps2) { iterAcc += n; perAcc++; return IN_SET; }
+			}
+			if (n === checkAt) {
+				ddAdd(nxh, nxl, dx, 0); szxh = _dhi; szxl = _dlo;                             // save z_n as DD
+				ddAdd(nyh, nyl, dy, 0); szyh = _dhi; szyl = _dlo;
+				pSaved = true; checkAt *= 2;
+			}
+		}
+	}
+	iterAcc += n; capAcc++;
+	return CAPPED;
+}
+
 // Band transfer: compress the escape count before it maps to color. Linear is the raw
 // count; sqrt and log grow slower as mu grows, so the per-pixel band rate stays roughly
 // constant across zoom WITHOUT referencing the zoom level. That makes the coloring both
@@ -358,9 +485,12 @@ function renderRegion(
 	function escapeAt(px: number, py: number): number {
 		const offX = (px * invW - 0.5) * view.spanX;
 		const offY = (py * invH - 0.5) * view.spanY;
+		if (usePert) {
+			return escapeSmoothPert(view.cx + offX, view.cy + offY, offX - refOffX, offY - refOffY, maxIters);
+		}
 		if (useDD) {
-			ddAdd(view.cx, 0, offX, 0); const crhi = _dhi, crlo = _dlo;
-			ddAdd(view.cy, 0, offY, 0); const cihi = _dhi, cilo = _dlo;
+			ddAdd(view.cx, view.cxLo, offX, 0); const crhi = _dhi, crlo = _dlo;
+			ddAdd(view.cy, view.cyLo, offY, 0); const cihi = _dhi, cilo = _dlo;
 			return escapeSmoothDD(crhi, crlo, cihi, cilo, maxIters);
 		}
 		return escapeSmooth(view.cx + offX, view.cy + offY, maxIters);
@@ -445,8 +575,8 @@ function sharpenPoints(
 		const offX = ((ox + lx + 0.5) * invW - 0.5) * view.spanX;
 		const offY = ((oy + ly + 0.5) * invH - 0.5) * view.spanY;
 		if (useDD) {
-			ddAdd(view.cx, 0, offX, 0); const crhi = _dhi, crlo = _dlo;
-			ddAdd(view.cy, 0, offY, 0); const cihi = _dhi, cilo = _dlo;
+			ddAdd(view.cx, view.cxLo, offX, 0); const crhi = _dhi, crlo = _dlo;
+			ddAdd(view.cy, view.cyLo, offY, 0); const cihi = _dhi, cilo = _dlo;
 			muOut[k] = escapeSmoothDD(crhi, crlo, cihi, cilo, maxIters);
 		} else {
 			muOut[k] = escapeSmooth(view.cx + offX, view.cy + offY, maxIters);

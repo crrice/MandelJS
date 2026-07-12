@@ -15,6 +15,9 @@
 const ITER_BASE = 1000;   // full-view budget
 const ITER_SLOPE = 600;   // extra iterations per octave (2x) of zoom
 const ITER_CAP = 20000;   // ceiling for the INITIAL pass (fast time-to-first-frame)
+const ITER_CAP_PERT = 60000;   // higher initial ceiling when the pass is perturbation — its iters are
+const PERT_ITER_MULT = 2;      // ~30x cheaper, so we afford budget = MULT × the depth formula (capped
+                               // here), resolving more filament detail up front instead of via idle DD.
 
 // Progressive sharpening. The initial pass caps at ITER_CAP so the first frame
 // lands fast; points that hit the cap unresolved (CAPPED) are then re-iterated on
@@ -54,15 +57,17 @@ const DD_SWITCH_RATIO = 8;
 // Worker pool
 //---------------------------------------------------------------------------\\
 
-const TILE_SIZE = 32;   // tile edge in px; small enough to load-balance, big
-                        // enough that per-tile messaging stays negligible
-const WORKER_CAP = 8;   // don't spawn more than this many workers
+const TILE_W = 20, TILE_H = 20;   // 20px square → 32×16 divisions (both powers of 2) = 512 tiles (2^9)
+                                  // on the 640×320 canvas (exact division, no ragged edges). ~21% SSAA-
+                                  // border recompute (~perimeter/area) — near the ~16px floor below which
+                                  // that overhead starts to dominate. Finer than 32×16 for the tail.
+const WORKER_CAP = 32;  // safety ceiling on the pool; actual count = min(this, hardwareConcurrency)
 
 interface TileMsg {
 	type: "tile"; gen: number;
 	ox: number; oy: number; tw: number; th: number;
 	canvasW: number; canvasH: number; view: View; maxIters: number; densityMul: number; mode: number;
-	usePeriod: boolean; periodEps2: number; useDD: boolean; bandMap: number;
+	usePeriod: boolean; periodEps2: number; useDD: boolean; usePert: boolean; pertRhoThresh: number; bandMap: number;
 	idx?: Int32Array;   // present => sharpen job: re-iterate only these capped tile-local pixels
 }
 interface DoneMsg {
@@ -102,12 +107,21 @@ function buildWorkerSource(): string {
 		"let _dhi = 0, _dlo = 0;",                  // DD op scratch
 		"const DD_SPLIT = " + DD_SPLIT + ";",
 		"let bandMap = 0;",
+		"let usePert = false;",
+		"let refZx = new Float64Array(1), refZy = new Float64Array(1), refLen = 0;",
+		"let refZxl = new Float64Array(1), refZyl = new Float64Array(1);",
+		"let refOffX = 0, refOffY = 0;",
+		"let pertRhoThresh = 0.1;",
+		"let _refGen = -1;",   // gen the cached reference orbit was computed for
 		"let iterAcc = 0, escAcc = 0, inAcc = 0, perAcc = 0, capAcc = 0;",
 		escapeSmooth.toString(),
 		ddAdd.toString(),
 		ddMul.toString(),
 		ddSq.toString(),
 		escapeSmoothDD.toString(),
+		refOrbitLen.toString(),
+		computeRef.toString(),
+		escapeSmoothPert.toString(),
 		bandTransform.toString(),
 		colorSample.toString(),
 		renderRegion.toString(),
@@ -119,6 +133,8 @@ function buildWorkerSource(): string {
 		"  periodOn = m.usePeriod;",
 		"  periodEps2 = m.periodEps2;",
 		"  useDD = m.useDD;",
+		"  usePert = m.usePert;",
+		"  pertRhoThresh = m.pertRhoThresh;",
 		"  bandMap = m.bandMap;",
 		"  iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;",
 		"  if (m.idx) {",   // sharpen: re-iterate only the listed capped points, packed results
@@ -129,6 +145,7 @@ function buildWorkerSource(): string {
 		"                  mu: muS.buffer, de: deS.buffer }, [muS.buffer, deS.buffer]);",
 		"    return;",
 		"  }",
+		"  if (usePert && m.gen !== _refGen) { computeRef(m.view, m.maxIters); _refGen = m.gen; }",   // reference once per gen
 		"  var n = m.tw * m.th;",
 		"  var out = new Uint32Array(n), muF = new Float32Array(n), deF = new Float32Array(n);",
 		"  renderRegion(out, muF, deF, m.tw, m.ox, m.oy, m.tw, m.th, m.canvasW, m.canvasH,",
@@ -175,6 +192,9 @@ class FractalRenderer {
 	private periodEps2 = PERIOD_EPS2; // zoom-scaled cycle-detection threshold (set per render)
 	private useDD = false; // double-double orbit precision (auto per view; set per render)
 	private ddOverride: boolean | null = null; // mandelDD() force on/off; null = auto-gate
+	private usePert = false; // perturbation fast path (deep zoom; follows useDD unless overridden)
+	private pertOverride: boolean | null = null; // mandelPert() force on/off; null = follow useDD
+	private pertRhoThresh = 0.1; // error-bound glitch-flag threshold (higher = fewer flags → less idle DD)
 	// Progressive sharpening. After the initial (fast, low-cap) frame lands, the
 	// idle worker pool re-iterates the CAPPED tiles at an escalating cap. `stage`
 	// is the escalation step (0 = initial frame); `undetermined` is the live count
@@ -264,6 +284,11 @@ class FractalRenderer {
 	// For A/B on the wall window (mandelDD(false) vs mandelDD(true)).
 	public setDD(on: boolean | null): void {
 		this.ddOverride = on;
+	}
+
+	// Force the perturbation fast path on/off for A/B (null = follow the DD auto-gate).
+	public setPert(on: boolean | null): void {
+		this.pertOverride = on;
 	}
 
 	// Switch to a different palette. Resets wrap/density to the palette's own
@@ -383,10 +408,10 @@ class FractalRenderer {
 		const W = canvas.width, H = canvas.height, mu = this.muField;
 		const tiles: TileJob[] = [];
 		let total = 0;
-		for (let oy = 0; oy < H; oy += TILE_SIZE) {
-			const th = Math.min(TILE_SIZE, H - oy);
-			for (let ox = 0; ox < W; ox += TILE_SIZE) {
-				const tw = Math.min(TILE_SIZE, W - ox);
+		for (let oy = 0; oy < H; oy += TILE_H) {
+			const th = Math.min(TILE_H, H - oy);
+			for (let ox = 0; ox < W; ox += TILE_W) {
+				const tw = Math.min(TILE_W, W - ox);
 				const idxArr: number[] = [];
 				for (let r = 0; r < th; r++) {
 					const row = (oy + r) * W + ox;
@@ -477,10 +502,11 @@ class FractalRenderer {
 	}
 
 	// Iterations grow with zoom depth (deeper => more, capped) unless overridden.
-	private itersForView(v: View): number {
+	private itersForView(v: View, usePert: boolean): number {
 		const zoom = DEFAULT_VIEW.spanX / v.spanX;
 		if (zoom <= 1) return ITER_BASE;
-		return Math.min(ITER_CAP, Math.round(ITER_BASE + ITER_SLOPE * Math.log2(zoom)));
+		const budget = Math.round(ITER_BASE + ITER_SLOPE * Math.log2(zoom));
+		return usePert ? Math.min(ITER_CAP_PERT, budget * PERT_ITER_MULT) : Math.min(ITER_CAP, budget);
 	}
 
 	// Cycle-detection ε² tightens with zoom. Longer deep-zoom orbits let a chaotic
@@ -528,16 +554,24 @@ class FractalRenderer {
 		return 1 / (this.densityBase * stretch);
 	}
 
-	public render(view: View, maxIters = this.itersForView(view)): void {
+	public render(view: View, maxItersArg?: number): void {
 		this.view = view;
 		this.densityMul = this.densityMulFor(view);
 		this.useDD = this.ddOverride !== null ? this.ddOverride : this.useDDFor(view);
+		this.usePert = this.pertOverride !== null ? this.pertOverride : this.useDD;   // perturbation where DD would engage
+		const maxIters = maxItersArg ?? this.itersForView(view, this.usePert);   // pert affords a higher initial cap
 		this.periodEps2 = this.periodEps2For(view, this.useDD);   // DD lets ε tighten further
 		if (this.onPrecision) this.onPrecision(this.useDD ? 128 : 64);   // 64×limbs
 		this.sharpenStage = 0;
 		this.undetermined = 0;
 		// Fresh view: clear any leftover sharpening readout until the first frame lands.
 		if (this.onProgress) this.onProgress({ working: 0, abandoned: 0, sharpening: false, done: false });
+
+		// Wash the previous frame toward grey so a new render is visibly "working" even when the fresh
+		// tiles match the old ones (a homogeneous region reads as frozen otherwise). Grey stays visible
+		// over any content (in-set black included); tiles paint back to full colour as they land.
+		ctx.fillStyle = "rgba(128, 128, 128, 0.5)";
+		ctx.fillRect(0, 0, canvas.width, canvas.height);
 
 		if (this.workers.length === 0) {
 			this.maxIters = maxIters;
@@ -551,9 +585,9 @@ class FractalRenderer {
 		// Full-canvas tile queue for the initial pass (no idx => full render).
 		const W = canvas.width, H = canvas.height;
 		const tiles: TileJob[] = [];
-		for (let oy = 0; oy < H; oy += TILE_SIZE)
-			for (let ox = 0; ox < W; ox += TILE_SIZE)
-				tiles.push({ ox, oy, tw: Math.min(TILE_SIZE, W - ox), th: Math.min(TILE_SIZE, H - oy) });
+		for (let oy = 0; oy < H; oy += TILE_H)
+			for (let ox = 0; ox < W; ox += TILE_W)
+				tiles.push({ ox, oy, tw: Math.min(TILE_W, W - ox), th: Math.min(TILE_H, H - oy) });
 		this.beginGeneration(maxIters, tiles);
 	}
 
@@ -580,9 +614,10 @@ class FractalRenderer {
 			ox: tile.ox, oy: tile.oy, tw: tile.tw, th: tile.th,
 			canvasW: canvas.width, canvasH: canvas.height,
 			view: this.view, maxIters: this.maxIters, densityMul: this.densityMul, mode: this.mode,
-			usePeriod: this.usePeriod, periodEps2: this.periodEps2, useDD: this.useDD, bandMap: this.bandMap,
+			usePeriod: this.usePeriod, periodEps2: this.periodEps2, useDD: this.useDD,
+			usePert: tile.idx ? false : this.usePert, pertRhoThresh: this.pertRhoThresh, bandMap: this.bandMap,
 		};
-		if (tile.idx) msg.idx = tile.idx;   // sharpen job: only these capped points
+		if (tile.idx) msg.idx = tile.idx;   // sharpen job: only these capped points (always DD)
 		this.workers[i].postMessage(msg);
 	}
 
@@ -594,8 +629,11 @@ class FractalRenderer {
 			s.iters += m.iters; s.esc += m.esc; s.ins += m.ins; s.per += m.per; s.cap += m.cap;
 		}
 		this.dispatch(i); // keep the worker fed from the current queue
-		// Last tile of this generation just landed — finalize + report.
-		if (m.gen === this.gen && this.queue.length === 0 && this.idle.every((x) => x)) {
+		// Generation done = the POOL is drained (queue empty + every worker idle), NOT a fact about this
+		// tile's gen. With many workers + rapid re-renders the last tile to land can be a STALE one from a
+		// superseded gen; gating this on m.gen would then skip completion entirely and strand the current
+		// gen — no sharpening, field full of CAPPED points, badge stuck at 0. (Apply above stays gen-guarded.)
+		if (this.queue.length === 0 && this.idle.every((x) => x)) {
 			this.onGenerationComplete();
 		}
 	}
@@ -658,6 +696,9 @@ class FractalRenderer {
 		periodEps2 = this.periodEps2;
 		useDD = this.useDD;
 		bandMap = this.bandMap;
+		usePert = this.usePert;
+		pertRhoThresh = this.pertRhoThresh;
+		if (usePert) computeRef(this.view, this.maxIters);
 		iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;
 		renderRegion(
 			data32, this.muField, this.deField, W, 0, 0, W, H, W, H, this.view, this.maxIters,

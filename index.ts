@@ -33,12 +33,17 @@ const CANVAS_ASPECT = canvas.width / canvas.height;
 function viewFromUrl(): View | null {
 	const p = new URLSearchParams(location.search);
 	const cx = parseFloat(p.get("cx") || ""), cy = parseFloat(p.get("cy") || ""), span = parseFloat(p.get("span") || "");
+	const cxLo = parseFloat(p.get("cxl") || "0"), cyLo = parseFloat(p.get("cyl") || "0");   // DD center lo-limbs (0 if absent)
 	if (!isFinite(cx) || !isFinite(cy) || !isFinite(span) || span <= 0) return null;
-	return { cx, cy, spanX: span, spanY: span / CANVAS_ASPECT };
+	return { cx, cxLo: isFinite(cxLo) ? cxLo : 0, cy, cyLo: isFinite(cyLo) ? cyLo : 0, spanX: span, spanY: span / CANVAS_ASPECT };
 }
 function syncUrl(v: View): void {
 	const p = new URLSearchParams(location.search);
 	p.set("cx", String(v.cx)); p.set("cy", String(v.cy)); p.set("span", String(v.spanX));
+	// DD center lo-limbs, only when nonzero (deep views) so shallow permalinks stay clean. Each limb is an
+	// f64 and String()↔parseFloat round-trips it EXACTLY, so cx+cxLo reconstructs the DD center bit-for-bit.
+	if (v.cxLo !== 0) p.set("cxl", String(v.cxLo)); else p.delete("cxl");
+	if (v.cyLo !== 0) p.set("cyl", String(v.cyLo)); else p.delete("cyl");
 	history.replaceState(null, "", "?" + p.toString());
 }
 
@@ -68,6 +73,7 @@ const dev = window as unknown as {
 	mandelSharpen: (on?: boolean) => void;
 	mandelBand: (n?: number) => void;
 	mandelDD: (on?: boolean | null) => void;
+	mandelPert: (on?: boolean | null) => void;
 };
 
 dev.mandelBench = async (n = 9) => {
@@ -110,6 +116,14 @@ dev.mandelBand = (n = 0) => { renderer.setBandMap(n); console.log("band map = " 
 dev.mandelDD = (on = true) => {
 	renderer.setDD(on);
 	console.log("DD precision " + (on === null ? "AUTO (zoom-gated)" : on ? "forced ON" : "forced OFF"));
+	renderer.render(view);
+};
+
+// Force the perturbation fast path for A/B at a deep window (null = follow the DD gate).
+//   mandelPert(false); await mandelBench(9);  mandelPert(true); await mandelBench(9);  mandelPert(null)
+dev.mandelPert = (on = true) => {
+	renderer.setPert(on);
+	console.log("perturbation " + (on === null ? "AUTO (follows DD gate)" : on ? "forced ON" : "forced OFF"));
 	renderer.render(view);
 };
 
@@ -220,9 +234,14 @@ zoomButton.addEventListener("click", () => {
 	const r = boxZoomer.getCurrentRect();
 	if (!r) return;
 	const W = canvas.width, H = canvas.height;
+	// Recenter in double-double: newCenter = oldCenter + boxOffset. In f64 the offset is lost once it
+	// drops below the center's ULP (~|c|·ε); ddAdd's twoSum keeps it, so the box lands where you drew it.
+	const offX = ((r[0] + r[2] / 2) / W - 0.5) * view.spanX;
+	const offY = ((r[1] + r[3] / 2) / H - 0.5) * view.spanY;
+	ddAdd(view.cx, view.cxLo, offX, 0); const ncx = _dhi, ncxLo = _dlo;
+	ddAdd(view.cy, view.cyLo, offY, 0); const ncy = _dhi, ncyLo = _dlo;
 	view = {
-		cx: view.cx + ((r[0] + r[2] / 2) / W - 0.5) * view.spanX,
-		cy: view.cy + ((r[1] + r[3] / 2) / H - 0.5) * view.spanY,
+		cx: ncx, cxLo: ncxLo, cy: ncy, cyLo: ncyLo,
 		spanX: view.spanX * (r[2] / W),
 		spanY: view.spanY * (r[3] / H),
 	};
