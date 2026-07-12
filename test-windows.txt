@@ -1,0 +1,2 @@
+128 bit minibrot:
+https://localhost/fractal-gen/?cx=-0.7050815446907845&cy=-0.35135614735306503&span=1.82079224493306e-14
