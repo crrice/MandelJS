@@ -155,6 +155,10 @@ let periodEps2 = PERIOD_EPS2;
 // only). Set per tile from the worker message, like periodOn; renderRegion reads it
 // to pick the f64 or DD sample path.
 let useDD = false;
+// Escape-time band transfer: 0 linear, 1 sqrt, 2 log2. A pure display choice (recolor,
+// no re-iterate). Set per tile like periodOn; colorSample reads it. sqrt/log give
+// zoom-stable, consistent banding across depth — see bandTransform.
+let bandMap = 0;
 // DD op result scratch (hi, lo). The DD primitives write their two-limb result here
 // instead of allocating a pair — keeps the hot path allocation-free, same trick as
 // deDist. Copy _dhi/_dlo into locals immediately after each call (they're clobbered
@@ -332,18 +336,30 @@ function escapeSmoothDD(crhi: number, crlo: number, cihi: number, cilo: number, 
 	return CAPPED;
 }
 
-// The ONE coloring transfer function: a (mu, deDist) sample -> packed RGBA. Every
-// path routes through this — renderRegion (worker) and colorizeField / pixelColor
-// (main thread) — so escape-time bands, distance coloring, and the auto-leveled ramp
-// can never drift out of sync (they used to be three hand-synced copies). Non-cyclic
-// escape-time uses a linear level window [lvlLo, lvlLo+lvlSpan]: the main thread passes
-// the view's auto-leveled mu range; the worker, which can't see that range, passes
-// (0, 1/densityMul) — algebraically a flat clamp. Self-contained for stringification
-// (DIST_SCALE only).
+// Band transfer: compress the escape count before it maps to color. Linear is the raw
+// count; sqrt and log grow slower as mu grows, so the per-pixel band rate stays roughly
+// constant across zoom WITHOUT referencing the zoom level. That makes the coloring both
+// consistent-banded and zoom-STABLE — a point keeps its color as you dive in (the
+// prerequisite for zoom animation), which the zoom-scaled density stretch can't give.
+// 0 = linear, 1 = sqrt, 2 = log2. Self-contained for stringification (Math only).
+function bandTransform(mu: number, bandMap: number): number {
+	if (bandMap === 1) return Math.sqrt(mu);
+	if (bandMap === 2) return Math.log2(1 + mu);
+	return mu;
+}
+
+// The ONE coloring transfer function: a (mu, deDist) sample -> packed RGBA. Every path
+// routes through this — renderRegion (worker) and colorizeField / pixelColor (main
+// thread) — so escape-time bands, distance coloring, and the auto-leveled ramp can never
+// drift out of sync (they used to be three hand-synced copies). Escape-time first passes
+// mu through bandTransform. Non-cyclic uses a level window [lvlLo, lvlHi] (transformed
+// the same way): the main thread passes the view's auto-leveled mu range; the worker,
+// which can't see it, passes (0, 1/densityMul) — algebraically a flat clamp for linear.
+// Self-contained for stringification (DIST_SCALE / bandTransform).
 function colorSample(
 	mu: number, de: number, lut: Uint32Array, inSet: number,
 	mode: number, cyclic: boolean, densityMul: number,
-	pixelSize: number, lvlLo: number, lvlSpan: number,
+	pixelSize: number, bandMap: number, lvlLo: number, lvlHi: number,
 ): number {
 	if (!isFinite(mu)) return inSet;                        // IN_SET or CAPPED -> in-set color
 	const lastIdx = lut.length - 1;
@@ -352,12 +368,15 @@ function colorSample(
 		td -= (td | 0);
 		return lut[(td * lastIdx) | 0];
 	}
+	const g = bandTransform(mu, bandMap);                   // compressed escape count
 	if (cyclic) {                                            // escape-time, wrapped bands
-		let t = mu * densityMul;
+		let t = g * densityMul;
 		t -= (t | 0);
 		return lut[(t * lastIdx) | 0];
 	}
-	let t = (mu - lvlLo) / lvlSpan;                          // escape-time, clamped level window
+	const glo = bandTransform(lvlLo, bandMap);              // level window, same transform
+	const ghi = bandTransform(lvlHi, bandMap);
+	let t = (g - glo) / (ghi > glo ? ghi - glo : 1);        // clamped level window
 	t = t < 0 ? 0 : t > 1 ? 1 : t;
 	return lut[(t * lastIdx) | 0];
 }
@@ -388,7 +407,7 @@ function renderRegion(
 	// Color a computed (mu, deDist) sample via the shared colorSample. The worker can't
 	// see the view's auto-level range, so it passes (0, 1/densityMul) — a flat clamp.
 	function colorOf(mu: number, de: number): number {
-		return colorSample(mu, de, lut, inSet, mode, cyclic, densityMul, pixelSize, 0, 1 / densityMul);
+		return colorSample(mu, de, lut, inSet, mode, cyclic, densityMul, pixelSize, bandMap, 0, 1 / densityMul);
 	}
 	// Escape value at a canvas-space sample (px,py already pixel/subpixel-centered).
 	// Below the f64 wall (useDD) the coordinate is built in double-double —
@@ -649,7 +668,7 @@ interface TileMsg {
 	type: "tile"; gen: number;
 	ox: number; oy: number; tw: number; th: number;
 	canvasW: number; canvasH: number; view: View; maxIters: number; densityMul: number; mode: number;
-	usePeriod: boolean; periodEps2: number; useDD: boolean;
+	usePeriod: boolean; periodEps2: number; useDD: boolean; bandMap: number;
 	idx?: Int32Array;   // present => sharpen job: re-iterate only these capped tile-local pixels
 }
 interface DoneMsg {
@@ -688,12 +707,14 @@ function buildWorkerSource(): string {
 		"let useDD = false;",                       // deep-view precision, set per tile
 		"let _dhi = 0, _dlo = 0;",                  // DD op scratch
 		"const DD_SPLIT = " + DD_SPLIT + ";",
+		"let bandMap = 0;",
 		"let iterAcc = 0, escAcc = 0, inAcc = 0, perAcc = 0, capAcc = 0;",
 		escapeSmooth.toString(),
 		ddAdd.toString(),
 		ddMul.toString(),
 		ddSq.toString(),
 		escapeSmoothDD.toString(),
+		bandTransform.toString(),
 		colorSample.toString(),
 		renderRegion.toString(),
 		sharpenPoints.toString(),
@@ -704,6 +725,7 @@ function buildWorkerSource(): string {
 		"  periodOn = m.usePeriod;",
 		"  periodEps2 = m.periodEps2;",
 		"  useDD = m.useDD;",
+		"  bandMap = m.bandMap;",
 		"  iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;",
 		"  if (m.idx) {",   // sharpen: re-iterate only the listed capped points, packed results
 		"    var muS = new Float32Array(m.idx.length), deS = new Float32Array(m.idx.length);",
@@ -737,6 +759,7 @@ class FractalRenderer {
 	private lut!: Uint32Array;
 	private inSet = 0;
 	private densityMul = 1 / 32;
+	private bandMap = 0;           // escape-time band transfer (0 linear / 1 sqrt / 2 log)
 	private mode = 0; // 0 = escape-time, 1 = distance
 	// Escape-count range of the current view, for the auto-leveled (non-cyclic)
 	// ramp. Recomputed from the field when each render completes; a monotonic
@@ -879,6 +902,15 @@ class FractalRenderer {
 		this.colorizeField();
 	}
 
+	// Set the escape-time band transfer (0 linear / 1 sqrt / 2 log). sqrt/log give
+	// zoom-consistent, zoom-stable banding and drop the zoom density stretch (see
+	// densityMulFor). A pure recolor from the stored field — instant, no re-iterate.
+	public setBandMap(n: number): void {
+		this.bandMap = n;
+		this.densityMul = this.densityMulFor(this.view);
+		this.colorizeField();
+	}
+
 	// Repaint the whole canvas from the stored 1-sample field with the current
 	// palette/mode — the coloring pass, run on the main thread, no iteration.
 	private colorizeField(): void {
@@ -886,15 +918,15 @@ class FractalRenderer {
 		const image = ctx.getImageData(0, 0, W, H);
 		const data32 = new Uint32Array(image.data.buffer);
 		const lut = this.lut, inSet = this.inSet;
-		const densityMul = this.densityMul, cyclic = this.wrap, mode = this.mode;
+		const densityMul = this.densityMul, cyclic = this.wrap, mode = this.mode, bandMap = this.bandMap;
 		const pixelSize = this.view.spanX / W;
 		const mu = this.muField, de = this.deField;
 		// Auto-leveled range for the non-cyclic escape-time ramp — normalizes mu to the
 		// view's escape-count range so the gradient spans the visible structure at any
 		// depth; cyclic and distance modes ignore it (see colorSample).
-		const lo = this.muLo, span = this.muHi > this.muLo ? this.muHi - this.muLo : 1;
+		const lo = this.muLo, hi = this.muHi;
 		for (let i = 0; i < N; i++) {
-			data32[i] = colorSample(mu[i], de[i], lut, inSet, mode, cyclic, densityMul, pixelSize, lo, span);
+			data32[i] = colorSample(mu[i], de[i], lut, inSet, mode, cyclic, densityMul, pixelSize, bandMap, lo, hi);
 		}
 		ctx.putImageData(image, 0, 0);
 	}
@@ -1093,7 +1125,10 @@ class FractalRenderer {
 	// Stretch a cyclic palette's period with zoom so color stops wrapping many
 	// times per pixel deep in. Ramp (non-cyclic) palettes clamp, so leave them be.
 	private densityMulFor(v: View): number {
-		if (!this.wrap) return 1 / this.densityBase;
+		// No zoom stretch for a ramp (clamped) or a compressed band-map — sqrt/log already
+		// hold the band rate roughly constant across depth, and the stretch would make them
+		// view-DEPENDENT (breaking zoom-stability). Only linear cyclic bands need it.
+		if (!this.wrap || this.bandMap !== 0) return 1 / this.densityBase;
 		const zoom = DEFAULT_VIEW.spanX / v.spanX;
 		const stretch = zoom > 1 ? Math.pow(zoom, COLOR_STRETCH_EXP) : 1;
 		return 1 / (this.densityBase * stretch);
@@ -1151,7 +1186,7 @@ class FractalRenderer {
 			ox: tile.ox, oy: tile.oy, tw: tile.tw, th: tile.th,
 			canvasW: canvas.width, canvasH: canvas.height,
 			view: this.view, maxIters: this.maxIters, densityMul: this.densityMul, mode: this.mode,
-			usePeriod: this.usePeriod, periodEps2: this.periodEps2, useDD: this.useDD,
+			usePeriod: this.usePeriod, periodEps2: this.periodEps2, useDD: this.useDD, bandMap: this.bandMap,
 		};
 		if (tile.idx) msg.idx = tile.idx;   // sharpen job: only these capped points
 		this.workers[i].postMessage(msg);
@@ -1207,9 +1242,8 @@ class FractalRenderer {
 	// Color one field sample (repaints a sharpened pixel) via the shared colorSample —
 	// the same function colorizeField and the worker use, so they can't diverge.
 	private pixelColor(m: number, deVal: number): number {
-		const lo = this.muLo, span = this.muHi > this.muLo ? this.muHi - this.muLo : 1;
 		return colorSample(m, deVal, this.lut, this.inSet, this.mode, this.wrap, this.densityMul,
-			this.view.spanX / canvas.width, lo, span);
+			this.view.spanX / canvas.width, this.bandMap, this.muLo, this.muHi);
 	}
 
 	// Copy a tile's (mu, deDist) field into the persistent full-canvas buffers.
@@ -1229,6 +1263,7 @@ class FractalRenderer {
 		periodOn = this.usePeriod;
 		periodEps2 = this.periodEps2;
 		useDD = this.useDD;
+		bandMap = this.bandMap;
 		iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;
 		renderRegion(
 			data32, this.muField, this.deField, W, 0, 0, W, H, W, H, this.view, this.maxIters,
@@ -1286,6 +1321,7 @@ const dev = window as unknown as {
 	mandelBench: (n?: number) => Promise<unknown>;
 	mandelPeriod: (on?: boolean) => void;
 	mandelSharpen: (on?: boolean) => void;
+	mandelBand: (n?: number) => void;
 	mandelDD: (on?: boolean | null) => void;
 };
 
@@ -1320,6 +1356,9 @@ dev.mandelPeriod = (on = true) => { renderer.setPeriod(on); console.log("periodi
 // Toggle progressive sharpening (idle re-iteration of undetermined points). e.g.
 //   mandelSharpen(false)  // freeze at the initial frame
 dev.mandelSharpen = (on = true) => { renderer.setSharpen(on); console.log("sharpening " + (on ? "ON" : "OFF")); };
+
+// Switch the escape-time band transfer for A/B. 0 linear, 1 sqrt, 2 log. e.g. mandelBand(1)
+dev.mandelBand = (n = 0) => { renderer.setBandMap(n); console.log("band map = " + (["linear", "sqrt", "log"][n] || n)); };
 
 // Force double-double precision for A/B on the wall window (null = auto-gate by zoom).
 //   mandelDD(false); await mandelBench(9);  mandelDD(true); await mandelBench(9);  mandelDD(null)
@@ -1481,6 +1520,13 @@ const densitySlider = document.querySelector(".density-slider") as HTMLInputElem
 if (densitySlider) {
 	densitySlider.value = String(currentPalette.density);
 	densitySlider.addEventListener("input", () => renderer.setDensity(Number(densitySlider.value)));
+}
+
+// Band transfer selector (escape-time): linear / sqrt / log. sqrt & log give consistent,
+// zoom-stable banding; instant recolor from the stored field.
+const bandSelect = document.querySelector(".band-select") as HTMLSelectElement | null;
+if (bandSelect) {
+	bandSelect.addEventListener("change", () => renderer.setBandMap(Number(bandSelect.value)));
 }
 
 const paletteSelect = document.querySelector(".palette-select") as HTMLSelectElement | null;
