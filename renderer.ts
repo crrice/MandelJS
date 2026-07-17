@@ -19,6 +19,28 @@ const ITER_CAP_PERT = 60000;   // higher initial ceiling when the pass is pertur
 const PERT_ITER_MULT = 2;      // ~30x cheaper, so we afford budget = MULT × the depth formula (capped
                                // here), resolving more filament detail up front instead of via idle DD.
 
+// Probe-based initial cap (f64 path). The zoom-only budget above is blind to a region's LOCAL
+// dwell: near a minibrot the escape time runs far past the formula's guess, so the first frame
+// caps out ~100% unresolved → all black, and sharpening then redoes it from scratch (the low
+// pass is pure waste). Instead, sample the view's actual escape-time distribution and size the
+// first pass to resolve ~FF_PROBE_PCT of it in ONE pass — a good first frame AND less total work.
+// Adaptive: an easy window probes low → the same fast first frame as before. Measured (minibrot
+// window): current FF@20k+IS = 56k iters/px, 0% first frame; a single probed pass ≈ 37k iters/px,
+// ~99% first frame. Clamped to FF_SUPER_CAP so a very deep window still lands a bounded first
+// frame and leaves the tail to sharpening (where the provisional heat underlay carries it).
+const FF_PROBE_NX = 20, FF_PROBE_NY = 10;   // sparse dwell-probe grid (200 pts, 2:1 canvas aspect)
+const FF_PROBE_PCT = 0.95;                   // target percentile of the sampled dwell distribution
+const FF_PROBE_MARGIN = 1.3;                 // bump above p95 to catch the near-tail (~98–99% resolved)
+// First-frame COMPUTE BUDGET (mean iters/px) — the ceiling on the probed cap, in place of a hardcoded
+// iteration count. It scales with zoom depth so deeper dives are allowed proportionally more first-frame
+// work ("more time for deeper zooms", in deterministic form). When the budget can't cover the dwell (a
+// very deep / high-dwell window), the cap lands where the budget runs out and the tail falls to
+// sharpening + the provisional heat. The probe measures dwell to a multiple of the budget so both the
+// percentile target and the budget are estimated accurately; that ceiling scales with depth too.
+const FF_BUDGET_BASE = 2000;       // budget at zoom 1 (iters/px)
+const FF_BUDGET_SLOPE = 1200;      // + iters/px per octave (log2) of zoom
+const FF_PROBE_CEIL_MULT = 6;      // probe iterates to this × the budget (dwell measurement ceiling)
+
 // Progressive sharpening. The initial pass caps at ITER_CAP so the first frame
 // lands fast; points that hit the cap unresolved (CAPPED) are then re-iterated on
 // the idle worker pool at a cap that escalates ×SHARPEN_MULT per stage. Rather
@@ -35,6 +57,12 @@ const SHARPEN_MULT = 10;              // cap multiplier per sharpening stage
 const SHARPEN_CEILING = 100_000_000;  // past this, points are precision-limited, not iteration-limited
 const SHARPEN_MIN_YIELD = 0.01;       // a stage resolving < this share of what remained is "unproductive"
 const SHARPEN_CHEAP_MS = 150;         // ...but a stage faster than this is a free tickle — keep going anyway
+// Perturbation-first sharpening ceiling. A pert window sharpens its CAPPED pixels in the cheap f64
+// perturbation path FIRST (cap-limited pixels escape as the cap rises; only true glitches stay capped),
+// then hands the glitchy remainder to exact DD. Perturbation stores the reference orbit as arrays
+// (~32 B/iter × workers), so we stop escalating the pert cap here and switch to DD (which needs no
+// stored reference) for anything deeper. Cap-limited pixels almost always resolve well below this.
+const PERT_SHARPEN_CEIL = 1_000_000;
 
 // Color-frequency control. Deep in, the smooth count changes so fast per pixel
 // that a fixed color cycle wraps many times between neighbors — chromatic
@@ -68,23 +96,28 @@ interface TileMsg {
 	ox: number; oy: number; tw: number; th: number;
 	canvasW: number; canvasH: number; view: View; maxIters: number; densityMul: number; mode: number;
 	usePeriod: boolean; periodEps2: number; useDD: boolean; usePert: boolean; pertRhoThresh: number; bandMap: number;
-	idx?: Int32Array;   // present => sharpen job: re-iterate only these capped tile-local pixels
+	ssaaOn?: boolean;   // full-render only: false => 1-sample fast frame (initial pass); default true (sync path)
+	idx?: Int32Array;   // present => point job (sharpen or ssaa) over these tile-local pixels
+	ssaaJob?: boolean;  // with idx => background SSAA (supersample edges → colors) instead of sharpen (re-iterate → mu/de)
+	lvlLo?: number; lvlHi?: number;   // ssaa job: the main thread's auto-level window, so AA colors match the resting frame
 }
 interface DoneMsg {
 	type: "done"; gen: number;
 	ox: number; oy: number; tw: number; th: number;
 	iters: number; esc: number; ins: number; per: number; cap: number;
-	mu: ArrayBuffer; de: ArrayBuffer;
-	buf?: ArrayBuffer;   // full-tile pixels (absent for sharpen results)
-	idx?: Int32Array;    // sharpen results: mu/de are packed per-capped-point, aligned to idx
+	mu?: ArrayBuffer; de?: ArrayBuffer;
+	buf?: ArrayBuffer;   // full-tile pixels (absent for point-job results)
+	idx?: Int32Array;    // point-job results: packed per-point, aligned to idx
+	ssaaJob?: boolean;   // true => `col` holds packed averaged colors (SSAA); else mu/de (sharpen)
+	col?: ArrayBuffer;   // ssaa results: averaged packed colors, aligned to idx
 }
 
 // Per-generation instrumentation: total iterations + outcome tallies.
 interface GenStats { iters: number; esc: number; ins: number; per: number; cap: number; }
 
-// A unit of render work: a tile rectangle. With `idx` (capped tile-local pixel
-// indices) it's a sharpening job — only those points are re-iterated.
-interface TileJob { ox: number; oy: number; tw: number; th: number; idx?: Int32Array; }
+// A unit of render work: a tile rectangle. With `idx` it's a point job over those tile-local
+// pixels — sharpen (re-iterate capped) by default, or SSAA (supersample edges) when ssaaJob.
+interface TileJob { ox: number; oy: number; tw: number; th: number; idx?: Int32Array; ssaaJob?: boolean; }
 
 // The worker body: the kernel + primitive (stringified from above) plus a tiny
 // message loop. It holds the current palette and renders whatever tile it's
@@ -98,6 +131,7 @@ function buildWorkerSource(): string {
 		"const SS = " + SS + ";",
 		"const EDGE_TH = " + EDGE_TH + ";",
 		"const PERIOD_WARMUP = " + PERIOD_WARMUP + ";",
+		"const PERT_GATE2 = " + PERT_GATE2 + ";",
 		"const IN_SET = Infinity;",
 			"const CAPPED = -Infinity;",
 		"let deDist = 0;",
@@ -107,6 +141,8 @@ function buildWorkerSource(): string {
 		"let _dhi = 0, _dlo = 0;",                  // DD op scratch
 		"const DD_SPLIT = " + DD_SPLIT + ";",
 		"let bandMap = 0;",
+		"let provOn = false, provLo = 0, provHi = 1, provLut = null;",   // provisional CAPPED coloring: workers keep it OFF (→black per tile); main thread recolors
+		"let ssaaOn = true;",   // SSAA toggle; initial tiles send false (1-sample fast frame), SSAA runs as a background pass
 		"let usePert = false;",
 		"let refZx = new Float64Array(1), refZy = new Float64Array(1), refLen = 0;",
 		"let refZxl = new Float64Array(1), refZyl = new Float64Array(1);",
@@ -122,10 +158,12 @@ function buildWorkerSource(): string {
 		refOrbitLen.toString(),
 		computeRef.toString(),
 		escapeSmoothPert.toString(),
+		escapeAtPt.toString(),
 		bandTransform.toString(),
 		colorSample.toString(),
 		renderRegion.toString(),
 		sharpenPoints.toString(),
+		ssaaPoints.toString(),
 		"let PAL = null;",
 		"onmessage = function (e) {",
 		"  var m = e.data;",
@@ -136,7 +174,18 @@ function buildWorkerSource(): string {
 		"  usePert = m.usePert;",
 		"  pertRhoThresh = m.pertRhoThresh;",
 		"  bandMap = m.bandMap;",
+		"  ssaaOn = m.ssaaOn !== false;",   // default true; initial full-render sends false
 		"  iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;",
+		"  if (usePert && m.gen !== _refGen) { computeRef(m.view, m.maxIters); _refGen = m.gen; }",   // reference once per gen (covers full + ssaa jobs)
+		"  if (m.idx && m.ssaaJob) {",   // background SSAA: supersample only the listed edge points, packed colors
+		"    var colS = new Uint32Array(m.idx.length);",
+		"    ssaaPoints(colS, m.idx, m.ox, m.oy, m.tw, m.canvasW, m.canvasH, m.view, m.maxIters,",
+		"               PAL.lut, PAL.inSet, m.densityMul, PAL.cyclic, m.mode, m.lvlLo, m.lvlHi);",
+		"    postMessage({ type: 'done', gen: m.gen, ox: m.ox, oy: m.oy, tw: m.tw, th: m.th, idx: m.idx, ssaaJob: true,",
+		"                  iters: iterAcc, esc: escAcc, ins: inAcc, per: perAcc, cap: capAcc,",
+		"                  col: colS.buffer }, [colS.buffer]);",
+		"    return;",
+		"  }",
 		"  if (m.idx) {",   // sharpen: re-iterate only the listed capped points, packed results
 		"    var muS = new Float32Array(m.idx.length), deS = new Float32Array(m.idx.length);",
 		"    sharpenPoints(muS, deS, m.idx, m.ox, m.oy, m.tw, m.canvasW, m.canvasH, m.view, m.maxIters);",
@@ -145,7 +194,6 @@ function buildWorkerSource(): string {
 		"                  mu: muS.buffer, de: deS.buffer }, [muS.buffer, deS.buffer]);",
 		"    return;",
 		"  }",
-		"  if (usePert && m.gen !== _refGen) { computeRef(m.view, m.maxIters); _refGen = m.gen; }",   // reference once per gen
 		"  var n = m.tw * m.th;",
 		"  var out = new Uint32Array(n), muF = new Float32Array(n), deF = new Float32Array(n);",
 		"  renderRegion(out, muF, deF, m.tw, m.ox, m.oy, m.tw, m.th, m.canvasW, m.canvasH,",
@@ -182,6 +230,14 @@ class FractalRenderer {
 	// thread instantly, without re-iterating.
 	private muField: Float32Array;
 	private deField: Float32Array;
+	// Provisional coloring of CAPPED pixels (see kernel.ts): shade the first frame's
+	// unresolved points by their log|z'| structure signal (stored in deField) through a
+	// paper→ink ramp, instead of leaving them black. On by default; mandelProv() A/Bs it.
+	// provLo/provHi is the auto-leveled range over the current frame's CAPPED pixels.
+	private provOn = true;
+	private provLut!: Uint32Array;
+	private provLo = 0;
+	private provHi = 1;
 	// Instrumentation for the current generation: wall-clock + iteration totals +
 	// outcome tallies (escaped / proven in-set / capped).
 	private renderStart = 0;
@@ -206,6 +262,16 @@ class FractalRenderer {
 	private sharpenOn = true;
 	private sharpenStage = 0;
 	private undetermined = 0;
+	// Sharpening sub-phase for a perturbation window: 'pert' re-iterates CAPPED pixels in the cheap
+	// perturbation path (resolving cap-limited pixels), then switches to 'dd' for the glitchy remainder
+	// that perturbation can't decide. Non-pert windows stay 'dd' (their sharpen is plain f64/DD).
+	private sharpenMode: "pert" | "dd" = "dd";
+	// Background anti-aliasing. The initial pass renders 1-sample (fast); once sharpening
+	// settles, a single generation supersamples only the edge pixels (ssaaPoints) to anti-alias
+	// the resting frame — off the critical path, so the first frame stays fast. ssaaPhase marks
+	// that the in-flight generation is that SSAA pass; ssaaRefine gates the feature (A/B).
+	private ssaaRefine = true;
+	private ssaaPhase = false;
 	public onProgress: ((p: { working: number; abandoned: number; sharpening: boolean; done: boolean }) => void) | null = null;
 	// Fired each render with the working precision in BITS (64 = f64, 128 = double-double,
 	// 192 = triple-double, …), so the UI can show it and explain the slower deep renders.
@@ -251,6 +317,9 @@ class FractalRenderer {
 		const built = this.palette.build(ink, paper, this.wrap);
 		this.lut = built.lut;
 		this.inSet = built.inSet;
+		// Provisional CAPPED ramp: a theme-aware paper→ink gradient (the `subtle` palette),
+		// so the developing first frame reads as a quiet monochrome underlay under any palette.
+		this.provLut = PALETTES.subtle.build(ink, paper, false).lut;
 	}
 
 	// Each worker gets its own copy of the LUT (structured clone, ~4KB).
@@ -289,6 +358,15 @@ class FractalRenderer {
 	// Force the perturbation fast path on/off for A/B (null = follow the DD auto-gate).
 	public setPert(on: boolean | null): void {
 		this.pertOverride = on;
+	}
+
+	// Toggle provisional CAPPED coloring on/off and recolor instantly from the stored field
+	// — the live A/B of the developing-underlay vs the old all-black first frame. Freeze the
+	// frame first (mandelSharpen(false)) to hold CAPPED pixels for a clean comparison.
+	public setProv(on: boolean): void {
+		this.provOn = on;
+		if (on) this.computeProvLevels();
+		this.colorizeField();
 	}
 
 	// Switch to a different palette. Resets wrap/density to the palette's own
@@ -340,6 +418,9 @@ class FractalRenderer {
 		const densityMul = this.densityMul, cyclic = this.wrap, mode = this.mode, bandMap = this.bandMap;
 		const pixelSize = this.view.spanX / W;
 		const mu = this.muField, de = this.deField;
+		// Push provisional-coloring state into the kernel globals colorSample reads, so CAPPED
+		// pixels shade via the paper→ink ramp (or stay in-set when provOn is off).
+		provOn = this.provOn; provLo = this.provLo; provHi = this.provHi; provLut = this.provLut;
 		// Auto-leveled range for the non-cyclic escape-time ramp — normalizes mu to the
 		// view's escape-count range so the gradient spans the visible structure at any
 		// depth; cyclic and distance modes ignore it (see colorSample).
@@ -379,13 +460,64 @@ class FractalRenderer {
 		if (this.muHi <= this.muLo) this.muHi = this.muLo + 1;
 	}
 
+	// Pack a provisional heat color for one CAPPED pixel's structure signal (log|z'|),
+	// leveled to the current [provLo, provHi]. Used to paint each tile as it lands.
+	private provColor(logDz: number): number {
+		const span = this.provHi > this.provLo ? this.provHi - this.provLo : 1;
+		let t = (logDz - this.provLo) / span;
+		t = t < 0 ? 0 : t > 1 ? 1 : t;
+		return this.provLut[(t * (this.provLut.length - 1)) | 0];
+	}
+
+	// Grow this frame's running provisional range to cover a tile's CAPPED pixels, so tiles
+	// can paint their heat as they arrive — before the whole frame (hence a global level) exists.
+	// computeProvLevels replaces this with the clipped global range once the pass completes.
+	private updateProvRange(mu: Float32Array, de: Float32Array): void {
+		let lo = this.provLo, hi = this.provHi;
+		for (let p = 0; p < mu.length; p++) {
+			if (mu[p] === CAPPED) { const v = de[p]; if (isFinite(v)) { if (v < lo) lo = v; if (v > hi) hi = v; } }
+		}
+		this.provLo = lo; this.provHi = hi;
+	}
+
+	// Auto-level the provisional structure signal (log|z'|, stored in deField) over just
+	// the CAPPED pixels, so the paper→ink underlay spans their range — 1%/99% clipped like
+	// computeLevels so a few near-boundary outliers don't flatten it. No-op if nothing capped.
+	private computeProvLevels(): void {
+		const mu = this.muField, de = this.deField, N = mu.length;
+		let mn = Infinity, mx = -Infinity, cnt = 0;
+		for (let i = 0; i < N; i++) {
+			if (mu[i] === CAPPED) { const v = de[i]; if (isFinite(v)) { cnt++; if (v < mn) mn = v; if (v > mx) mx = v; } }
+		}
+		if (cnt === 0 || mx <= mn) { this.provLo = 0; this.provHi = 1; return; }
+		const BINS = 256;
+		const hist = new Uint32Array(BINS);
+		const scale = (BINS - 1) / (mx - mn);
+		for (let i = 0; i < N; i++) {
+			if (mu[i] === CAPPED) { const v = de[i]; if (isFinite(v)) hist[((v - mn) * scale) | 0]++; }
+		}
+		const loTarget = cnt * 0.01, hiTarget = cnt * 0.99;
+		let acc = 0, loBin = 0, hiBin = BINS - 1;
+		for (let b = 0; b < BINS; b++) { acc += hist[b]; if (acc >= loTarget) { loBin = b; break; } }
+		acc = 0;
+		for (let b = 0; b < BINS; b++) { acc += hist[b]; if (acc >= hiTarget) { hiBin = b; break; } }
+		this.provLo = mn + loBin / scale;
+		this.provHi = mn + hiBin / scale;
+		if (this.provHi <= this.provLo) this.provHi = this.provLo + 1;
+	}
+
 	// Called once a render generation fully lands. Refresh the auto-level range
 	// (kept current so a later wrap-off switch has it), and for a non-cyclic
 	// escape-time view, repaint from the field so the ramp spans the structure —
 	// the workers colored progressively with a flat clamp; this snaps it right.
+	// On the initial frame, also level + paint the provisional CAPPED underlay (workers
+	// left those pixels black), so a high-dwell all-CAPPED frame develops instead of blacking out.
 	private finalizeColors(): void {
 		this.computeLevels();
-		if (!this.wrap && this.mode === 0) this.colorizeField();
+		if (this.provOn && this.sharpenStage === 0) this.computeProvLevels();
+		// Skip the recolor after the SSAA generation — colorizeField repaints from the 1-sample
+		// field and would clobber the just-blitted anti-aliased edge pixels (matters for non-cyclic).
+		if (!this.ssaaPhase && ((this.provOn && this.sharpenStage === 0) || (!this.wrap && this.mode === 0))) this.colorizeField();
 	}
 
 	// Fired once a render generation fully lands (worker or sync path): auto-level
@@ -424,17 +556,87 @@ class FractalRenderer {
 		return { count: total, tiles };
 	}
 
+	// Scan the resolved 1-sample field for EDGE pixels (colour differs from a 4-neighbour by
+	// > EDGE_TH), grouped into tiles, for the background SSAA pass. Colours are recomputed from
+	// the stored (mu, de) field — the same coloring the resting frame uses — so cross-tile edges
+	// are found correctly with no per-tile border. Same edge criterion as the old inline
+	// renderRegion SSAA, so the deferred pass anti-aliases exactly the pixels it would have.
+	private scanEdges(): { count: number; tiles: TileJob[] } {
+		const W = canvas.width, H = canvas.height, N = W * H;
+		provOn = this.provOn; provLo = this.provLo; provHi = this.provHi; provLut = this.provLut;
+		const mu = this.muField, de = this.deField, lut = this.lut, inSet = this.inSet;
+		const densityMul = this.densityMul, cyclic = this.wrap, mode = this.mode, bandMap = this.bandMap;
+		const pixelSize = this.view.spanX / W, lo = this.muLo, hi = this.muHi;
+		const col = new Uint32Array(N);
+		for (let i = 0; i < N; i++) col[i] = colorSample(mu[i], de[i], lut, inSet, mode, cyclic, densityMul, pixelSize, bandMap, lo, hi);
+		const cd = (a: number, b: number): number =>
+			Math.abs((a & 255) - (b & 255)) + Math.abs(((a >> 8) & 255) - ((b >> 8) & 255)) + Math.abs(((a >> 16) & 255) - ((b >> 16) & 255));
+		const tiles: TileJob[] = [];
+		let total = 0;
+		for (let oy = 0; oy < H; oy += TILE_H) {
+			const th = Math.min(TILE_H, H - oy);
+			for (let ox = 0; ox < W; ox += TILE_W) {
+				const tw = Math.min(TILE_W, W - ox);
+				const idxArr: number[] = [];
+				for (let r = 0; r < th; r++) {
+					const gy = oy + r;
+					for (let k = 0; k < tw; k++) {
+						const gx = ox + k, gi = gy * W + gx, c = col[gi];
+						if ((gx > 0 && cd(c, col[gi - 1]) > EDGE_TH) ||
+							(gx < W - 1 && cd(c, col[gi + 1]) > EDGE_TH) ||
+							(gy > 0 && cd(c, col[gi - W]) > EDGE_TH) ||
+							(gy < H - 1 && cd(c, col[gi + W]) > EDGE_TH)) idxArr.push(r * tw + k);
+					}
+				}
+				if (idxArr.length > 0) { tiles.push({ ox, oy, tw, th, idx: Int32Array.from(idxArr), ssaaJob: true }); total += idxArr.length; }
+			}
+		}
+		tiles.sort((a, b) => b.idx!.length - a.idx!.length); // LPT: heaviest tiles first
+		return { count: total, tiles };
+	}
+
 	// Post-generation hook: refresh the undetermined count, drive the UI, and — if
 	// anything is still capped and we haven't reached the target cap — kick the next
 	// sharpening stage on the (now idle) pool at a higher cap over just those tiles.
 	// A superseding view bumps the generation, so a stage scheduled here is
 	// abandoned before it paints if the user has moved on.
 	private afterGeneration(): void {
-		if (this.workers.length === 0 || !this.sharpenOn) return;
+		if (this.workers.length === 0) return;
+		// The just-completed generation WAS the background SSAA pass → the frame is fully
+		// resolved and anti-aliased. Nothing more to schedule.
+		if (this.ssaaPhase) {
+			this.ssaaPhase = false;
+			if (this.onProgress) this.onProgress({ working: 0, abandoned: this.undetermined, sharpening: false, done: true });
+			return;
+		}
+		if (!this.sharpenOn) return;   // clean initial-frame path (bench): no sharpen, no AA
 		const prev = this.undetermined;                       // capped count entering this stage
 		const { count, tiles } = this.scanCapped();           // capped count after it
 		const resolved = this.sharpenStage === 0 ? 0 : prev - count;
 		this.undetermined = count;
+
+		// Perturbation-first sharpening (pert windows). Re-iterate the CAPPED pixels in the cheap f64
+		// perturbation path: cap-limited pixels escape as the cap rises; only genuine glitches stay
+		// CAPPED (perturbation never resolves them). Keep escalating while it's still RESOLVING pixels
+		// — productivity only, NOT the "cheap" clause, since pert is always cheap and would otherwise
+		// escalate forever. When pert stops helping (or its reference orbit would grow past
+		// PERT_SHARPEN_CEIL), hand the glitchy remainder to exact DD instead of dumping every capped
+		// pixel there up front. This is what keeps perturbation working as long as it actually helps.
+		if (this.sharpenMode === "pert" && count > 0) {
+			const yielded = prev > 0 ? resolved / prev : 1;
+			const productive = this.sharpenStage === 0 || yielded >= SHARPEN_MIN_YIELD;
+			this.workingLive = count;
+			if (this.onProgress) this.onProgress({ working: count, abandoned: 0, sharpening: true, done: false });
+			if (productive && this.maxIters < PERT_SHARPEN_CEIL) {
+				this.sharpenStage++;
+				this.beginGeneration(Math.min(PERT_SHARPEN_CEIL, Math.round(this.maxIters * SHARPEN_MULT)), tiles);
+			} else {
+				this.sharpenMode = "dd";   // perturbation exhausted → DD the remainder (same cap; DD escalates from here)
+				this.beginGeneration(this.maxIters, tiles);
+			}
+			return;
+		}
+
 		const done = this.sharpenDone(count, prev, tiles.length, resolved);
 		// While sharpening, the survivors are "working"; once we stop, whatever is
 		// still capped becomes "abandoned" — so the working bucket ticks down to 0
@@ -444,11 +646,22 @@ class FractalRenderer {
 				? { working: 0, abandoned: count, sharpening: false, done: true }
 				: { working: count, abandoned: 0, sharpening: true, done: false });
 		}
-		if (done) return;
+		if (done) { this.maybeStartSSAA(); return; }   // sharpening settled → anti-alias the edges in the background
 		this.sharpenStage++;
 		this.workingLive = count;   // entering capped count; onDone ticks it down live per tile
 		const nextCap = Math.min(SHARPEN_CEILING, Math.round(this.maxIters * SHARPEN_MULT));
 		this.beginGeneration(nextCap, tiles);   // each tile carries its capped-point idx
+	}
+
+	// One-shot background anti-aliasing: supersample only the edge pixels of the now-resolved
+	// frame (ssaaPoints), so the resting image is crisp without the initial pass ever paying the
+	// SSAA cost. Started once, after sharpening settles; ssaaPhase marks the in-flight generation.
+	private maybeStartSSAA(): void {
+		if (!this.ssaaRefine || this.ssaaPhase) return;
+		const { count, tiles } = this.scanEdges();
+		if (count === 0) return;
+		this.ssaaPhase = true;
+		this.beginGeneration(this.maxIters, tiles);   // maxIters carries through; tiles hold edge idx + ssaaJob
 	}
 
 	// Whether to stop escalating. Continue while the last stage stayed worth it —
@@ -509,6 +722,58 @@ class FractalRenderer {
 		return usePert ? Math.min(ITER_CAP_PERT, budget * PERT_ITER_MULT) : Math.min(ITER_CAP, budget);
 	}
 
+	// Probe the view's actual dwell (escape-time) distribution on a sparse grid, then size the
+	// first-pass cap to resolve ~FF_PROBE_PCT of it in ONE pass. Replaces the zoom-only formula's
+	// blind clamp for the f64 path: a high-dwell (e.g. near-minibrot) window escapes far later than
+	// the formula guesses, so the formula's cap yields an all-black first frame that sharpening then
+	// redoes. Runs the same f64 kernel the render uses, with periodicity on (so interior probe points
+	// resolve early and don't drive the cap). Clamped to [formula floor, FF_SUPER_CAP]; the residual
+	// beyond the cap falls to sharpening. Cost: FF_PROBE_NX·NY points × their dwell (≈tens of ms).
+	private probeCap(view: View): number {
+		const floor = this.itersForView(view, false);   // never below the current formula/clamp
+		const zoom = DEFAULT_VIEW.spanX / view.spanX;
+		const budgetPerPx = FF_BUDGET_BASE + FF_BUDGET_SLOPE * Math.max(0, Math.log2(zoom));   // scales with depth
+		const probeCeil = Math.max(floor, Math.round(budgetPerPx * FF_PROBE_CEIL_MULT));       // dwell measurement ceiling
+		periodOn = this.usePeriod;                        // kernel globals escapeSmooth reads
+		periodEps2 = this.periodEps2;
+		const dwells: number[] = [];
+		for (let j = 0; j < FF_PROBE_NY; j++) {
+			const offY = ((j + 0.5) / FF_PROBE_NY - 0.5) * view.spanY;
+			for (let i = 0; i < FF_PROBE_NX; i++) {
+				const offX = ((i + 0.5) / FF_PROBE_NX - 0.5) * view.spanX;
+				const mu = escapeSmooth(view.cx + offX, view.cy + offY, probeCeil);
+				if (mu === CAPPED) dwells.push(probeCeil);   // unresolved by the ceiling → drives cap up
+				else if (isFinite(mu)) dwells.push(mu);        // escaped at ~mu → its dwell
+				// IN_SET (+∞): interior, resolves via periodicity regardless of cap → ignore
+			}
+		}
+		if (dwells.length === 0) return floor;               // all-interior view → nothing to size against
+		dwells.sort((a, b) => a - b);
+		// Quality target: the cap that resolves ~FF_PROBE_PCT of the escaping pixels this pass.
+		const pct = dwells[Math.min(dwells.length - 1, Math.floor(dwells.length * FF_PROBE_PCT))];
+		const target = Math.ceil(pct * FF_PROBE_MARGIN);
+		// Budget ceiling: the largest cap whose mean iters/px stays within the depth-scaled budget.
+		const budgetCap = this.capForBudget(dwells, budgetPerPx, probeCeil);
+		return Math.max(floor, Math.min(target, budgetCap, probeCeil));
+	}
+
+	// Largest cap C such that the sampled mean of min(dwell, C) stays within budgetPerPx. Mean-iters
+	// is monotonic in C, so binary-search between 0 and `hi`; returns `hi` if the budget already
+	// covers the whole probe range (i.e. the budget doesn't bind and the percentile target wins).
+	private capForBudget(sortedDwells: number[], budgetPerPx: number, hi: number): number {
+		const n = sortedDwells.length;
+		const meanAt = (C: number): number => {
+			let s = 0; for (let i = 0; i < n; i++) s += Math.min(sortedDwells[i], C); return s / n;
+		};
+		if (meanAt(hi) <= budgetPerPx) return hi;
+		let lo = 0, h = hi;
+		for (let it = 0; it < 40; it++) {
+			const mid = (lo + h) / 2;
+			if (meanAt(mid) <= budgetPerPx) lo = mid; else h = mid;
+		}
+		return Math.floor(lo);
+	}
+
 	// Cycle-detection ε² tightens with zoom. Longer deep-zoom orbits let a chaotic
 	// exterior orbit brush within the loose threshold by recurrence (false in-set),
 	// so above ZOOM0 we shrink ε² ∝ (zoom)^-0.8 (ε ∝ zoom^-0.4), floored at the f64
@@ -559,11 +824,13 @@ class FractalRenderer {
 		this.densityMul = this.densityMulFor(view);
 		this.useDD = this.ddOverride !== null ? this.ddOverride : this.useDDFor(view);
 		this.usePert = this.pertOverride !== null ? this.pertOverride : this.useDD;   // perturbation where DD would engage
-		const maxIters = maxItersArg ?? this.itersForView(view, this.usePert);   // pert affords a higher initial cap
-		this.periodEps2 = this.periodEps2For(view, this.useDD);   // DD lets ε tighten further
+		this.periodEps2 = this.periodEps2For(view, this.useDD);   // DD lets ε tighten further (probe below needs it set)
 		if (this.onPrecision) this.onPrecision(this.useDD ? 128 : 64);   // 64×limbs
 		this.sharpenStage = 0;
 		this.undetermined = 0;
+		this.ssaaPhase = false;
+		this.sharpenMode = this.usePert ? "pert" : "dd";   // pert windows sharpen in perturbation first, then DD
+		this.provLo = Infinity; this.provHi = -Infinity;   // reset the per-frame running provisional range
 		// Fresh view: clear any leftover sharpening readout until the first frame lands.
 		if (this.onProgress) this.onProgress({ working: 0, abandoned: 0, sharpening: false, done: false });
 
@@ -572,6 +839,11 @@ class FractalRenderer {
 		// over any content (in-set black included); tiles paint back to full colour as they land.
 		ctx.fillStyle = "rgba(128, 128, 128, 0.5)";
 		ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+		// Size the initial cap. f64 path: probe the view's actual dwell so a high-dwell window gets a
+		// cap that resolves its first frame (not the zoom-only formula's blind guess → all-black). Runs
+		// after the wash so the wash is instant. DD/pert keep the formula/pert budget for now.
+		const maxIters = maxItersArg ?? (this.useDD || this.usePert ? this.itersForView(view, this.usePert) : this.probeCap(view));
 
 		if (this.workers.length === 0) {
 			this.maxIters = maxIters;
@@ -615,15 +887,22 @@ class FractalRenderer {
 			canvasW: canvas.width, canvasH: canvas.height,
 			view: this.view, maxIters: this.maxIters, densityMul: this.densityMul, mode: this.mode,
 			usePeriod: this.usePeriod, periodEps2: this.periodEps2, useDD: this.useDD,
-			usePert: tile.idx ? false : this.usePert, pertRhoThresh: this.pertRhoThresh, bandMap: this.bandMap,
+			// A sharpen job forces the DD path ONLY in the 'dd' sub-phase; the 'pert' sub-phase (and the
+			// initial full render + SSAA jobs) keep the view's perturbation path.
+			usePert: (tile.idx && !tile.ssaaJob && this.sharpenMode === "dd") ? false : this.usePert, pertRhoThresh: this.pertRhoThresh, bandMap: this.bandMap,
+			ssaaOn: false,   // initial full render is 1-sample (fast frame); point jobs ignore this
 		};
-		if (tile.idx) msg.idx = tile.idx;   // sharpen job: only these capped points (always DD)
+		if (tile.idx) {
+			msg.idx = tile.idx;
+			if (tile.ssaaJob) { msg.ssaaJob = true; msg.lvlLo = this.muLo; msg.lvlHi = this.muHi; }
+		}
 		this.workers[i].postMessage(msg);
 	}
 
 	private onDone(i: number, m: DoneMsg): void {
 		if (m.gen === this.gen) { // drop stale tiles from a superseded view
-			if (m.idx) this.applySharpen(m);
+			if (m.ssaaJob) this.applySSAA(m);
+			else if (m.idx) this.applySharpen(m);
 			else this.applyTile(m);
 			const s = this.genStats;
 			s.iters += m.iters; s.esc += m.esc; s.ins += m.ins; s.per += m.per; s.cap += m.cap;
@@ -639,9 +918,19 @@ class FractalRenderer {
 	}
 
 	// Initial/full render of a tile: blit its pixels and stash its (mu, deDist) field.
+	// The worker paints CAPPED pixels black; before blitting, overwrite them with the
+	// provisional heat so each tile lands already-developed (not black) as it arrives —
+	// the range grows across tiles, then finalizeColors snaps it to the clipped global
+	// range for a consistent frame once the whole pass lands.
 	private applyTile(m: DoneMsg): void {
+		const mu = new Float32Array(m.mu!), de = new Float32Array(m.de!);
+		if (this.provOn) {
+			this.updateProvRange(mu, de);
+			const buf = new Uint32Array(m.buf!);
+			for (let p = 0; p < mu.length; p++) if (mu[p] === CAPPED) buf[p] = this.provColor(de[p]);
+		}
 		ctx.putImageData(new ImageData(new Uint8ClampedArray(m.buf!), m.tw, m.th), m.ox, m.oy);
-		this.storeField(m.ox, m.oy, m.tw, m.th, new Float32Array(m.mu), new Float32Array(m.de));
+		this.storeField(m.ox, m.oy, m.tw, m.th, mu, de);
 	}
 
 	// Sharpening result: only the tile's capped points were re-iterated (mu/de packed,
@@ -650,7 +939,7 @@ class FractalRenderer {
 	// many resolved. Repaints only the changed pixels via a per-tile getImageData/
 	// putImageData, so already-resolved neighbours keep the SSAA from the full render.
 	private applySharpen(m: DoneMsg): void {
-		const W = canvas.width, idx = m.idx!, mu = new Float32Array(m.mu), de = new Float32Array(m.de);
+		const W = canvas.width, idx = m.idx!, mu = new Float32Array(m.mu!), de = new Float32Array(m.de!);
 		const img = ctx.getImageData(m.ox, m.oy, m.tw, m.th);
 		const data32 = new Uint32Array(img.data.buffer);
 		let resolved = 0;
@@ -669,6 +958,18 @@ class FractalRenderer {
 				this.onProgress({ working: this.workingLive, abandoned: 0, sharpening: true, done: false });
 			}
 		}
+	}
+
+	// Background SSAA result: the tile's edge pixels were supersampled into averaged colors
+	// (packed, aligned to idx). Blit just those pixels — the field (mu/de) is unchanged, this
+	// only anti-aliases the already-resolved display. Per-tile getImageData/putImageData so
+	// untouched pixels keep their colour.
+	private applySSAA(m: DoneMsg): void {
+		const idx = m.idx!, col = new Uint32Array(m.col!);
+		const img = ctx.getImageData(m.ox, m.oy, m.tw, m.th);
+		const data32 = new Uint32Array(img.data.buffer);
+		for (let k = 0; k < idx.length; k++) data32[idx[k]] = col[k];
+		ctx.putImageData(img, m.ox, m.oy);
 	}
 
 	// Color one field sample (repaints a sharpened pixel) via the shared colorSample —
@@ -698,6 +999,8 @@ class FractalRenderer {
 		bandMap = this.bandMap;
 		usePert = this.usePert;
 		pertRhoThresh = this.pertRhoThresh;
+		provOn = false;   // paint CAPPED black in the blocking pass; finalizeColors levels + recolors the underlay
+		ssaaOn = true;    // no-worker fallback renders crisp (with SSAA) in one blocking pass; no background AA pass
 		if (usePert) computeRef(this.view, this.maxIters);
 		iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;
 		renderRegion(

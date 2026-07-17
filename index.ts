@@ -74,6 +74,7 @@ const dev = window as unknown as {
 	mandelBand: (n?: number) => void;
 	mandelDD: (on?: boolean | null) => void;
 	mandelPert: (on?: boolean | null) => void;
+	mandelProv: (on?: boolean) => void;
 };
 
 dev.mandelBench = async (n = 9) => {
@@ -126,6 +127,11 @@ dev.mandelPert = (on = true) => {
 	console.log("perturbation " + (on === null ? "AUTO (follows DD gate)" : on ? "forced ON" : "forced OFF"));
 	renderer.render(view);
 };
+
+// Toggle provisional CAPPED coloring for A/B — the developing paper→ink underlay vs the old
+// all-black first frame. Recolors instantly from the stored field (no re-iterate); pair with
+// mandelSharpen(false) to freeze an all-CAPPED frame and flip it. e.g. mandelProv(false)
+dev.mandelProv = (on = true) => { renderer.setProv(on); console.log("provisional coloring " + (on ? "ON" : "OFF")); };
 
 // Progressive-sharpening readout (optional element). Splits the undetermined
 // points into `working` (still being iterated) and `abandoned` (given up on once

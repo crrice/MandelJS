@@ -64,6 +64,19 @@ const PERIOD_EPS_ZOOM0 = 1e5;       // below this zoom, stay at the loose base
 // per-iteration periodicity overhead; only near-boundary / interior orbits do.
 const PERIOD_WARMUP = 64;
 
+// Perturbation periodicity pre-filter (escapeSmoothPert only). The z-periodicity test
+// needs a DD-precise |z_n − z_saved| to survive past the f64 wall, but running those DD
+// ops on EVERY non-escaped iteration triples the (cheap f64) perturbation first-frame.
+// So gate the DD compare behind a plain-f64 estimate of the same distance²: a non-cyclic
+// exterior orbit sits O(0.01–2) from any earlier point — vastly outside this radius — so
+// it's rejected in ~6 flops without touching DD; only genuine near-cycles fall through to
+// the precise test. The radius is a FIXED absolute value (not periodEps2-scaled): it must
+// stay above the f64 estimate's ~1e-16 noise at every depth (or deep-zoom cycles, whose
+// true distance is far smaller, would be rejected), while sitting far below the exterior
+// separations. 1e-24 = (1e-12)² — validated 0 lost cycles / 0 new false-positives vs the
+// ungated check across the baseline and a near-eps-floor deep window.
+const PERT_GATE2 = 1e-24;
+
 // Sentinel returned by `escapeSmooth` for points PROVEN in-set — via the
 // cardioid/bulb shortcut or a detected attracting cycle. Every escaped point
 // yields a finite smooth value, so === is unambiguous.
@@ -108,6 +121,27 @@ let bandMap = 0;
 // deDist. Copy _dhi/_dlo into locals immediately after each call (they're clobbered
 // by the next DD op).
 let _dhi = 0, _dlo = 0;
+
+// Provisional coloring of CAPPED (unresolved) pixels. A high-dwell window whose minimum
+// escape time exceeds the initial cap comes back 100% CAPPED → an all-black first frame,
+// jarring even though idle-sharpening then resolves it. Instead of painting CAPPED the
+// in-set color, shade it by a monotone structure signal — log|z'| at the cap, which ranks
+// ~0.88 with the eventual escape band — through a paper→ink ramp (provLut), auto-leveled to
+// [provLo, provHi]. That turns the black frame into a smooth "developing" underlay the real
+// bands then resolve over. The CAPPED sentinel stays in the mu field, so sharpening and
+// auto-leveling are untouched: this is a pure display layer. provOn gates it (mandelProv
+// A/B). Each cap path stashes its log|z'| into deDist (unused by CAPPED pixels otherwise);
+// colorSample reads it. Workers keep provOn=false (CAPPED→black per tile); the main thread
+// levels the field and recolors once the frame lands.
+let provOn = false, provLo = 0, provHi = 1;
+let provLut: Uint32Array | null = null;
+
+// Anti-aliasing (SSAA) toggle for renderRegion. The INITIAL pass sets this false → 1-sample,
+// no border, no supersampling → the first frame lands ~3x faster (on a filament-heavy window,
+// ~2/3 of renderRegion's cost is adaptive SSAA on the resolved boundary). A background pass
+// (ssaaPoints) then anti-aliases only the edge pixels, off the critical path. The sync (no-worker)
+// fallback keeps it true (renders crisp in one blocking call). Set per tile from the worker message.
+let ssaaOn = true;
 
 // Perturbation (deep-zoom fast path): iterate each pixel as its deviation δ from ONE shared
 // high-precision reference orbit, in plain f64 — ~30x cheaper than a per-pixel DD orbit.
@@ -183,6 +217,7 @@ function escapeSmooth(cr: number, ci: number, maxIters: number): number {
 		}
 	}
 	iterAcc += n; capAcc++;
+	deDist = 0.5 * Math.log(dzx * dzx + dzy * dzy + 1e-300);   // provisional structure signal: log|z'| at the cap
 	return CAPPED;   // hit the cap unresolved — sharpening may still settle it
 }
 
@@ -289,6 +324,7 @@ function escapeSmoothDD(crhi: number, crlo: number, cihi: number, cilo: number, 
 		}
 	}
 	iterAcc += n; capAcc++;
+	deDist = 0.5 * Math.log(dzxhi * dzxhi + dzyhi * dzyhi + 1e-300);   // provisional log|z'| (hi limbs)
 	return CAPPED;
 }
 
@@ -369,7 +405,7 @@ function escapeSmoothPert(cr: number, ci: number, dcx: number, dcy: number, maxI
 		const z2 = zx * zx + zy * zy;
 		const dm = Math.sqrt(dx * dx + dy * dy);
 		if (z2 > BAILOUT2) {
-			if (dm > 0 && e / dm > pertRhoThresh) { iterAcc += n; capAcc++; return CAPPED; }   // glitch → DD in sharpening
+			if (dm > 0 && e / dm > pertRhoThresh) { iterAcc += n; capAcc++; deDist = 0.5 * Math.log(dzx * dzx + dzy * dzy + 1e-300); return CAPPED; }   // glitch → DD in sharpening
 			const zmag = Math.sqrt(z2), dmag = Math.sqrt(dzx * dzx + dzy * dzy);
 			deDist = dmag > 1e-300 ? 2 * zmag * Math.log(zmag) / dmag : 1e30;
 			const mu = n + 1 - Math.log(0.5 * Math.log(z2)) / Math.LN2;
@@ -388,13 +424,18 @@ function escapeSmoothPert(cr: number, ci: number, dcx: number, dcy: number, maxI
 		// difference (Z_n − Z_saved) is formed in DD so the test stays precise past the f64 wall; the
 		// δ diff is f64. Resolves in-set minibrot points in the cheap pass instead of via DD sharpening.
 		if (periodOn && n >= PERIOD_WARMUP && n <= refLen) {
-			const nxh = refZx[n], nxl = refZxl[n], nyh = refZy[n], nyl = refZyl[n];
+			const nxh = refZx[n], nyh = refZy[n];   // hi limbs only in the hot path; lo limbs deferred
 			if (pSaved) {
-				ddAdd(nxh, nxl, -szxh, -szxl); ddAdd(_dhi, _dlo, dx, 0); const drx = _dhi;   // (z_n − z_saved).x, DD
-				ddAdd(nyh, nyl, -szyh, -szyl); ddAdd(_dhi, _dlo, dy, 0); const dry = _dhi;
-				if (drx * drx + dry * dry < periodEps2) { iterAcc += n; perAcc++; return IN_SET; }
+				const gx = (nxh - szxh) + dx, gy = (nyh - szyh) + dy;   // f64 estimate of z_n − z_saved
+				if (gx * gx + gy * gy < PERT_GATE2) {   // cheap gate: skip DD unless a real cycle candidate
+					const nxl = refZxl[n], nyl = refZyl[n];
+					ddAdd(nxh, nxl, -szxh, -szxl); ddAdd(_dhi, _dlo, dx, 0); const drx = _dhi;   // (z_n − z_saved).x, DD
+					ddAdd(nyh, nyl, -szyh, -szyl); ddAdd(_dhi, _dlo, dy, 0); const dry = _dhi;
+					if (drx * drx + dry * dry < periodEps2) { iterAcc += n; perAcc++; return IN_SET; }
+				}
 			}
 			if (n === checkAt) {
+				const nxl = refZxl[n], nyl = refZyl[n];
 				ddAdd(nxh, nxl, dx, 0); szxh = _dhi; szxl = _dlo;                             // save z_n as DD
 				ddAdd(nyh, nyl, dy, 0); szyh = _dhi; szyl = _dlo;
 				pSaved = true; checkAt *= 2;
@@ -402,6 +443,7 @@ function escapeSmoothPert(cr: number, ci: number, dcx: number, dcy: number, maxI
 		}
 	}
 	iterAcc += n; capAcc++;
+	deDist = 0.5 * Math.log(dzx * dzx + dzy * dzy + 1e-300);   // provisional log|z'| at the cap
 	return CAPPED;
 }
 
@@ -430,7 +472,13 @@ function colorSample(
 	mode: number, cyclic: boolean, densityMul: number,
 	pixelSize: number, bandMap: number, lvlLo: number, lvlHi: number,
 ): number {
-	if (!isFinite(mu)) return inSet;                        // IN_SET or CAPPED -> in-set color
+	if (mu === -Infinity) {                                 // CAPPED (unresolved this pass)
+		if (!provOn || !provLut) return inSet;              //   provisional coloring off -> in-set color (old behavior)
+		let tp = (de - provLo) / (provHi > provLo ? provHi - provLo : 1);   // de carries log|z'| for CAPPED px
+		tp = tp < 0 ? 0 : tp > 1 ? 1 : tp;
+		return provLut[(tp * (provLut.length - 1)) | 0];    // paper->ink structure ramp
+	}
+	if (!isFinite(mu)) return inSet;                        // IN_SET (+inf) or NaN -> in-set color
 	const lastIdx = lut.length - 1;
 	if (mode === 1) {                                        // distance estimate
 		let td = Math.log(1 + de / pixelSize) * DIST_SCALE;
@@ -448,6 +496,25 @@ function colorSample(
 	let t = (g - glo) / (ghi > glo ? ghi - glo : 1);        // clamped level window
 	t = t < 0 ? 0 : t > 1 ? 1 : t;
 	return lut[(t * lastIdx) | 0];
+}
+
+// Escape value at a canvas-space sample (px, py already pixel/subpixel-centered), via the
+// active precision path: perturbation (δ off the shared reference), double-double (DD coordinate
+// built with twoSum), or plain f64 (bit-identical to the pre-DD engine). Sets deDist as a side
+// effect. Shared by renderRegion, sharpenPoints, and ssaaPoints so the three can't drift.
+// Self-contained for stringification (the escape kernels + dd ops + ref/scratch globals).
+function escapeAtPt(px: number, py: number, view: View, maxIters: number, invW: number, invH: number): number {
+	const offX = (px * invW - 0.5) * view.spanX;
+	const offY = (py * invH - 0.5) * view.spanY;
+	if (usePert) {
+		return escapeSmoothPert(view.cx + offX, view.cy + offY, offX - refOffX, offY - refOffY, maxIters);
+	}
+	if (useDD) {
+		ddAdd(view.cx, view.cxLo, offX, 0); const crhi = _dhi, crlo = _dlo;
+		ddAdd(view.cy, view.cyLo, offY, 0); const cihi = _dhi, cilo = _dlo;
+		return escapeSmoothDD(crhi, crlo, cihi, cilo, maxIters);
+	}
+	return escapeSmooth(view.cx + offX, view.cy + offY, maxIters);
 }
 
 // Fill a tile into `out` (a Uint32 buffer with row stride `outStride`). The
@@ -478,22 +545,8 @@ function renderRegion(
 	function colorOf(mu: number, de: number): number {
 		return colorSample(mu, de, lut, inSet, mode, cyclic, densityMul, pixelSize, bandMap, 0, 1 / densityMul);
 	}
-	// Escape value at a canvas-space sample (px,py already pixel/subpixel-centered).
-	// Below the f64 wall (useDD) the coordinate is built in double-double —
-	// c = cx (+) offset via twoSum — and iterated in DD; otherwise the plain f64
-	// path, which stays bit-identical to the pre-DD engine. Sets deDist either way.
 	function escapeAt(px: number, py: number): number {
-		const offX = (px * invW - 0.5) * view.spanX;
-		const offY = (py * invH - 0.5) * view.spanY;
-		if (usePert) {
-			return escapeSmoothPert(view.cx + offX, view.cy + offY, offX - refOffX, offY - refOffY, maxIters);
-		}
-		if (useDD) {
-			ddAdd(view.cx, view.cxLo, offX, 0); const crhi = _dhi, crlo = _dlo;
-			ddAdd(view.cy, view.cyLo, offY, 0); const cihi = _dhi, cilo = _dlo;
-			return escapeSmoothDD(crhi, crlo, cihi, cilo, maxIters);
-		}
-		return escapeSmooth(view.cx + offX, view.cy + offY, maxIters);
+		return escapeAtPt(px, py, view, maxIters, invW, invH);
 	}
 	function colorAt(fx: number, fy: number): number {
 		const mu = escapeAt(fx, fy);
@@ -503,6 +556,22 @@ function renderRegion(
 		return Math.abs((a & 255) - (b & 255)) +
 			Math.abs(((a >> 8) & 255) - ((b >> 8) & 255)) +
 			Math.abs(((a >> 16) & 255) - ((b >> 16) & 255));
+	}
+
+	// 1-sample fast path (initial frame): no border, no supersampling. Just one sample per
+	// pixel, colored and written, with the (mu, deDist) field stashed for recolor/sharpen/SSAA.
+	// The background ssaaPoints pass anti-aliases the edges afterward, off the critical path.
+	if (!ssaaOn) {
+		for (let ly = 0; ly < th; ly++) {
+			let off = ly * outStride;
+			for (let lx = 0; lx < tw; lx++, off++) {
+				const mu = escapeAt(ox + lx + 0.5, oy + ly + 0.5);
+				const de = deDist;
+				out[off] = colorOf(mu, de);
+				const p = ly * tw + lx; muOut[p] = mu; deOut[p] = de;
+			}
+		}
+		return;
 	}
 
 	// Pass 1: one sample per pixel over the tile PLUS a 1px border (border only
@@ -572,15 +641,38 @@ function sharpenPoints(
 	const invW = 1 / canvasW, invH = 1 / canvasH;
 	for (let k = 0; k < idx.length; k++) {
 		const p = idx[k], lx = p % tw, ly = (p / tw) | 0;
-		const offX = ((ox + lx + 0.5) * invW - 0.5) * view.spanX;
-		const offY = ((oy + ly + 0.5) * invH - 0.5) * view.spanY;
-		if (useDD) {
-			ddAdd(view.cx, view.cxLo, offX, 0); const crhi = _dhi, crlo = _dlo;
-			ddAdd(view.cy, view.cyLo, offY, 0); const cihi = _dhi, cilo = _dlo;
-			muOut[k] = escapeSmoothDD(crhi, crlo, cihi, cilo, maxIters);
-		} else {
-			muOut[k] = escapeSmooth(view.cx + offX, view.cy + offY, maxIters);
-		}
+		muOut[k] = escapeAtPt(ox + lx + 0.5, oy + ly + 0.5, view, maxIters, invW, invH);
 		deOut[k] = deDist;
+	}
+}
+
+// Background anti-aliasing: for each listed EDGE pixel (an edge detected in the 1-sample first
+// frame), take SS×SS subsamples via escapeAtPt, color each through colorSample, and write the
+// AVERAGED packed color (aligned to idx). Runs on the idle pool after the frame lands, so SSAA
+// never blocks the first frame — this is the deferred half of the old inline renderRegion SSAA.
+// Uses the main thread's auto-level window (lvlLo/lvlHi) so the anti-aliased pixels match the
+// resting frame's coloring. Centered subsamples match renderRegion. Self-contained for
+// stringification (escapeAtPt / colorSample / SS / deDist).
+function ssaaPoints(
+	colOut: Uint32Array, idx: Int32Array,
+	ox: number, oy: number, tw: number, canvasW: number, canvasH: number,
+	view: View, maxIters: number,
+	lut: Uint32Array, inSet: number, densityMul: number, cyclic: boolean, mode: number,
+	lvlLo: number, lvlHi: number,
+): void {
+	const invW = 1 / canvasW, invH = 1 / canvasH, invSS = 1 / SS, nSub = SS * SS;
+	const pixelSize = view.spanX * invW;
+	for (let k = 0; k < idx.length; k++) {
+		const p = idx[k], lx = p % tw, ly = (p / tw) | 0;
+		let ar = 0, ag = 0, ab = 0;
+		for (let sy = 0; sy < SS; sy++) {
+			const fy = oy + ly + (sy + 0.5) * invSS;
+			for (let sx = 0; sx < SS; sx++) {
+				const mu = escapeAtPt(ox + lx + (sx + 0.5) * invSS, fy, view, maxIters, invW, invH);
+				const cc = colorSample(mu, deDist, lut, inSet, mode, cyclic, densityMul, pixelSize, bandMap, lvlLo, lvlHi);
+				ar += cc & 255; ag += (cc >> 8) & 255; ab += (cc >> 16) & 255;
+			}
+		}
+		colOut[k] = ((255 << 24) | (((ab / nSub) | 0) << 16) | (((ag / nSub) | 0) << 8) | ((ar / nSub) | 0)) >>> 0;
 	}
 }
