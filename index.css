@@ -93,6 +93,30 @@ h1 {
 @keyframes sharpen-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
 @media (prefers-reduced-motion: reduce) { .sharpen-status.is-active::before { animation: none; } }
 
+/* Telemetry grid — a footer panel below the controls; a cell per stat, updated live as tiles land. */
+.telemetry {
+	margin-top: 20px;
+	padding-top: 18px;
+	border-top: 1px solid #2a2c31;
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+	gap: 11px 18px;
+}
+.tstat-k {
+	font: 500 0.62rem/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	color: #6d7078;
+}
+.tstat-v {
+	margin-top: 2px;
+	min-height: 1.25em;
+	font: 500 0.82rem/1.35 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+	letter-spacing: 0.02em;
+	color: #cdd6e6;
+}
+.tstat[data-k="composition"] .tstat-v { white-space: pre-line; }
+
 .controls {
 	display: flex;
 	gap: 12px;
@@ -113,6 +137,8 @@ h1 {
 }
 .btn:hover { color: #fff; border-color: #4c6ef5; background: #20242b; }
 .btn:focus-visible { outline: 2px solid #4c6ef5; outline-offset: 2px; }
+.btn:disabled { opacity: 0.4; cursor: default; }
+.btn:disabled:hover { color: #cdd6e6; border-color: #2a2c31; background: #1a1c20; }
 
 /* Color instrument: palette picker, wrap toggle, density slider. */
 .color-controls { flex-wrap: wrap; margin-top: 12px; }

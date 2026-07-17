@@ -10,8 +10,9 @@
 	<main>
 		<h1>MandelJS</h1>
 		<p class="sub">A from-scratch Mandelbrot explorer, drawn pixel by pixel on a canvas
-			(<code>z ↦ z² + c</code>). Drag a box over a region and hit <b>zoom</b> to dive in;
-			<b>reset</b> returns to the full view.</p>
+			(<code>z ↦ z² + c</code>). Drag a box to select a region — nudge it, scroll to resize —
+			then hit <b>zoom</b> to dive in. <b>back</b> steps out one dive, <b>reset</b> returns to the
+			full view.</p>
 
 		<div class="scroll">
 			<div class="easel">
@@ -21,7 +22,9 @@
 		</div>
 
 		<div class="controls">
-			<button class="btn zoom-button" type="button">⤢ zoom</button>
+			<button class="btn zoom-button" type="button" disabled>⤢ zoom</button>
+			<button class="btn back-button" type="button" disabled>↩ back</button>
+			<button class="btn out-button" type="button">⊖ zoom out</button>
 			<button class="btn reset-button" type="button">↺ reset</button>
 			<button class="btn mode-button" type="button">coloring: escape-time</button>
 		</div>
@@ -41,6 +44,16 @@
 			<label class="field">density
 				<input class="density-slider" type="range" min="8" max="128" step="1" />
 			</label>
+		</div>
+
+		<div class="telemetry" aria-live="polite">
+			<div class="tstat" data-k="zoom"><div class="tstat-k">zoom</div><div class="tstat-v"></div></div>
+			<div class="tstat" data-k="precision"><div class="tstat-k">precision</div><div class="tstat-v"></div></div>
+			<div class="tstat" data-k="deepest"><div class="tstat-k">deepest pixel</div><div class="tstat-v"></div></div>
+			<div class="tstat" data-k="throughput"><div class="tstat-k">throughput</div><div class="tstat-v"></div></div>
+			<div class="tstat" data-k="composition"><div class="tstat-k">composition</div><div class="tstat-v"></div></div>
+			<div class="tstat" data-k="method"><div class="tstat-k">method (exterior)</div><div class="tstat-v"></div></div>
+			<div class="tstat" data-k="thresholds"><div class="tstat-k">dwell p50 / p90</div><div class="tstat-v"></div></div>
 		</div>
 	</main>
 

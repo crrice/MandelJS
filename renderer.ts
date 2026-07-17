@@ -115,6 +115,26 @@ interface DoneMsg {
 // Per-generation instrumentation: total iterations + outcome tallies.
 interface GenStats { iters: number; esc: number; ins: number; per: number; cap: number; }
 
+// Headline per-frame telemetry for the UI stats line — the numbers that convey how deep this
+// view digs. `deepest` is the honest maximum iterations any single pixel actually performed:
+// the deepest escaper's dwell, or (while pixels are still capped) the current cap they reached.
+interface FrameStats {
+	zoom: number;         // magnification vs the default view
+	bits: number;         // working precision (64 f64 / 128 double-double)
+	maxIters: number;     // the current iteration cap
+	deepest: number;      // deepest iterations reached by any pixel
+	escaped: number;      // pixels that escaped (exterior)
+	inSet: number;        // pixels proven in-set (interior)
+	capped: number;       // pixels still undetermined at the cap
+	xPert: number;        // exterior pixels resolved via perturbation
+	xDD: number;          // exterior pixels resolved via exact double-double
+	xDirect: number;      // exterior pixels resolved via direct f64 iteration
+	itersPerSec: number;  // throughput: cumulative frame iterations / elapsed wall-time
+	p50: number;          // dwell threshold: half the escapers escaped within this many iters
+	p90: number;          // dwell threshold: 90% of escapers escaped within this many iters
+	done: boolean;        // frame fully resolved (drives the deepest label)
+}
+
 // A unit of render work: a tile rectangle. With `idx` it's a point job over those tile-local
 // pixels — sharpen (re-iterate capped) by default, or SSAA (supersample edges) when ssaaJob.
 interface TileJob { ox: number; oy: number; tw: number; th: number; idx?: Int32Array; ssaaJob?: boolean; }
@@ -226,6 +246,22 @@ class FractalRenderer {
 	// they do everywhere at deep zoom), collapsing to a flat fill.
 	private muLo = 0;
 	private muHi = 1;
+	// Whole-frame tallies for the telemetry grid. The status counts (wf*) are maintained LIVE as
+	// tiles land — incremented per FF tile, reclassified per IS resolve — then reconciled to the
+	// authoritative full-field scan in computeLevels each generation. muMax also grows live.
+	private muMax = -Infinity;   // deepest escaper's smooth iteration value (grows live)
+	private wfEsc = 0;           // escaped (exterior) pixels
+	private wfCap = 0;           // still-CAPPED pixels
+	private wfIns = 0;           // proven in-set (interior) pixels
+	// Exterior pixels credited to each resolution path (cumulative over the frame; sums to wfEsc).
+	private xPert = 0;
+	private xDD = 0;
+	private xDirect = 0;
+	private p50 = 0;             // dwell thresholds (smooth iters), from computeLevels' histogram
+	private p90 = 0;
+	private frameStart = 0;      // performance.now() at render() — throughput spans the whole frame
+	private frameIters = 0;      // cumulative iterations across every generation of this frame
+	private lastStatsEmit = 0;   // throttle for live per-tile stats emits
 	// Stored per-pixel fields (1 sample) so coloring can be redone on the main
 	// thread instantly, without re-iterating.
 	private muField: Float32Array;
@@ -272,7 +308,10 @@ class FractalRenderer {
 	// that the in-flight generation is that SSAA pass; ssaaRefine gates the feature (A/B).
 	private ssaaRefine = true;
 	private ssaaPhase = false;
-	public onProgress: ((p: { working: number; abandoned: number; sharpening: boolean; done: boolean }) => void) | null = null;
+	public onProgress: ((p: { working: number; abandoned: number; sharpening: boolean; done: boolean; phase: string }) => void) | null = null;
+	// Fired alongside onProgress as a generation lands, carrying the frame's headline telemetry
+	// (zoom, precision, deepest iterations reached) for the UI stats line.
+	public onStats: ((s: FrameStats) => void) | null = null;
 	// Fired each render with the working precision in BITS (64 = f64, 128 = double-double,
 	// 192 = triple-double, …), so the UI can show it and explain the slower deep renders.
 	// Bits, not a bool, so it generalizes to future multi-double levels.
@@ -437,27 +476,54 @@ class FractalRenderer {
 	// compress the whole gradient. Cheap: a couple of O(N) passes.
 	private computeLevels(): void {
 		const mu = this.muField, N = mu.length;
-		let mn = Infinity, mx = -Infinity, cnt = 0;
+		let mn = Infinity, mx = -Infinity, cnt = 0, capped = 0, inset = 0;
 		for (let i = 0; i < N; i++) {
 			const m = mu[i];
 			if (isFinite(m)) { cnt++; if (m < mn) mn = m; if (m > mx) mx = m; }
+			else if (m === CAPPED) capped++;   // -Infinity: still undetermined
+			else inset++;                      // +Infinity (IN_SET) or NaN: interior
 		}
-		if (cnt === 0 || mx <= mn) { this.muLo = 0; this.muHi = 1; return; }
+		// Reconcile the live status tallies to this authoritative full-field scan, and stash muMax.
+		this.muMax = mx; this.wfEsc = cnt; this.wfCap = capped; this.wfIns = inset;
+		if (cnt === 0 || mx <= mn) { this.muLo = 0; this.muHi = 1; this.p50 = this.p90 = 0; return; }
 		const BINS = 512;
-		const hist = new Uint32Array(BINS);
+		const linHist = new Uint32Array(BINS);   // linear: color-clip window
+		const logHist = new Uint32Array(BINS);   // log: dwell percentiles
 		const scale = (BINS - 1) / (mx - mn);
+		// Dwell is heavy-tailed — nearly every exterior pixel escapes fast, a rare few near the boundary
+		// take vastly longer. A linear histogram lets one deep outlier stretch the range until the whole
+		// bulk collapses into bin 0 (p50 == p90). Bin the percentiles in LOG space so resolution stays
+		// fine across the bulk regardless of the tail; the color clip keeps its linear binning.
+		const lmn = Math.log(Math.max(mn, 1)), lmx = Math.log(Math.max(mx, mn + 1));
+		const lscale = (BINS - 1) / Math.max(lmx - lmn, 1e-9);
 		for (let i = 0; i < N; i++) {
 			const m = mu[i];
-			if (isFinite(m)) hist[((m - mn) * scale) | 0]++;
+			if (!isFinite(m)) continue;
+			linHist[((m - mn) * scale) | 0]++;
+			const lb = ((Math.log(Math.max(m, 1)) - lmn) * lscale) | 0;
+			logHist[lb < 0 ? 0 : lb >= BINS ? BINS - 1 : lb]++;
 		}
+		// Color window: 1%/99% clip on the linear histogram so a few boundary outliers don't flatten the ramp.
 		const loTarget = cnt * 0.01, hiTarget = cnt * 0.99;
 		let acc = 0, loBin = 0, hiBin = BINS - 1;
-		for (let b = 0; b < BINS; b++) { acc += hist[b]; if (acc >= loTarget) { loBin = b; break; } }
-		acc = 0;
-		for (let b = 0; b < BINS; b++) { acc += hist[b]; if (acc >= hiTarget) { hiBin = b; break; } }
+		for (let b = 0; b < BINS; b++) {
+			acc += linHist[b];
+			if (loBin === 0 && acc >= loTarget) loBin = b;
+			if (acc >= hiTarget) { hiBin = b; break; }
+		}
 		this.muLo = mn + loBin / scale;
 		this.muHi = mn + hiBin / scale;
 		if (this.muHi <= this.muLo) this.muHi = this.muLo + 1;
+		// Dwell thresholds: 50%/90% percentiles from the log histogram, mapped back to iteration counts.
+		const p50Target = cnt * 0.5, p90Target = cnt * 0.9;
+		let accL = 0, p50Bin = -1, p90Bin = -1;
+		for (let b = 0; b < BINS; b++) {
+			accL += logHist[b];
+			if (p50Bin < 0 && accL >= p50Target) p50Bin = b;
+			if (accL >= p90Target) { p90Bin = b; break; }
+		}
+		this.p50 = Math.exp(lmn + (p50Bin < 0 ? 0 : p50Bin) / lscale);
+		this.p90 = Math.exp(lmn + (p90Bin < 0 ? 0 : p90Bin) / lscale);
 	}
 
 	// Pack a provisional heat color for one CAPPED pixel's structure signal (log|z'|),
@@ -529,6 +595,40 @@ class FractalRenderer {
 		const cb = this.onComplete; this.onComplete = null;
 		if (cb) cb();
 		this.afterGeneration();
+	}
+
+	// Emit the frame's headline telemetry to the UI. `deepest` is the honest maximum iterations a
+	// single pixel actually ran: while anything is still capped, those pixels reached the current
+	// cap (maxIters); once nothing is capped, it's the deepest escaper's dwell (floor of muMax).
+	private emitStats(done: boolean): void {
+		if (!this.onStats) return;
+		const deepest = this.wfCap > 0 ? this.maxIters
+			: this.muMax > 0 ? Math.floor(this.muMax) : this.maxIters;
+		const elapsed = (performance.now() - this.frameStart) / 1000;
+		this.onStats({
+			zoom: DEFAULT_VIEW.spanX / this.view.spanX,
+			bits: this.useDD ? 128 : 64,
+			maxIters: this.maxIters,
+			deepest,
+			escaped: this.wfEsc,
+			inSet: this.wfIns,
+			capped: this.wfCap,
+			xPert: this.xPert,
+			xDD: this.xDD,
+			xDirect: this.xDirect,
+			itersPerSec: elapsed > 0 ? this.frameIters / elapsed : 0,
+			p50: this.p50,
+			p90: this.p90,
+			done,
+		});
+	}
+
+	// Credit n exterior pixels to the compute path that resolved them. `pertActive` is true for the
+	// perturbation path; otherwise it's exact DD when the view runs double-double, else direct f64.
+	private addMethod(pertActive: boolean, n: number): void {
+		if (pertActive) this.xPert += n;
+		else if (this.useDD) this.xDD += n;
+		else this.xDirect += n;
 	}
 
 	// Scan the stored field for still-undetermined (CAPPED) pixels: the total count
@@ -606,7 +706,8 @@ class FractalRenderer {
 		// resolved and anti-aliased. Nothing more to schedule.
 		if (this.ssaaPhase) {
 			this.ssaaPhase = false;
-			if (this.onProgress) this.onProgress({ working: 0, abandoned: this.undetermined, sharpening: false, done: true });
+			if (this.onProgress) this.onProgress({ working: 0, abandoned: this.undetermined, sharpening: false, done: true, phase: "done" });
+			this.emitStats(true);
 			return;
 		}
 		if (!this.sharpenOn) return;   // clean initial-frame path (bench): no sharpen, no AA
@@ -626,7 +727,8 @@ class FractalRenderer {
 			const yielded = prev > 0 ? resolved / prev : 1;
 			const productive = this.sharpenStage === 0 || yielded >= SHARPEN_MIN_YIELD;
 			this.workingLive = count;
-			if (this.onProgress) this.onProgress({ working: count, abandoned: 0, sharpening: true, done: false });
+			if (this.onProgress) this.onProgress({ working: count, abandoned: 0, sharpening: true, done: false, phase: "refining" });
+			this.emitStats(false);
 			if (productive && this.maxIters < PERT_SHARPEN_CEIL) {
 				this.sharpenStage++;
 				this.beginGeneration(Math.min(PERT_SHARPEN_CEIL, Math.round(this.maxIters * SHARPEN_MULT)), tiles);
@@ -638,15 +740,16 @@ class FractalRenderer {
 		}
 
 		const done = this.sharpenDone(count, prev, tiles.length, resolved);
-		// While sharpening, the survivors are "working"; once we stop, whatever is
-		// still capped becomes "abandoned" — so the working bucket ticks down to 0
-		// as points either resolve or get given up on.
-		if (this.onProgress) {
-			this.onProgress(done
-				? { working: 0, abandoned: count, sharpening: false, done: true }
-				: { working: count, abandoned: 0, sharpening: true, done: false });
+		if (done) {
+			// The mu-field is fully resolved. Emit the final numbers now; maybeStartSSAA reports the
+			// terminal phase (anti-aliasing if there are edges to refine, else done).
+			this.emitStats(true);
+			this.maybeStartSSAA();
+			return;
 		}
-		if (done) { this.maybeStartSSAA(); return; }   // sharpening settled → anti-alias the edges in the background
+		// Still sharpening: the survivors are "working" and the grid keeps digging.
+		if (this.onProgress) this.onProgress({ working: count, abandoned: 0, sharpening: true, done: false, phase: "refining" });
+		this.emitStats(false);
 		this.sharpenStage++;
 		this.workingLive = count;   // entering capped count; onDone ticks it down live per tile
 		const nextCap = Math.min(SHARPEN_CEILING, Math.round(this.maxIters * SHARPEN_MULT));
@@ -657,10 +760,16 @@ class FractalRenderer {
 	// frame (ssaaPoints), so the resting image is crisp without the initial pass ever paying the
 	// SSAA cost. Started once, after sharpening settles; ssaaPhase marks the in-flight generation.
 	private maybeStartSSAA(): void {
-		if (!this.ssaaRefine || this.ssaaPhase) return;
+		// Terminal report when nothing will be anti-aliased: the frame is fully done.
+		const settle = () => {
+			if (this.onProgress) this.onProgress({ working: 0, abandoned: this.undetermined, sharpening: false, done: true, phase: "done" });
+		};
+		if (!this.ssaaRefine || this.ssaaPhase) { settle(); return; }
 		const { count, tiles } = this.scanEdges();
-		if (count === 0) return;
+		if (count === 0) { settle(); return; }
 		this.ssaaPhase = true;
+		// The image is resolved but still refining its edges — report the anti-aliasing phase.
+		if (this.onProgress) this.onProgress({ working: 0, abandoned: this.undetermined, sharpening: false, done: false, phase: "anti-aliasing" });
 		this.beginGeneration(this.maxIters, tiles);   // maxIters carries through; tiles hold edge idx + ssaaJob
 	}
 
@@ -831,8 +940,12 @@ class FractalRenderer {
 		this.ssaaPhase = false;
 		this.sharpenMode = this.usePert ? "pert" : "dd";   // pert windows sharpen in perturbation first, then DD
 		this.provLo = Infinity; this.provHi = -Infinity;   // reset the per-frame running provisional range
+		// Reset the telemetry accumulators for the new frame (counts rebuild as tiles land).
+		this.muMax = -Infinity; this.wfEsc = 0; this.wfCap = 0; this.wfIns = 0;
+		this.xPert = 0; this.xDD = 0; this.xDirect = 0; this.p50 = 0; this.p90 = 0;
+		this.frameStart = performance.now(); this.frameIters = 0; this.lastStatsEmit = 0;
 		// Fresh view: clear any leftover sharpening readout until the first frame lands.
-		if (this.onProgress) this.onProgress({ working: 0, abandoned: 0, sharpening: false, done: false });
+		if (this.onProgress) this.onProgress({ working: 0, abandoned: 0, sharpening: false, done: false, phase: "first frame" });
 
 		// Wash the previous frame toward grey so a new render is visibly "working" even when the fresh
 		// tiles match the old ones (a homogeneous region reads as frozen otherwise). Grey stays visible
@@ -906,6 +1019,19 @@ class FractalRenderer {
 			else this.applyTile(m);
 			const s = this.genStats;
 			s.iters += m.iters; s.esc += m.esc; s.ins += m.ins; s.per += m.per; s.cap += m.cap;
+			this.frameIters += m.iters;
+			// Live composition + method, updated as each tile lands (SSAA jobs don't change the field).
+			if (!m.ssaaJob) {
+				if (m.idx) {                          // IS: capped pixels reclassified
+					this.wfEsc += m.esc; this.wfIns += m.ins; this.wfCap -= m.esc + m.ins;
+					this.addMethod(this.sharpenMode === "pert", m.esc);
+				} else {                              // FF: fresh classification
+					this.wfEsc += m.esc; this.wfIns += m.ins; this.wfCap += m.cap;
+					this.addMethod(this.usePert, m.esc);
+				}
+				const now = performance.now();       // throttled live emit so the grid ticks, not floods
+				if (now - this.lastStatsEmit > 60) { this.lastStatsEmit = now; this.emitStats(false); }
+			}
 		}
 		this.dispatch(i); // keep the worker fed from the current queue
 		// Generation done = the POOL is drained (queue empty + every worker idle), NOT a fact about this
@@ -924,6 +1050,9 @@ class FractalRenderer {
 	// range for a consistent frame once the whole pass lands.
 	private applyTile(m: DoneMsg): void {
 		const mu = new Float32Array(m.mu!), de = new Float32Array(m.de!);
+		let mx = this.muMax;   // grow the live deepest-escaper as tiles land
+		for (let p = 0; p < mu.length; p++) { const v = mu[p]; if (v > mx && isFinite(v)) mx = v; }
+		this.muMax = mx;
 		if (this.provOn) {
 			this.updateProvRange(mu, de);
 			const buf = new Uint32Array(m.buf!);
@@ -947,7 +1076,10 @@ class FractalRenderer {
 			const p = idx[k], gpos = (m.oy + ((p / m.tw) | 0)) * W + m.ox + (p % m.tw);
 			const val = mu[k];
 			this.muField[gpos] = val; this.deField[gpos] = de[k];
-			if (val !== CAPPED) { data32[p] = this.pixelColor(val, de[k]); resolved++; }  // resolved -> recolor
+			if (val !== CAPPED) {
+				data32[p] = this.pixelColor(val, de[k]); resolved++;   // resolved -> recolor
+				if (isFinite(val) && val > this.muMax) this.muMax = val;
+			}
 		}
 		if (resolved > 0) ctx.putImageData(img, m.ox, m.oy);
 		if (this.onProgress) {   // live countdown: working shrinks by however many resolved
@@ -955,7 +1087,8 @@ class FractalRenderer {
 			const now = performance.now();
 			if (now - this.lastEmit > 40) {
 				this.lastEmit = now;
-				this.onProgress({ working: this.workingLive, abandoned: 0, sharpening: true, done: false });
+				this.onProgress({ working: this.workingLive, abandoned: 0, sharpening: true, done: false, phase: "refining" });
+				this.emitStats(false);
 			}
 		}
 	}

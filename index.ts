@@ -133,21 +133,92 @@ dev.mandelPert = (on = true) => {
 // mandelSharpen(false) to freeze an all-CAPPED frame and flip it. e.g. mandelProv(false)
 dev.mandelProv = (on = true) => { renderer.setProv(on); console.log("provisional coloring " + (on ? "ON" : "OFF")); };
 
-// Progressive-sharpening readout (optional element). Splits the undetermined
-// points into `working` (still being iterated) and `abandoned` (given up on once
-// escalation stops). Appears with the first frame; the working count ticks down
-// as points resolve, then drops to 0 as the remainder transfers to abandoned;
-// resets on a new view. `is-active` = workers still refining, `is-done` = settled.
+// Progressive readout (optional element): the current render phase plus the live undetermined-point
+// split — `working` (still being iterated) and `abandoned` (given up on once escalation stops).
+// The leading dot pulses while the workers are busy (any non-done phase) and turns green when
+// settled. Phase: first frame → refining → anti-aliasing → done.
 const sharpenStatus = document.querySelector(".sharpen-status") as HTMLElement | null;
 if (sharpenStatus) {
-	renderer.onProgress = ({ working, abandoned, sharpening, done }) => {
-		// Always visible for now (even at 0 · 0): the working count ticks down live
-		// as points resolve, then transfers to abandoned when escalation stops.
-		sharpenStatus.textContent =
-			working.toLocaleString() + " working · " + abandoned.toLocaleString() + " abandoned";
-		sharpenStatus.classList.toggle("is-active", sharpening);
+	renderer.onProgress = ({ working, abandoned, done, phase }) => {
+		const parts = [phase];
+		if (working > 0) parts.push(working.toLocaleString() + " working");
+		if (abandoned > 0) parts.push(abandoned.toLocaleString() + " abandoned");
+		sharpenStatus.textContent = parts.join(" · ");
+		sharpenStatus.classList.toggle("is-active", !done);
 		sharpenStatus.classList.toggle("is-done", done);
 	};
+}
+
+// Telemetry grid (optional element): a cell per stat, updated live as tiles land. Cells are keyed
+// by a data-k attribute so the markup and the updater stay decoupled.
+const telemetry = document.querySelector(".telemetry") as HTMLElement | null;
+const teleCells: Record<string, HTMLElement> = {};
+if (telemetry) {
+	telemetry.querySelectorAll<HTMLElement>(".tstat").forEach((el) => {
+		const k = el.dataset.k, v = el.querySelector<HTMLElement>(".tstat-v");
+		if (k && v) teleCells[k] = v;
+	});
+	renderer.onStats = (s) => updateTelemetry(s);
+}
+function setCell(k: string, text: string): void { const el = teleCells[k]; if (el) el.textContent = text; }
+
+function updateTelemetry(s: FrameStats): void {
+	setCell("zoom", fmtMag(s.zoom));
+	setCell("precision", s.bits + "-bit");
+	setCell("deepest", fmtCount(s.deepest) + " iters" + (s.done ? "" : " …"));
+	setCell("throughput", s.itersPerSec > 0 ? fmtCount(Math.round(s.itersPerSec)) + " iters/s" : "—");
+	setCell("composition", compText(s));
+	setCell("method", methodText(s));
+	setCell("thresholds", s.p50 > 0 ? "p50 " + fmtCount(Math.round(s.p50)) + " · p90 " + fmtCount(Math.round(s.p90)) : "—");
+}
+
+// Composition — status partition of every pixel (sums to 100), one slice per line (the cell's
+// value uses white-space: pre-line). Unresolved shown only when nonzero.
+function compText(s: FrameStats): string {
+	const t = s.escaped + s.inSet + s.capped;
+	if (t <= 0) return "—";
+	const parts = [fmtPct(s.escaped, t) + "% exterior", fmtPct(s.inSet, t) + "% interior"];
+	if (s.capped > 0) parts.push(fmtPct(s.capped, t) + "% unresolved");
+	return parts.join("\n");
+}
+
+// Method — compute-path partition of the EXTERIOR pixels only. Nonzero buckets, so a shallow window
+// reads "100% direct f64" and a deep one "99% perturbation · 1% exact DD".
+function methodText(s: FrameStats): string {
+	const t = s.xPert + s.xDD + s.xDirect;
+	if (t <= 0) return "—";
+	const parts: string[] = [];
+	if (s.xPert > 0) parts.push(fmtPct(s.xPert, t) + "% perturbation");
+	if (s.xDD > 0) parts.push(fmtPct(s.xDD, t) + "% exact DD");
+	if (s.xDirect > 0) parts.push(fmtPct(s.xDirect, t) + "% direct f64");
+	return parts.join(" · ");
+}
+
+function fmtPct(n: number, total: number): string {
+	const p = 100 * n / total;
+	if (p >= 99.95) return "100";
+	if (p > 0 && p < 0.05) return "<0.1";
+	return p.toFixed(1);
+}
+
+// Humanize a large count: 6_800_000 → "6.8M", 78_157 → "78k", 890 → "890".
+function fmtCount(n: number): string {
+	if (n >= 1e12) return (n / 1e12).toFixed(1).replace(/\.0$/, "") + "T";
+	if (n >= 1e9) return (n / 1e9).toFixed(1).replace(/\.0$/, "") + "B";
+	if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+	if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1).replace(/\.0$/, "") + "k";
+	return String(n | 0);
+}
+
+// Magnification vs the default view: humanized (1.3M×, 1.8T×) through 10¹⁵, then scientific with a
+// superscript exponent for the truly deep dives where the friendly names run out.
+const SUPS = "⁰¹²³⁴⁵⁶⁷⁸⁹";
+function fmtMag(z: number): string {
+	if (z < 1e3) return (z >= 100 ? String(Math.round(z)) : z.toFixed(1)) + "×";
+	if (z < 1e15) return fmtCount(Math.round(z)) + "×";
+	const [m, e] = z.toExponential(1).split("e");
+	const exp = String(Math.abs(parseInt(e, 10))).replace(/./g, (d) => SUPS[+d]);
+	return m + "×10" + exp;
 }
 
 // Recolor on light/dark flip (matters for the theme-aware subtle palette).
@@ -155,89 +226,215 @@ const themeMq = matchMedia("(prefers-color-scheme: dark)");
 if (themeMq.addEventListener) themeMq.addEventListener("change", () => renderer.recolor());
 
 //---------------------------------------------------------------------------\\
-// Interactivity — drag a box, hit zoom
+// Interactivity — a zoom selector you draw, nudge, and resize
 //---------------------------------------------------------------------------\\
+//
+// The overlay canvas carries a single, optional selection rect, aspect-locked to
+// the view so a dive never distorts. Drag empty space to draw one; drag inside
+// it to move it; scroll over it to resize about its center; a single click
+// outside dismisses it. Nothing commits implicitly — the zoom button reads the
+// current selection — so a dive is always deliberate.
 
-class CanvasBoxZoomer {
+type SelRect = { x: number; y: number; w: number; h: number };
+
+const DRAG_SLOP = 4;      // px of motion before a press counts as a drag (vs a click)
+const SEL_MIN_H = 10;     // smallest selection height worth keeping
+const WHEEL_STEP = 1.12;  // per-notch resize factor
+
+class ZoomSelector {
 	private overlay: HTMLCanvasElement;
 	private octx: CanvasRenderingContext2D;
+	private aspect: number;
 
-	private isDown = false;
-	private start: [number, number] = [0, 0];
-	private end: [number, number] = [0, 0];
+	private rect: SelRect | null = null;
+	private mode: "none" | "draw" | "move" = "none";
+	private moved = false;
+	private downPt: [number, number] = [0, 0];   // press origin (click-vs-drag test)
+	private anchor: [number, number] = [0, 0];    // draw: the fixed corner
+	private grab: [number, number] = [0, 0];      // move: cursor offset within the box
+
+	// Fires whenever the selection appears or clears, so the zoom button can enable/disable.
+	public onChange: (() => void) | null = null;
 
 	public constructor(base: HTMLCanvasElement) {
+		this.aspect = base.width / base.height;
 		this.overlay = document.createElement("canvas");
 		this.overlay.width = base.width;
 		this.overlay.height = base.height;
+		this.overlay.style.cursor = "crosshair";
 		easel.appendChild(this.overlay);
-
 		this.octx = this.overlay.getContext("2d")!;
 
-		this.overlay.addEventListener("mousedown", this.onMouseDown.bind(this));
-		this.overlay.addEventListener("mousemove", this.onMouseMove.bind(this));
-		this.overlay.addEventListener("mouseup", this.onMouseUp.bind(this));
+		this.overlay.addEventListener("mousedown", this.onDown);
+		// move/up on window so a drag that leaves the canvas keeps tracking and still releases.
+		window.addEventListener("mousemove", this.onMove);
+		window.addEventListener("mouseup", this.onUp);
+		this.overlay.addEventListener("wheel", this.onWheel, { passive: false });
 	}
 
-	private onMouseDown(ev: MouseEvent): void {
-		this.start = [ev.offsetX, ev.offsetY];
-		this.end = [ev.offsetX, ev.offsetY];
-		this.isDown = true;
+	private local(ev: MouseEvent): [number, number] {
+		const b = this.overlay.getBoundingClientRect();
+		return [ev.clientX - b.left, ev.clientY - b.top];
 	}
 
-	private onMouseMove(ev: MouseEvent): void {
-		if (!this.isDown) return;
-		this.end = [ev.offsetX, ev.offsetY];
-		const r = this.getCurrentRect();
-		const c = this.octx;
-		c.clearRect(0, 0, this.overlay.width, this.overlay.height);
+	private inside(p: [number, number]): boolean {
+		const r = this.rect;
+		return !!r && p[0] >= r.x && p[0] <= r.x + r.w && p[1] >= r.y && p[1] <= r.y + r.h;
+	}
+
+	private onDown = (ev: MouseEvent): void => {
+		const p = this.local(ev);
+		this.downPt = p;
+		this.moved = false;
+		if (this.inside(p)) {
+			this.mode = "move";
+			this.grab = [p[0] - this.rect!.x, p[1] - this.rect!.y];
+		} else {
+			this.mode = "draw";
+			this.anchor = p;
+		}
+	};
+
+	private onMove = (ev: MouseEvent): void => {
+		const p = this.local(ev);
+		if (this.mode === "none") {
+			this.overlay.style.cursor = this.inside(p) ? "move" : "crosshair";
+			return;
+		}
+		if (!this.moved && Math.hypot(p[0] - this.downPt[0], p[1] - this.downPt[1]) > DRAG_SLOP) this.moved = true;
+		if (this.mode === "draw") {
+			this.overlay.style.cursor = "crosshair";
+			if (this.moved) this.setRect(this.clampSize(this.drawRect(p)));
+		} else {
+			this.overlay.style.cursor = "move";
+			if (this.moved) this.setRect(this.clampMove(p[0] - this.grab[0], p[1] - this.grab[1]));
+		}
+	};
+
+	private onUp = (ev: MouseEvent): void => {
+		if (this.mode === "none") return;
+		const wasDraw = this.mode === "draw";
+		const moved = this.moved;
+		this.mode = "none";
+		// A click on empty space (draw, no drag) dismisses; a drag too small to matter is discarded.
+		// A press inside the box that didn't move keeps the selection.
+		if (wasDraw && (!moved || !this.rect || this.rect.h < SEL_MIN_H)) this.clear();
+		const p = this.local(ev);
+		this.overlay.style.cursor = this.inside(p) ? "move" : "crosshair";
+	};
+
+	// Scroll over the box → resize about its center, aspect locked. Over empty space (or with no
+	// box) we don't preventDefault, so the page scrolls as usual.
+	private onWheel = (ev: WheelEvent): void => {
+		if (!this.rect || !this.inside(this.local(ev))) return;
+		ev.preventDefault();
+		const r = this.rect;
+		const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+		const f = ev.deltaY < 0 ? 1 / WHEEL_STEP : WHEEL_STEP;   // scroll up = tighter selection
+		this.setRect(this.clampSize({ x: cx - r.w * f / 2, y: cy - r.h * f / 2, w: r.w * f, h: r.h * f }, cx, cy));
+	};
+
+	// Aspect-locked rect from the fixed anchor to the cursor: size follows whichever axis was dragged
+	// further, direction follows the drag, so the box always encloses the cursor.
+	private drawRect(p: [number, number]): SelRect {
+		const dx = p[0] - this.anchor[0], dy = p[1] - this.anchor[1];
+		const w = Math.max(Math.abs(dx), Math.abs(dy) * this.aspect);
+		const h = w / this.aspect;
+		return { x: dx >= 0 ? this.anchor[0] : this.anchor[0] - w, y: dy >= 0 ? this.anchor[1] : this.anchor[1] - h, w, h };
+	}
+
+	// Clamp a rect to the canvas: cap the size to the frame (aspect preserved), then keep it fully
+	// on-canvas. When re-centering (resize) the given center is held; otherwise the origin is nudged in.
+	private clampSize(r: SelRect, cx?: number, cy?: number): SelRect {
+		const W = this.overlay.width, H = this.overlay.height;
+		let { w, h } = r;
+		const minW = SEL_MIN_H * this.aspect;
+		w = Math.min(Math.max(w, minW), W);
+		h = w / this.aspect;
+		if (h > H) { h = H; w = H * this.aspect; }
+		let x = cx !== undefined ? cx - w / 2 : r.x;
+		let y = cy !== undefined ? cy - h / 2 : r.y;
+		x = Math.min(Math.max(x, 0), W - w);
+		y = Math.min(Math.max(y, 0), H - h);
+		return { x, y, w, h };
+	}
+
+	private clampMove(x: number, y: number): SelRect {
+		const r = this.rect!, W = this.overlay.width, H = this.overlay.height;
+		return { x: Math.min(Math.max(x, 0), W - r.w), y: Math.min(Math.max(y, 0), H - r.h), w: r.w, h: r.h };
+	}
+
+	private setRect(r: SelRect | null): void {
+		this.rect = r;
+		this.redraw();
+		if (this.onChange) this.onChange();
+	}
+
+	private redraw(): void {
+		const c = this.octx, W = this.overlay.width, H = this.overlay.height;
+		c.clearRect(0, 0, W, H);
+		const r = this.rect;
 		if (!r) return;
-		// Draw twice so it reads on any background: a dark solid halo underneath,
-		// bright dashes on top.
+		c.fillStyle = "rgba(76, 110, 245, 0.10)";
+		c.fillRect(r.x, r.y, r.w, r.h);
+		// Stroke twice so the edge reads on any background: a dark halo, bright dashes on top.
 		c.setLineDash([]);
 		c.lineWidth = 3;
 		c.strokeStyle = "rgba(0, 0, 0, 0.55)";
-		c.strokeRect(r[0], r[1], r[2], r[3]);
+		c.strokeRect(r.x, r.y, r.w, r.h);
 		c.setLineDash([5, 4]);
 		c.lineWidth = 1;
 		c.strokeStyle = "rgba(255, 255, 255, 0.95)";
-		c.strokeRect(r[0], r[1], r[2], r[3]);
+		c.strokeRect(r.x, r.y, r.w, r.h);
 	}
 
-	private onMouseUp(ev: MouseEvent): void {
-		this.end = [ev.offsetX, ev.offsetY];
-		this.isDown = false;
+	// The committed selection as [x, y, w, h], or undefined if none / too small to be intentional.
+	public getRect(): [number, number, number, number] | undefined {
+		const r = this.rect;
+		if (!r || r.h < SEL_MIN_H) return undefined;
+		return [r.x, r.y, r.w, r.h];
 	}
 
-	// The selected rect as [x, y, w, h], locked to the canvas aspect ratio so the
-	// zoom never distorts: a rect with w/h == canvasW/canvasH scales spanX and
-	// spanY by the same factor, leaving the view aspect unchanged. Size is driven
-	// by whichever axis you dragged further, so the box always encloses the
-	// cursor; direction follows the drag. Undefined if too small to be intentional.
-	public getCurrentRect(): [number, number, number, number] | undefined {
-		const aspect = this.overlay.width / this.overlay.height;
-		const dx = this.end[0] - this.start[0];
-		const dy = this.end[1] - this.start[1];
-		const w = Math.max(Math.abs(dx), Math.abs(dy) * aspect);
-		const h = w / aspect;
-		if (h < 10) return undefined;
-		const x = dx >= 0 ? this.start[0] : this.start[0] - w;
-		const y = dy >= 0 ? this.start[1] : this.start[1] - h;
-		return [x, y, w, h];
-	}
+	public hasSelection(): boolean { return !!this.rect; }
 
-	public clear(): void {
-		this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
-		this.start = [0, 0];
-		this.end = [0, 0];
-	}
+	public clear(): void { this.setRect(null); }
 }
 
-const boxZoomer = new CanvasBoxZoomer(canvas);
+const selector = new ZoomSelector(canvas);
 
-const zoomButton = document.querySelector(".zoom-button") as HTMLElement;
+const zoomButton = document.querySelector(".zoom-button") as HTMLButtonElement;
+const backButton = document.querySelector(".back-button") as HTMLButtonElement | null;
+const outButton = document.querySelector(".out-button") as HTMLButtonElement | null;
+const resetButton = document.querySelector(".reset-button") as HTMLButtonElement;
+
+// View history for exact zoom-out. Each dive/out/reset pushes the outgoing view; back pops it.
+// Kept separate from the URL (which only mirrors the current view) so stepping back restores the
+// DD center lo-limbs bit-for-bit — no precision loss on the way out.
+const viewHistory: View[] = [];
+function pushHistory(v: View): void {
+	viewHistory.push(v);
+	if (backButton) backButton.disabled = false;
+}
+
+// Navigate to a view: swap it in, mirror to the URL, render, and drop any selection.
+function goTo(next: View): void {
+	view = next;
+	syncUrl(view);
+	// Show the new magnification immediately and blank the rest to a dash — the figures fill back in
+	// as the first tiles land, so the grid never lingers on the previous frame's numbers.
+	if (telemetry) {
+		setCell("zoom", fmtMag(DEFAULT_VIEW.spanX / next.spanX));
+		for (const k of ["deepest", "throughput", "composition", "method", "thresholds"]) setCell(k, "…");
+	}
+	renderer.render(view);
+	selector.clear();
+}
+
+selector.onChange = () => { zoomButton.disabled = !selector.hasSelection(); };
+zoomButton.disabled = true;
+
 zoomButton.addEventListener("click", () => {
-	const r = boxZoomer.getCurrentRect();
+	const r = selector.getRect();
 	if (!r) return;
 	const W = canvas.width, H = canvas.height;
 	// Recenter in double-double: newCenter = oldCenter + boxOffset. In f64 the offset is lost once it
@@ -246,22 +443,35 @@ zoomButton.addEventListener("click", () => {
 	const offY = ((r[1] + r[3] / 2) / H - 0.5) * view.spanY;
 	ddAdd(view.cx, view.cxLo, offX, 0); const ncx = _dhi, ncxLo = _dlo;
 	ddAdd(view.cy, view.cyLo, offY, 0); const ncy = _dhi, ncyLo = _dlo;
-	view = {
+	pushHistory(view);
+	goTo({
 		cx: ncx, cxLo: ncxLo, cy: ncy, cyLo: ncyLo,
 		spanX: view.spanX * (r[2] / W),
 		spanY: view.spanY * (r[3] / H),
-	};
-	syncUrl(view);
-	renderer.render(view);
-	boxZoomer.clear();
+	});
 });
 
-const resetButton = document.querySelector(".reset-button") as HTMLElement;
+if (backButton) {
+	backButton.disabled = true;
+	backButton.addEventListener("click", () => {
+		const prev = viewHistory.pop();
+		if (!prev) return;
+		backButton.disabled = viewHistory.length === 0;
+		goTo(prev);
+	});
+}
+
+if (outButton) {
+	// Step out past history: 2× the span about the current center (kept exactly — only span changes).
+	outButton.addEventListener("click", () => {
+		pushHistory(view);
+		goTo({ ...view, spanX: view.spanX * 2, spanY: view.spanY * 2 });
+	});
+}
+
 resetButton.addEventListener("click", () => {
-	view = { ...DEFAULT_VIEW };
-	syncUrl(view);
-	renderer.render(view);
-	boxZoomer.clear();
+	pushHistory(view);
+	goTo({ ...DEFAULT_VIEW });
 });
 
 // Coloring-mode toggle (optional control — absent on pages without it).
