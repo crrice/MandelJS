@@ -474,17 +474,14 @@ resetButton.addEventListener("click", () => {
 	goTo({ ...DEFAULT_VIEW });
 });
 
-// Coloring-mode toggle (optional control — absent on pages without it).
-const modeButton = document.querySelector(".mode-button") as HTMLElement | null;
-if (modeButton) {
-	const labels = ["escape-time", "distance"];
-	let mode = 0;
-	const sync = () => { modeButton.textContent = "coloring: " + labels[mode]; };
-	sync();
-	modeButton.addEventListener("click", () => {
-		mode = mode ? 0 : 1;
-		renderer.setColorMode(mode);
-		sync();
+// Coloring method (optional control) — one dropdown for all four paths: escape-time bands with the
+// linear / √ / log transforms, plus distance estimate. Each recolors instantly from the stored field.
+const coloringSelect = document.querySelector(".coloring-select") as HTMLSelectElement | null;
+if (coloringSelect) {
+	coloringSelect.addEventListener("change", () => {
+		const v = coloringSelect.value;
+		if (v === "distance") renderer.setColoring(1, 0);
+		else renderer.setColoring(0, v === "sqrt" ? 1 : v === "log" ? 2 : 0);
 	});
 }
 
@@ -502,12 +499,6 @@ if (densitySlider) {
 	densitySlider.addEventListener("input", () => renderer.setDensity(Number(densitySlider.value)));
 }
 
-// Band transfer selector (escape-time): linear / sqrt / log. sqrt & log give consistent,
-// zoom-stable banding; instant recolor from the stored field.
-const bandSelect = document.querySelector(".band-select") as HTMLSelectElement | null;
-if (bandSelect) {
-	bandSelect.addEventListener("change", () => renderer.setBandMap(Number(bandSelect.value)));
-}
 
 const paletteSelect = document.querySelector(".palette-select") as HTMLSelectElement | null;
 if (paletteSelect) {

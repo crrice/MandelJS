@@ -26,7 +26,6 @@
 			<button class="btn back-button" type="button" disabled>↩ back</button>
 			<button class="btn out-button" type="button">⊖ zoom out</button>
 			<button class="btn reset-button" type="button">↺ reset</button>
-			<button class="btn mode-button" type="button">coloring: escape-time</button>
 		</div>
 
 		<div class="controls color-controls">
@@ -43,6 +42,14 @@
 			<label class="field checkbox"><input class="wrap-toggle" type="checkbox" /> wrap</label>
 			<label class="field">density
 				<input class="density-slider" type="range" min="8" max="128" step="1" />
+			</label>
+			<label class="field">coloring
+				<select class="coloring-select">
+					<option value="linear">linear</option>
+					<option value="sqrt">√ compressed</option>
+					<option value="log" selected>log compressed</option>
+					<option value="distance">distance</option>
+				</select>
 			</label>
 		</div>
 

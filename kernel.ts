@@ -654,25 +654,24 @@ function sharpenPoints(
 // resting frame's coloring. Centered subsamples match renderRegion. Self-contained for
 // stringification (escapeAtPt / colorSample / SS / deDist).
 function ssaaPoints(
-	colOut: Uint32Array, idx: Int32Array,
+	muOut: Float32Array, deOut: Float32Array, idx: Int32Array,
 	ox: number, oy: number, tw: number, canvasW: number, canvasH: number,
 	view: View, maxIters: number,
-	lut: Uint32Array, inSet: number, densityMul: number, cyclic: boolean, mode: number,
-	lvlLo: number, lvlHi: number,
 ): void {
 	const invW = 1 / canvasW, invH = 1 / canvasH, invSS = 1 / SS, nSub = SS * SS;
-	const pixelSize = view.spanX * invW;
+	// Emit the raw SS² subsample (mu, deDist) per edge pixel (packed k*nSub + subsample). The main
+	// thread averages them through colorSample and caches them, so a later recolor re-averages the
+	// anti-aliasing without re-iterating (colors are cheap; escape values are not).
 	for (let k = 0; k < idx.length; k++) {
 		const p = idx[k], lx = p % tw, ly = (p / tw) | 0;
-		let ar = 0, ag = 0, ab = 0;
+		let o = k * nSub;
 		for (let sy = 0; sy < SS; sy++) {
 			const fy = oy + ly + (sy + 0.5) * invSS;
 			for (let sx = 0; sx < SS; sx++) {
-				const mu = escapeAtPt(ox + lx + (sx + 0.5) * invSS, fy, view, maxIters, invW, invH);
-				const cc = colorSample(mu, deDist, lut, inSet, mode, cyclic, densityMul, pixelSize, bandMap, lvlLo, lvlHi);
-				ar += cc & 255; ag += (cc >> 8) & 255; ab += (cc >> 16) & 255;
+				muOut[o] = escapeAtPt(ox + lx + (sx + 0.5) * invSS, fy, view, maxIters, invW, invH);
+				deOut[o] = deDist;
+				o++;
 			}
 		}
-		colOut[k] = ((255 << 24) | (((ab / nSub) | 0) << 16) | (((ag / nSub) | 0) << 8) | ((ar / nSub) | 0)) >>> 0;
 	}
 }

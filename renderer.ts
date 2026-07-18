@@ -71,6 +71,15 @@ const PERT_SHARPEN_CEIL = 1_000_000;
 // fast the per-pixel delta grows with zoom.
 const COLOR_STRETCH_EXP = 0.3;
 
+// Band-frequency multipliers for the compressed (zoom-stable) escape maps. densityBase was
+// calibrated for linear mu; √mu and log2(1+mu) span a much smaller range, so without these they
+// barely complete one cycle and wash out. These set where the default density (32) lands the band
+// count; the density slider scales from there. Each is isolated to its own map (√ / log). √ is tuned
+// sparser than log because at deep windows its bands pack in tight otherwise. Eyeball-tunable:
+// larger = more bands.
+const BAND_FREQ_SQRT = 3;
+const BAND_FREQ_LOG = 24;
+
 // Double-double (DD) precision gate. Past a certain depth f64 runs out of mantissa
 // — the pixel step drops below the ULP of the coordinate (adjacent pixels collide)
 // AND the orbit's rounding error, Lyapunov-amplified, swamps the boundary test. The
@@ -197,13 +206,13 @@ function buildWorkerSource(): string {
 		"  ssaaOn = m.ssaaOn !== false;",   // default true; initial full-render sends false
 		"  iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;",
 		"  if (usePert && m.gen !== _refGen) { computeRef(m.view, m.maxIters); _refGen = m.gen; }",   // reference once per gen (covers full + ssaa jobs)
-		"  if (m.idx && m.ssaaJob) {",   // background SSAA: supersample only the listed edge points, packed colors
-		"    var colS = new Uint32Array(m.idx.length);",
-		"    ssaaPoints(colS, m.idx, m.ox, m.oy, m.tw, m.canvasW, m.canvasH, m.view, m.maxIters,",
-		"               PAL.lut, PAL.inSet, m.densityMul, PAL.cyclic, m.mode, m.lvlLo, m.lvlHi);",
+		"  if (m.idx && m.ssaaJob) {",   // background SSAA: supersample edge points, return raw subsample mu/de
+		"    var nSub = SS * SS;",
+		"    var muS = new Float32Array(m.idx.length * nSub), deS = new Float32Array(m.idx.length * nSub);",
+		"    ssaaPoints(muS, deS, m.idx, m.ox, m.oy, m.tw, m.canvasW, m.canvasH, m.view, m.maxIters);",
 		"    postMessage({ type: 'done', gen: m.gen, ox: m.ox, oy: m.oy, tw: m.tw, th: m.th, idx: m.idx, ssaaJob: true,",
 		"                  iters: iterAcc, esc: escAcc, ins: inAcc, per: perAcc, cap: capAcc,",
-		"                  col: colS.buffer }, [colS.buffer]);",
+		"                  mu: muS.buffer, de: deS.buffer }, [muS.buffer, deS.buffer]);",
 		"    return;",
 		"  }",
 		"  if (m.idx) {",   // sharpen: re-iterate only the listed capped points, packed results
@@ -238,7 +247,7 @@ class FractalRenderer {
 	private lut!: Uint32Array;
 	private inSet = 0;
 	private densityMul = 1 / 32;
-	private bandMap = 0;           // escape-time band transfer (0 linear / 1 sqrt / 2 log)
+	private bandMap = 2;           // escape-time band transfer (0 linear / 1 sqrt / 2 log) — log is the default
 	private mode = 0; // 0 = escape-time, 1 = distance
 	// Escape-count range of the current view, for the auto-leveled (non-cyclic)
 	// ramp. Recomputed from the field when each render completes; a monotonic
@@ -308,6 +317,13 @@ class FractalRenderer {
 	// that the in-flight generation is that SSAA pass; ssaaRefine gates the feature (A/B).
 	private ssaaRefine = true;
 	private ssaaPhase = false;
+	private ssaaDisplayMax = 0;   // real settled cap, saved while the AA pass runs at a bounded cap
+	// SSAA subsample cache: the per-edge-pixel supersamples (SS² (mu, de) each), kept so a recolor
+	// re-averages the anti-aliasing through the new coloring instead of losing it (no re-iterate).
+	private ssaaPos: Int32Array = new Int32Array(0);   // global pixel index per cached edge pixel
+	private ssaaMu: Float32Array = new Float32Array(0); // ssaaCount × SS² subsample mu
+	private ssaaDe: Float32Array = new Float32Array(0); // ssaaCount × SS² subsample de
+	private ssaaCount = 0;                              // edge pixels cached so far this frame
 	public onProgress: ((p: { working: number; abandoned: number; sharpening: boolean; done: boolean; phase: string }) => void) | null = null;
 	// Fired alongside onProgress as a generation lands, carrying the frame's headline telemetry
 	// (zoom, precision, deepest iterations reached) for the UI stats line.
@@ -380,6 +396,15 @@ class FractalRenderer {
 	// the stored field (1-sample; SSAA returns on the next render/zoom).
 	public setColorMode(mode: number): void {
 		this.mode = mode;
+		this.colorizeField();
+	}
+
+	// Set the whole coloring method — mode (0 escape / 1 distance) + escape band transform (0/1/2) —
+	// in one recolor. Backs the UI's single "coloring" dropdown; instant, no re-iterate.
+	public setColoring(mode: number, bandMap: number): void {
+		this.mode = mode;
+		this.bandMap = bandMap;
+		this.densityMul = this.densityMulFor(this.view);
 		this.colorizeField();
 	}
 
@@ -466,6 +491,12 @@ class FractalRenderer {
 		const lo = this.muLo, hi = this.muHi;
 		for (let i = 0; i < N; i++) {
 			data32[i] = colorSample(mu[i], de[i], lut, inSet, mode, cyclic, densityMul, pixelSize, bandMap, lo, hi);
+		}
+		// Re-apply the cached anti-aliasing on top of the 1-sample repaint: re-average the stored edge
+		// subsamples through the current coloring so a recolor keeps crisp edges (no re-iterate).
+		const nSub = SS * SS;
+		for (let e = 0; e < this.ssaaCount; e++) {
+			data32[this.ssaaPos[e]] = this.ssaaColor(this.ssaaMu, this.ssaaDe, e * nSub, nSub);
 		}
 		ctx.putImageData(image, 0, 0);
 	}
@@ -597,13 +628,15 @@ class FractalRenderer {
 		this.afterGeneration();
 	}
 
-	// Emit the frame's headline telemetry to the UI. `deepest` is the honest maximum iterations a
-	// single pixel actually ran: while anything is still capped, those pixels reached the current
-	// cap (maxIters); once nothing is capped, it's the deepest escaper's dwell (floor of muMax).
+	// Emit the frame's headline telemetry to the UI. `deepest` is the deepest pixel RESOLVED so far
+	// (floor of muMax) — it climbs per tile through the escape-time distribution as pixels land, so it
+	// rises smoothly instead of showing the escalating cap and jumping down at settle. Only once the
+	// frame is done do still-capped pixels count as ABANDONED — they truly ran the full cap without
+	// resolving — so the final figure takes the max with maxIters to include them.
 	private emitStats(done: boolean): void {
 		if (!this.onStats) return;
-		const deepest = this.wfCap > 0 ? this.maxIters
-			: this.muMax > 0 ? Math.floor(this.muMax) : this.maxIters;
+		const dm = this.muMax > 0 ? Math.floor(this.muMax) : 0;
+		const deepest = done && this.wfCap > 0 ? Math.max(dm, this.maxIters) : (dm || this.maxIters);
 		const elapsed = (performance.now() - this.frameStart) / 1000;
 		this.onStats({
 			zoom: DEFAULT_VIEW.spanX / this.view.spanX,
@@ -706,6 +739,7 @@ class FractalRenderer {
 		// resolved and anti-aliased. Nothing more to schedule.
 		if (this.ssaaPhase) {
 			this.ssaaPhase = false;
+			this.maxIters = this.ssaaDisplayMax;   // AA ran at a bounded cap; restore the real one for the telemetry
 			if (this.onProgress) this.onProgress({ working: 0, abandoned: this.undetermined, sharpening: false, done: true, phase: "done" });
 			this.emitStats(true);
 			return;
@@ -768,9 +802,20 @@ class FractalRenderer {
 		const { count, tiles } = this.scanEdges();
 		if (count === 0) { settle(); return; }
 		this.ssaaPhase = true;
+		// Fresh subsample cache for this frame's edges (SS² samples per edge pixel), filled as tiles land.
+		const nSub = SS * SS;
+		this.ssaaPos = new Int32Array(count);
+		this.ssaaMu = new Float32Array(count * nSub);
+		this.ssaaDe = new Float32Array(count * nSub);
+		this.ssaaCount = 0;
 		// The image is resolved but still refining its edges — report the anti-aliasing phase.
 		if (this.onProgress) this.onProgress({ working: 0, abandoned: this.undetermined, sharpening: false, done: false, phase: "anti-aliasing" });
-		this.beginGeneration(this.maxIters, tiles);   // maxIters carries through; tiles hold edge idx + ssaaJob
+		// Bound the AA pass to the perturbation regime. At a DD-escalated deep window this.maxIters can be
+		// enormous, and SSAA runs perturbation — building a reference orbit that long is hundreds of MB per
+		// worker (the pathological AA tail). Past PERT_SHARPEN_CEIL only abandoned precision-frontier
+		// subsamples remain, which perturbation can't resolve anyway. Keep the real cap for the telemetry.
+		this.ssaaDisplayMax = this.maxIters;
+		this.beginGeneration(Math.min(this.maxIters, PERT_SHARPEN_CEIL), tiles);   // tiles hold edge idx + ssaaJob
 	}
 
 	// Whether to stop escalating. Continue while the last stage stayed worth it —
@@ -916,13 +961,18 @@ class FractalRenderer {
 		return step < ulp * DD_SWITCH_RATIO;
 	}
 
-	// Stretch a cyclic palette's period with zoom so color stops wrapping many
-	// times per pixel deep in. Ramp (non-cyclic) palettes clamp, so leave them be.
+	// Map a cyclic palette's period from the density knob, per band map.
+	//   linear (0): view-DEPENDENT — stretch the period by zoom^0.3 so bands don't wrap to mush deep
+	//               in. The legacy default; not zoom-stable (a fixed c shifts color as you zoom).
+	//   sqrt (1) / log (2): view-INDEPENDENT and zoom-stable — a fixed function of mu, so the same c
+	//               always lands the same color, and the compression holds band rate roughly constant
+	//               across depth without any zoom term. `densityBase` was calibrated for LINEAR mu, so
+	//               each compressed map gets a frequency multiplier (BAND_FREQ) to land a comparable
+	//               band count; the density slider still scales from there. (Tune BAND_FREQ by eye.)
 	private densityMulFor(v: View): number {
-		// No zoom stretch for a ramp (clamped) or a compressed band-map — sqrt/log already
-		// hold the band rate roughly constant across depth, and the stretch would make them
-		// view-DEPENDENT (breaking zoom-stability). Only linear cyclic bands need it.
-		if (!this.wrap || this.bandMap !== 0) return 1 / this.densityBase;
+		if (this.bandMap === 1) return BAND_FREQ_SQRT / this.densityBase;
+		if (this.bandMap === 2) return BAND_FREQ_LOG / this.densityBase;
+		if (!this.wrap) return 1 / this.densityBase;   // linear ramp: no stretch (clamped level window)
 		const zoom = DEFAULT_VIEW.spanX / v.spanX;
 		const stretch = zoom > 1 ? Math.pow(zoom, COLOR_STRETCH_EXP) : 1;
 		return 1 / (this.densityBase * stretch);
@@ -940,6 +990,7 @@ class FractalRenderer {
 		this.ssaaPhase = false;
 		this.sharpenMode = this.usePert ? "pert" : "dd";   // pert windows sharpen in perturbation first, then DD
 		this.provLo = Infinity; this.provHi = -Infinity;   // reset the per-frame running provisional range
+		this.ssaaCount = 0;   // invalidate the previous frame's anti-aliasing cache
 		// Reset the telemetry accumulators for the new frame (counts rebuild as tiles land).
 		this.muMax = -Infinity; this.wfEsc = 0; this.wfCap = 0; this.wfIns = 0;
 		this.xPert = 0; this.xDD = 0; this.xDirect = 0; this.p50 = 0; this.p90 = 0;
@@ -1098,11 +1149,34 @@ class FractalRenderer {
 	// only anti-aliases the already-resolved display. Per-tile getImageData/putImageData so
 	// untouched pixels keep their colour.
 	private applySSAA(m: DoneMsg): void {
-		const idx = m.idx!, col = new Uint32Array(m.col!);
+		const idx = m.idx!, mu = new Float32Array(m.mu!), de = new Float32Array(m.de!);
+		const nSub = SS * SS, W = canvas.width;
+		provOn = this.provOn; provLo = this.provLo; provHi = this.provHi; provLut = this.provLut;   // colorSample globals
 		const img = ctx.getImageData(m.ox, m.oy, m.tw, m.th);
 		const data32 = new Uint32Array(img.data.buffer);
-		for (let k = 0; k < idx.length; k++) data32[idx[k]] = col[k];
+		for (let k = 0; k < idx.length; k++) {
+			const p = idx[k], off = k * nSub;
+			// Stash this edge pixel's subsamples (global position + SS² mu/de) so a recolor can re-average.
+			const c = this.ssaaCount++;
+			this.ssaaPos[c] = (m.oy + ((p / m.tw) | 0)) * W + m.ox + (p % m.tw);
+			this.ssaaMu.set(mu.subarray(off, off + nSub), c * nSub);
+			this.ssaaDe.set(de.subarray(off, off + nSub), c * nSub);
+			data32[p] = this.ssaaColor(mu, de, off, nSub);   // average → blit (tile-local index)
+		}
 		ctx.putImageData(img, m.ox, m.oy);
+	}
+
+	// Average one edge pixel's SS² subsamples into a packed color, via the shared colorSample. Used
+	// both when the AA tiles land and when a recolor re-averages the cached subsamples.
+	private ssaaColor(mu: Float32Array, de: Float32Array, off: number, nSub: number): number {
+		const px = this.view.spanX / canvas.width;
+		let ar = 0, ag = 0, ab = 0;
+		for (let s = 0; s < nSub; s++) {
+			const cc = colorSample(mu[off + s], de[off + s], this.lut, this.inSet, this.mode, this.wrap,
+				this.densityMul, px, this.bandMap, this.muLo, this.muHi);
+			ar += cc & 255; ag += (cc >> 8) & 255; ab += (cc >> 16) & 255;
+		}
+		return ((255 << 24) | (((ab / nSub) | 0) << 16) | (((ag / nSub) | 0) << 8) | ((ar / nSub) | 0)) >>> 0;
 	}
 
 	// Color one field sample (repaints a sharpened pixel) via the shared colorSample —
