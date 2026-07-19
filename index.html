@@ -62,9 +62,17 @@
 				<label class="field">formula
 					<select class="formula-select">
 						<option value="0">z² + c</option>
-						<option value="1">Cthulu</option>
+						<option value="cubic">z³ + c</option>
+						<option value="ship">Burning Ship</option>
+						<option value="cosine">Cosine</option>
+						<option value="custom">custom</option>
 					</select>
 				</label>
+				<label class="field formula-custom hidden">f(z,c) =
+					<input class="formula-input" type="text" spellcheck="false" autocomplete="off" autocapitalize="off"
+						value="z^2 + c" title="e.g. z^2 + c · (z^2+c)*sin(z^(c*i)) · z^3 + c · c*sin(z)" />
+				</label>
+				<span class="formula-error" role="alert"></span>
 				<label class="field checkbox"><input class="julia-toggle" type="checkbox" /> julia</label>
 				<label class="field">filter
 					<select class="filter-select">

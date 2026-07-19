@@ -154,7 +154,9 @@ interface TileJob { ox: number; oy: number; tw: number; th: number; idx?: Int32A
 // message loop. It holds the current palette and renders whatever tile it's
 // handed, transferring the pixels straight back. NOTE: this relies on the build
 // not minifying/renaming these functions (plain tsc + cp — it doesn't).
-function buildWorkerSource(): string {
+// customStepSrc, when given, is a full `function stepFormula(zx, zy, cx, cy) { … }` compiled from a
+// user formula (formula.ts) — spliced in place of the default z²+c step so FORMULA_CUSTOM runs it.
+function buildWorkerSource(customStepSrc?: string): string {
 	return [
 		'"use strict";',
 		"const BAILOUT2 = " + BAILOUT2 + ";",
@@ -173,7 +175,7 @@ function buildWorkerSource(): string {
 		"const DD_SPLIT = " + DD_SPLIT + ";",
 		"let bandMap = 0;",
 			"const BAILOUT_CUSTOM2 = " + BAILOUT_CUSTOM2 + ";",   // custom-formula escape radius²
-			"const FORMULA_MANDEL = 0, FORMULA_CTHULU = 1;",       // Kernel-2 formula ids
+			"const FORMULA_MANDEL = 0, FORMULA_CUSTOM = 1;",   // Kernel-2 formula ids
 			"let fractalMode = 0, juliaMode = false, formulaId = 0, juliaCx = 0, juliaCy = 0;",   // kernel selector + set type + formula + Julia seed
 			"let mSeedAtC = false;",   // Mandelbrot seed: z₀=0 (canonical) vs z₀=c (heuristic map, formulas singular at 0)
 			"let _cre = 0, _cim = 0;",                            // complex-op scratch (re, im)
@@ -197,13 +199,10 @@ function buildWorkerSource(): string {
 		refOrbitLen.toString(),
 		computeRef.toString(),
 		escapeSmoothPert.toString(),
-			cAdd.toString(),
-			cMul.toString(),
-			cSin.toString(),
-			cExp.toString(),
-			cLog.toString(),
-			cPow.toString(),
 			setupFilter.toString(),
+				// stepFormula: the FORMULA_CUSTOM iteration step. Default z²+c unless a user formula is
+				// compiled (formula.ts) and passed in — then that generated source is spliced in its place.
+				customStepSrc || "function stepFormula(zx, zy, cx, cy) { _cre = zx * zx - zy * zy + cx; _cim = 2 * zx * zy + cy; }",
 				probeFormulaAtZero.toString(),
 				escapeCustom.toString(),
 		escapeAtPt.toString(),
@@ -285,6 +284,7 @@ class FractalRenderer {
 	private juliaMode = false;
 	private juliaCx = 0;
 	private juliaCy = 0;
+	private customStepSrc = "";   // generated `function stepFormula(…){…}` for FORMULA_CUSTOM (empty = none)
 	// Mandelbrot seed for Kernel 2: z₀=0 (canonical) or z₀=c (mSeedAtC — the heuristic parameter-map fallback
 	// for formulas undefined at 0, decided by probing f(0) in render()). heuristicMap mirrors it for the UI
 	// (onMapMode), so the user can tell a true Mandelbrot from a heuristic map.
@@ -949,8 +949,37 @@ class FractalRenderer {
 	// ---- E6: the fractal API the UI drives. Each setter updates state + re-derives which kernel to
 	// use (deriveKernel); the caller then re-renders. The renderer never exposes kernel internals. ----
 
-	// Choose the iteration formula: 0 = z²+c, 1 = Cthulu (z²+c)·sin(z^(c·i)).
+	// Choose the iteration formula id: 0 = z²+c (Kernel 1 fast path). Presets + custom go through
+	// setCustomFormula (which selects FORMULA_CUSTOM), so the UI calls this only to return to z²+c.
 	public setFormula(formulaId: number): void { this.formulaId = formulaId; this.deriveKernel(); }
+
+	// Install a user formula (FORMULA_CUSTOM). `body` is a stepFormula BODY from compileFormula() — the
+	// caller (index.ts) has already validated it, so it's a safe, whitelisted straight-line block ending
+	// in `_cre = …; _cim = …;`. Two consumers need it: (1) the MAIN thread's stepFormula, for the f(0)
+	// probe + sync-render paths — assigned via new Function (its body reads/writes the global _cre/_cim,
+	// which are top-level lexical bindings a new-Function body can reach in this module:none build); and
+	// (2) the WORKERS, which get it spliced into a rebuilt source. Selects FORMULA_CUSTOM; caller re-renders.
+	public setCustomFormula(body: string): void {
+		this.customStepSrc = "function stepFormula(zx, zy, cx, cy) {\n" + body + "\n}";
+		try {
+			// eslint-disable-next-line no-new-func
+			stepFormula = new Function("zx", "zy", "cx", "cy", body) as unknown as (zx: number, zy: number, cx: number, cy: number) => void;
+		} catch { /* body was validated upstream; leave the previous step in place if this ever throws */ }
+		this.formulaId = FORMULA_CUSTOM;
+		this.rebuildWorkers();
+		this.deriveKernel();
+	}
+
+	// Rebuild the worker blob with the current custom step and respawn the whole pool (not just the busy
+	// ones — every worker still holds the previous stepFormula). Cheap and rare (only on a formula change),
+	// and a formula change always triggers a full re-render anyway. No-op in the sync fallback (no workers).
+	private rebuildWorkers(): void {
+		if (!this.workers.length) return;
+		const old = this.workerUrl;
+		this.workerUrl = URL.createObjectURL(new Blob([buildWorkerSource(this.customStepSrc)], { type: "application/javascript" }));
+		for (let i = 0; i < this.workers.length; i++) { this.workers[i].terminate(); this.spawnWorker(i); }
+		if (old) URL.revokeObjectURL(old);
+	}
 
 	// Choose the set type: juliaMode false = Mandelbrot (c per pixel), true = Julia with seed (cx,cy).
 	public setSetType(juliaMode: boolean, cx = 0, cy = 0): void {
@@ -1156,7 +1185,7 @@ class FractalRenderer {
 		if (this.muField.length !== px) { this.muField = new Float32Array(px); this.deField = new Float32Array(px); }
 		// Mandelbrot seed choice (Kernel 2 only): probe f(0) on a few sample c. Use z₀=0 (canonical) if the
 		// formula is finite at 0 anywhere; fall back to z₀=c (a heuristic parameter map) only if it's non-finite
-		// EVERYWHERE (a universal singularity, e.g. Cthulu). Never mislabels a z=0-friendly formula. onMapMode
+		// EVERYWHERE (a universal singularity, e.g. z²+c/z: c/0). Never mislabels a z=0-friendly formula. onMapMode
 		// tells the UI which it is. (Julia mode + Kernel 1 always canonical.)
 		this.mSeedAtC = false; this.heuristicMap = false;
 		if (this.fractalMode && !this.juliaMode) {

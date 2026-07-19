@@ -69,7 +69,7 @@ if (precisionStatus) {
 }
 
 // Heuristic-map flag: shows "parameter map" when a "Mandelbrot" is really a z₀=c heuristic (a formula
-// with no z₀=0 set, e.g. Cthulu), hidden for true M-sets and Julia. Wired before the first render.
+// with no z₀=0 set, e.g. z²+c/z), hidden for true M-sets and Julia. Wired before the first render.
 const mapNote = document.querySelector(".map-note") as HTMLElement | null;
 if (mapNote) {
 	renderer.onMapMode = (heuristic) => { mapNote.textContent = heuristic ? "parameter map" : ""; mapNote.classList.toggle("is-shown", heuristic); };
@@ -166,7 +166,8 @@ dev.tierazon = (opts?: { rings?: boolean; dStrands?: number; dFactor?: number })
 	const XMIN = -0.1499053515515627, XMAX = 1.188366179688075;
 	const YMIN = 0.2655855689131403, YMAX = 1.269289217342869;
 	view = { cx: (XMIN + XMAX) / 2, cxLo: 0, cy: (YMIN + YMAX) / 2, cyLo: 0, spanX: XMAX - XMIN, spanY: YMAX - YMIN };
-	renderer.setFormula(FORMULA_CTHULU);
+	const ct = compileFormula("(z^2 + c) * sin(z^(c*i))");   // the old Cthulu formula, now via the compiler
+	if (ct.ok && ct.body) renderer.setCustomFormula(ct.body);
 	renderer.setSetType(true, 0.4206477290564087, 0.5647650444593624);   // Julia, the brief's seed
 	if (opts && opts.rings) {
 		const dStrands = opts.dStrands ?? 0.08, dFactor = opts.dFactor ?? 4;
@@ -529,6 +530,32 @@ function setHistory(h: View[]): void {
 function defaultJuliaView(): View {
 	return { cx: 0, cxLo: 0, cy: 0, cyLo: 0, spanX: 4, spanY: 4 / CANVAS_ASPECT };   // origin, |z| < 2, aspect-matched
 }
+
+// The formula dropdown, as data. Key = the <option> value. "0" is the standard z²+c (Kernel 1 fast path,
+// no compiled formula). "custom" is the editable field. Every other entry is a formula STRING compiled
+// through the same path as custom (compileFormula → setCustomFormula) — adding a preset is just a row.
+// Each may carry its own default window: `center` (else origin, or cx=-1 for the standard) and `spanX`.
+interface Preset { formula?: string; center?: { cx: number; cy: number }; spanX?: number; }
+const PRESETS: { [key: string]: Preset } = {
+	"0": {},                                                                   // z²+c → Kernel 1; classic cx=-1 framing
+	"cubic": { formula: "z^3 + c" },                                           // cubic Multibrot, origin
+	"ship": { formula: "(abs(re(z)) + abs(im(z))*i)^2 + c", center: { cx: -0.5, cy: -0.5 }, spanX: 3.4 },   // Burning Ship
+	"cosine": { formula: "c*cos(z)" },                                         // cosine map, origin
+	"custom": {},                                                              // editable; origin
+};
+
+// The default window for the current mode + formula (reset target; also where a formula switch lands).
+// Julia always centers on the origin. In Mandelbrot mode each preset supplies its own framing (PRESETS):
+// the standard z²+c keeps the classic cx=-1, everything else defaults to the origin unless it overrides.
+function defaultViewFor(): View {
+	if (inJulia) return defaultJuliaView();
+	const key = formulaSelect ? formulaSelect.value : "0";
+	const p = PRESETS[key] || {};
+	const cx = p.center ? p.center.cx : (key === "0" ? DEFAULT_VIEW.cx : 0);
+	const cy = p.center ? p.center.cy : 0;
+	const spanX = p.spanX || DEFAULT_VIEW.spanX;
+	return { ...DEFAULT_VIEW, cx, cy, spanX, spanY: spanX / CANVAS_ASPECT };
+}
 function seedKey(cx: number, cy: number): number { return cx * 1e7 + cy; }   // cheap equality key for the seed
 
 function enterJulia(): void {
@@ -606,7 +633,7 @@ if (outButton) {
 
 resetButton.addEventListener("click", () => {
 	pushHistory(view);
-	goTo({ ...DEFAULT_VIEW });
+	goTo(defaultViewFor());
 });
 
 // Coloring method (optional control) — one dropdown for all four paths: escape-time bands with the
@@ -645,6 +672,9 @@ if (paletteSelect) {
 //---------------------------------------------------------------------------\\
 
 const formulaSelect = document.querySelector(".formula-select") as HTMLSelectElement | null;
+const formulaCustom = document.querySelector(".formula-custom") as HTMLElement | null;
+const formulaInput = document.querySelector(".formula-input") as HTMLInputElement | null;
+const formulaError = document.querySelector(".formula-error") as HTMLElement | null;
 const juliaToggle = document.querySelector(".julia-toggle") as HTMLInputElement | null;
 const filterSelect = document.querySelector(".filter-select") as HTMLSelectElement | null;
 const strandsSlider = document.querySelector(".strands-slider") as HTMLInputElement | null;
@@ -659,8 +689,11 @@ function pushFilter(): void {
 }
 function updateContextualControls(): void {
 	const filterOn = currentFilterId() !== 0;
-	const k2 = (formulaSelect ? Number(formulaSelect.value) !== 0 : false) || !!juliaToggle?.checked || filterOn;
+	const customOn = formulaSelect?.value === "custom";
+	const k2 = (formulaSelect ? formulaSelect.value !== "0" : false) || !!juliaToggle?.checked || filterOn;
 	document.querySelectorAll<HTMLElement>(".filter-param").forEach((el) => el.classList.toggle("hidden", !filterOn));
+	formulaCustom?.classList.toggle("hidden", !customOn);   // the f(z,c)= text field appears only for "custom…"
+	if (!customOn && formulaError) formulaError.textContent = "";   // clear a stale error when leaving custom
 	coloringBody?.classList.toggle("inactive", filterOn);   // escape-time coloring is bypassed by a filter
 	// Distance coloring needs Kernel 1's derivative; disable it on Kernel 2 (fall back to log if it was picked).
 	const distOpt = coloringSelect?.querySelector<HTMLOptionElement>('option[value="distance"]');
@@ -669,12 +702,53 @@ function updateContextualControls(): void {
 	filterState.active = filterOn;   // telemetry relabels in filter mode (V7)
 }
 
+// Show/clear a formula error; empty text hides the pill (see .formula-error:empty in CSS).
+function showFormulaError(msg: string): void { if (formulaError) formulaError.textContent = msg; }
+
+// Compile the text field and, if it's valid, install it as the custom formula + re-render. Returns
+// whether it compiled. `refsC === false` (a formula that ignores c) makes every Mandelbrot pixel
+// identical — surfaced as a non-blocking note rather than an error. The compiler is pure + cheap.
+function applyCustomFormula(): boolean {
+	if (!formulaInput) return false;
+	const res = compileFormula(formulaInput.value);
+	if (!res.ok || !res.body) { showFormulaError(res.error || "invalid formula"); return false; }
+	showFormulaError(res.refsC === false && !juliaToggle?.checked ? "note: no c — every point is identical" : "");
+	renderer.setCustomFormula(res.body);
+	updateContextualControls();
+	goTo(view);   // render the current view (the dropdown handler resets it to the formula default first)
+	return true;
+}
+
 if (formulaSelect) {
 	formulaSelect.addEventListener("change", () => {
-		renderer.setFormula(Number(formulaSelect.value));
+		// A new formula is a new fractal: land on its default window (per-preset center) and drop the old
+		// zoom history. Julia keeps its own view/bundle (already origin-centered).
+		if (!inJulia) { view = defaultViewFor(); setHistory([]); }
+		const key = formulaSelect.value;
+		if (key === "custom") {
+			updateContextualControls();   // reveal the text field
+			applyCustomFormula();         // compile the field + install + render the reset view
+			return;
+		}
+		const preset = PRESETS[key];
+		if (preset && preset.formula) {
+			const res = compileFormula(preset.formula);   // presets are known-valid, but guard anyway
+			if (res.ok && res.body) renderer.setCustomFormula(res.body);
+		} else {
+			renderer.setFormula(FORMULA_MANDEL);          // "0" → standard z²+c (Kernel 1)
+		}
 		updateContextualControls();
-		renderer.render(view);
+		goTo(view);
 	});
+}
+if (formulaInput) {
+	// Validate live as they type (cheap, no render); apply on Enter or blur (a re-iterate).
+	formulaInput.addEventListener("input", () => {
+		const res = compileFormula(formulaInput.value);
+		showFormulaError(res.ok ? "" : res.error || "invalid formula");
+	});
+	formulaInput.addEventListener("change", () => applyCustomFormula());
+	formulaInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); applyCustomFormula(); } });
 }
 
 if (filterSelect) {

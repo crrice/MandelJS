@@ -135,13 +135,13 @@ let fractalMode = 0;
 let juliaMode = false;
 let juliaCx = 0, juliaCy = 0;   // Julia seed c (used only when juliaMode)
 // Iteration-formula selector for Kernel 2 (constant per frame → the per-iteration switch is predicted).
-// 0 = z²+c (same math as Kernel 1), 1 = Cthulu, the map (z²+c)·sin(z^(c·i)). Additive: a future parser
-// registers more ids behind the same switch.
+// 0 = z²+c (same math as Kernel 1); 1 = a user/preset formula compiled by formula.ts and run through the
+// stepFormula seam below (the dropdown's named presets and "custom" all route here — see index.ts PRESETS).
 const FORMULA_MANDEL = 0;
-const FORMULA_CTHULU = 1;
+const FORMULA_CUSTOM = 1;
 let formulaId = 0;
 // Mandelbrot seed selector for Kernel 2. Normally z₀ = 0 (the canonical Mandelbrot seed). But some
-// formulas are undefined at z=0 (Cthulu: z^(c·i) needs log 0), which makes the z₀=0 Mandelbrot degenerate
+// formulas are undefined at z=0 (e.g. c/z or log z need a nonzero z), which makes the z₀=0 Mandelbrot degenerate
 // (every pixel NaN-escapes → solid color). For those, the renderer probes f(0), finds it non-finite, and
 // sets mSeedAtC → seed z₀ = c instead. That's NOT a true Mandelbrot set (c isn't the critical orbit) — it's
 // a heuristic PARAMETER MAP, flagged as such in the UI. Only ever true when z₀=0 genuinely fails.
@@ -510,49 +510,32 @@ function escapeSmoothPert(cr: number, ci: number, dcx: number, dcy: number, maxI
 }
 
 //---------------------------------------------------------------------------\\
-// Complex arithmetic for the custom-formula path — a complex number is a real f64
-// pair (re, im). JS's Math library is real→real, so each "complex" op is an identity
-// that decomposes into real Math calls (there is no complex sin/log/exp to call). Each
-// op writes its two-component result to the _cre/_cim scratch pair instead of allocating
-// a pair — the same allocation-free trick as the DD _dhi/_dlo scratch — so copy _cre/_cim
-// into locals immediately after each call (the next op clobbers them). Only escapeSmoothTierazon
-// uses these; the z²+c kernels keep their inlined multiply/add, so nothing here touches that path.
-// Self-contained for worker stringification (Math + the scratch globals only).
+// Custom-formula output scratch (re, im). A complex number is a real f64 pair; stepFormula (below)
+// writes its result here instead of returning a pair (JS can't cheaply return two f64) — the same
+// allocation-free trick as the DD _dhi/_dlo scratch. escapeCustom / probeFormulaAtZero copy _cre/_cim
+// into locals right after the stepFormula call. (The compiled formula body itself is flat straight-line
+// f64 — see formula.ts — so it needs no complex-op helpers; the z²+c kernels keep their inlined math.)
 //---------------------------------------------------------------------------\\
-
-// Complex op result scratch (re, im) — see above.
 let _cre = 0, _cim = 0;
 
-// (ax,ay) + (bx,by)
-function cAdd(ax: number, ay: number, bx: number, by: number): void { _cre = ax + bx; _cim = ay + by; }
-// (ax,ay) · (bx,by) = (ax·bx − ay·by, ax·by + ay·bx)
-function cMul(ax: number, ay: number, bx: number, by: number): void { _cre = ax * bx - ay * by; _cim = ax * by + ay * bx; }
-// sin(x+iy) = sin(x)·cosh(y) + i·cos(x)·sinh(y)   (angle-addition + cos(iy)=cosh y, sin(iy)=i·sinh y)
-function cSin(x: number, y: number): void { _cre = Math.sin(x) * Math.cosh(y); _cim = Math.cos(x) * Math.sinh(y); }
-// exp(x+iy) = eˣ·(cos y + i·sin y)   (Euler)
-function cExp(x: number, y: number): void { const ex = Math.exp(x); _cre = ex * Math.cos(y); _cim = ex * Math.sin(y); }
-// log(z) = ln|z| + i·arg(z)   (principal branch via atan2)
-function cLog(x: number, y: number): void { _cre = Math.log(Math.hypot(x, y)); _cim = Math.atan2(y, x); }
-// z^w = exp(w · log z) — the only route for a COMPLEX exponent w (can't repeat-multiply). Composes
-// clog → cmul → cexp; each sub-call clobbers _cre/_cim, so the intermediates are copied into locals.
-function cPow(zx: number, zy: number, wx: number, wy: number): void {
-	cLog(zx, zy); const lx = _cre, ly = _cim;
-	cMul(wx, wy, lx, ly); const px = _cre, py = _cim;
-	cExp(px, py);
-}
+// FORMULA_CUSTOM step: one iteration z ← f(z, c) of a user formula compiled by formula.ts. Writes
+// the result to the (_cre, _cim) scratch (same convention as the complex ops). The generated body is
+// flat straight-line f64 — NOT this default. The WORKER gets its stepFormula spliced in by
+// buildWorkerSource; the MAIN thread (probe + sync-render paths) gets one assigned via `new Function`
+// in renderer.setCustomFormula. This z²+c default stands in until a formula is compiled and keeps
+// escapeCustom / probeFormulaAtZero well-typed. `let` so the main thread can reassign it.
+let stepFormula: (zx: number, zy: number, cx: number, cy: number) => void =
+	function (zx, zy, cx, cy) { _cre = zx * zx - zy * zy + cx; _cim = 2 * zx * zy + cy; };
 
 // M-mode seed probe: is the formula's FIRST step from z=0 finite? The renderer calls this on a few sample
 // c to choose the Mandelbrot seed — z₀=0 when finite (the canonical set), else z₀=c (a heuristic parameter
-// map). Returns 1 if f_c(0) is finite, 0 if not. One step only; MIRRORS the formula switch in escapeCustom
-// (keep them in sync when adding a formula). Runs once per render on the main thread, so cost is irrelevant.
+// map). Returns 1 if f_c(0) is finite, 0 if not. One step only; uses the same stepFormula seam as
+// escapeCustom, so it stays in sync automatically. Runs once per render on the main thread — cost irrelevant.
 function probeFormulaAtZero(cx: number, cy: number): number {
 	let zx = 0, zy = 0;
-	if (formulaId === FORMULA_CTHULU) {
-		const wx = -cy, wy = cx;
-		cMul(zx, zy, zx, zy); cAdd(_cre, _cim, cx, cy); const ax = _cre, ay = _cim;
-		cPow(zx, zy, wx, wy); cSin(_cre, _cim); const sx = _cre, sy = _cim;
-		cMul(ax, ay, sx, sy); zx = _cre; zy = _cim;
-	} else {                       // FORMULA_MANDEL: z²+c at z=0 → c
+	if (formulaId === FORMULA_CUSTOM) {   // user/preset formula: one step from z=0 via the stepFormula seam
+		stepFormula(zx, zy, cx, cy); zx = _cre; zy = _cim;
+	} else {                              // FORMULA_MANDEL: z²+c at z=0 → c
 		zx = cx; zy = cy;
 	}
 	return (isFinite(zx) && isFinite(zy)) ? 1 : 0;
@@ -566,14 +549,15 @@ function probeFormulaAtZero(cx: number, cy: number): number {
 // bulb shortcuts (z²+c-specific), but DOES do generic z-periodicity (cycle detection generalizes — see the
 // loop). Escape radius BAILOUT_CUSTOM2 (|z|²≥4). No derivative (no distance mode).
 //
-// formulaId picks the step (constant per frame → the branch is predicted): z²+c, or Cthulu (z²+c)·sin(z^(c·i)).
+// formulaId picks the step (constant per frame → the branch is predicted): z²+c, or a compiled user/preset
+// formula run through the stepFormula seam.
 //
 // Two coloring regimes, selected by filterId:
 //   FILTER_NONE — escape-time. Returns the smooth escape count (same convention as escapeSmooth) or
-//     CAPPED if still bounded. FINITE GUARD: sin of a large imaginary part overflows to Inf, and a
-//     following Inf·0 yields NaN; a NaN magnitude fails the escape test and would iterate to the cap
-//     (wrongly painting in-set), so a non-finite z is treated as escaped at n. The z²+c formula matches
-//     Kernel 1's exterior math (the parity oracle); the smooth term assumes degree-2 escape.
+//     CAPPED if still bounded. FINITE GUARD: a transcendental step (e.g. sin of a large imaginary part)
+//     can overflow to Inf, and a following Inf·0 yields NaN; a NaN magnitude fails the escape test and
+//     would iterate to the cap (wrongly painting in-set), so a non-finite z is treated as escaped at n.
+//     The z²+c formula matches Kernel 1's exterior math (the parity oracle); the smooth term assumes degree-2 escape.
 //   a filter — an accumulating orbit trap (filter-interface.md), hooks inlined not virtual: init = the
 //     trap geometry (frame-constant |seed| in Julia; PER-PIXEL |c| in Mandelbrot, computed below);
 //     onIteration = the switch(filterId) on the POST-update z; complete = the switch at loop exit. Output
@@ -582,7 +566,6 @@ function probeFormulaAtZero(cx: number, cy: number): number {
 //     test on PRE-update z, filter on POST-update (a point can be trapped one step before escape culls it).
 // escapeSmooth (Kernel 1) is left byte-for-byte untouched. Self-contained for stringification.
 function escapeCustom(z0x: number, z0y: number, cx: number, cy: number, maxIters: number): number {
-	const wx = -cy, wy = cx;   // w = c·i (c rotated 90°) — the Cthulu formula's exponent, from THIS pixel's c
 	// Trap geometry: frame-constant globals in Julia; per-pixel limit = |c| in Mandelbrot (filter-interface.md).
 	let tLimit = trapLimit, tLo = trapLo, tHi = trapHi;
 	if (filterId !== FILTER_NONE && !juliaMode) { tLimit = Math.sqrt(cx * cx + cy * cy); tLo = tLimit - trapDStrands; tHi = tLimit + trapDStrands; }
@@ -593,10 +576,8 @@ function escapeCustom(z0x: number, z0y: number, cx: number, cy: number, maxIters
 		const mag2 = zx * zx + zy * zy;                     // escape test on PRE-update z
 		if (!(mag2 < BAILOUT_CUSTOM2)) { escaped = true; break; }   // escaped, OR non-finite (NaN/Inf fail "< R")
 		// formula step (formulaId): z ← f(z, c)
-		if (formulaId === FORMULA_CTHULU) {                 // (z²+c)·sin(z^(c·i))
-			cMul(zx, zy, zx, zy); cAdd(_cre, _cim, cx, cy); const ax = _cre, ay = _cim;   // z² + c
-			cPow(zx, zy, wx, wy); cSin(_cre, _cim); const sx = _cre, sy = _cim;           // sin( z^(c·i) )
-			cMul(ax, ay, sx, sy); zx = _cre; zy = _cim;                                   // (z²+c)·sin(…)
+		if (formulaId === FORMULA_CUSTOM) {                 // user/preset formula (formula.ts) via the stepFormula seam
+			stepFormula(zx, zy, cx, cy); zx = _cre; zy = _cim;
 		} else {                                            // FORMULA_MANDEL: z² + c (matches Kernel 1)
 			const nzx = zx * zx - zy * zy + cx, nzy = 2 * zx * zy + cy;
 			zx = nzx; zy = nzy;
