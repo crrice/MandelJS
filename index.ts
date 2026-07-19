@@ -29,7 +29,7 @@ const renderer = new FractalRenderer(currentPalette);
 // View <-> URL. The address bar always reflects the current view (?cx&cy&span),
 // so any zoom is a permalink: copy it, or reload it verbatim to reproduce the
 // exact same view — essential for apples-to-apples before/after benchmarks.
-const CANVAS_ASPECT = canvas.width / canvas.height;
+let CANVAS_ASPECT = canvas.width / canvas.height;   // live: the aspect selector updates it (V5)
 function viewFromUrl(): View | null {
 	const p = new URLSearchParams(location.search);
 	const cx = parseFloat(p.get("cx") || ""), cy = parseFloat(p.get("cy") || ""), span = parseFloat(p.get("span") || "");
@@ -37,7 +37,14 @@ function viewFromUrl(): View | null {
 	if (!isFinite(cx) || !isFinite(cy) || !isFinite(span) || span <= 0) return null;
 	return { cx, cxLo: isFinite(cxLo) ? cxLo : 0, cy, cyLo: isFinite(cyLo) ? cyLo : 0, spanX: span, spanY: span / CANVAS_ASPECT };
 }
+// True while a Julia set is on screen. The URL currently carries only the VIEW (cx/cy/span), not the
+// formula/set-type/seed (the permalink for those is deferred). So a Julia's z-space view must NOT be
+// written to the URL — otherwise a refresh re-applies that view (centered at the z-origin) to the default
+// z²+c Mandelbrot, landing it at the origin instead of its usual center. Gating syncUrl on Mandelbrot mode
+// keeps the URL a valid Mandelbrot permalink at all times; a refresh mid-Julia returns to the last M-view.
+let inJulia = false;
 function syncUrl(v: View): void {
+	if (inJulia) return;   // don't let a Julia z-view pollute the (Mandelbrot-only) URL
 	const p = new URLSearchParams(location.search);
 	p.set("cx", String(v.cx)); p.set("cy", String(v.cy)); p.set("span", String(v.spanX));
 	// DD center lo-limbs, only when nonzero (deep views) so shallow permalinks stay clean. Each limb is an
@@ -61,6 +68,13 @@ if (precisionStatus) {
 	};
 }
 
+// Heuristic-map flag: shows "parameter map" when a "Mandelbrot" is really a z₀=c heuristic (a formula
+// with no z₀=0 set, e.g. Cthulu), hidden for true M-sets and Julia. Wired before the first render.
+const mapNote = document.querySelector(".map-note") as HTMLElement | null;
+if (mapNote) {
+	renderer.onMapMode = (heuristic) => { mapNote.textContent = heuristic ? "parameter map" : ""; mapNote.classList.toggle("is-shown", heuristic); };
+}
+
 renderer.render(view);
 
 // Benchmark helper (console): re-render the current view n times and report the
@@ -75,6 +89,10 @@ const dev = window as unknown as {
 	mandelDD: (on?: boolean | null) => void;
 	mandelPert: (on?: boolean | null) => void;
 	mandelProv: (on?: boolean) => void;
+	tierazon: (opts?: { rings?: boolean; dStrands?: number; dFactor?: number }) => void;
+	tierazonExposure: (dFactor: number) => void;
+	juliaHere: () => void;
+	filterHere: (dFactor?: number) => void;
 };
 
 dev.mandelBench = async (n = 9) => {
@@ -133,20 +151,81 @@ dev.mandelPert = (on = true) => {
 // mandelSharpen(false) to freeze an all-CAPPED frame and flip it. e.g. mandelProv(false)
 dev.mandelProv = (on = true) => { renderer.setProv(on); console.log("provisional coloring " + (on ? "ON" : "OFF")); };
 
+// Custom-formula preview (the "Tierazon" repro): a Julia set of z ← (z²+c)·sin(z^(c·i)) with the
+// seed and window from tierazon-basic-repro.md, f64. NOT wired into the UI yet — a console hook to
+// eyeball the shape. The cap is left to the normal probe-cap + idle-sharpening machinery (more
+// accurate than the old program's fixed cap). The target window is 4:3, so the canvas is resized to
+// 4:3 (square pixels → undistorted); reload to return to the normal 2:1 Mandelbrot explorer. e.g. tierazon()
+dev.tierazon = (opts?: { rings?: boolean; dStrands?: number; dFactor?: number }) => {
+	const W = 640, H = 480;   // 4:3, matching the target window's aspect (square pixels, no stretch)
+	canvas.width = W; canvas.height = H;
+	easel.style.height = H + "px";
+	const overlay = easel.querySelectorAll("canvas")[1] as HTMLCanvasElement | undefined;
+	if (overlay) { overlay.width = W; overlay.height = H; }   // keep the selector overlay in sync
+	// Window + seed straight from the brief.
+	const XMIN = -0.1499053515515627, XMAX = 1.188366179688075;
+	const YMIN = 0.2655855689131403, YMAX = 1.269289217342869;
+	view = { cx: (XMIN + XMAX) / 2, cxLo: 0, cy: (YMIN + YMAX) / 2, cyLo: 0, spanX: XMAX - XMIN, spanY: YMAX - YMIN };
+	renderer.setFormula(FORMULA_CTHULU);
+	renderer.setSetType(true, 0.4206477290564087, 0.5647650444593624);   // Julia, the brief's seed
+	if (opts && opts.rings) {
+		const dStrands = opts.dStrands ?? 0.08, dFactor = opts.dFactor ?? 4;
+		renderer.setFilter(1, dStrands, dFactor);
+		renderer.render(view, 128);
+		console.log("tierazon x-ray rings: dStrands=" + dStrands + ", dFactor=" + dFactor + " · tierazonExposure(n) to tune · reload to reset");
+	} else {
+		renderer.setFilter(0);   // escape-time coloring
+		renderer.render(view);
+		console.log("tierazon: Cthulu Julia, escape-time, window 4:3 · tierazon({rings:true}) for the x-ray filter · reload to reset");
+	}
+};
+
+// Tune the x-ray filter exposure by eye — instant recolor from the stored accumulators (no re-iterate).
+dev.tierazonExposure = (dFactor) => { renderer.setFilterExposure(dFactor); console.log("filter exposure dFactor=" + dFactor); };
+
+// z²+c JULIA seeded from the current view CENTER — tests the Julia path through Kernel 2. e.g. juliaHere()
+dev.juliaHere = () => {
+	renderer.setFormula(FORMULA_MANDEL);
+	renderer.setSetType(true, view.cx, view.cy);   // Julia @ current center
+	renderer.setFilter(0);
+	const seed = view;
+	view = { cx: 0, cxLo: 0, cy: 0, cyLo: 0, spanX: 4, spanY: 4 / (canvas.width / canvas.height) };   // default z-window
+	renderer.render(view);
+	console.log("z²+c Julia @ c = " + seed.cx.toFixed(6) + " + " + seed.cy.toFixed(6) + "i · reload to reset");
+};
+
+// Apply the x-ray filter to the CURRENT fractal (default z²+c Mandelbrot) — tests filters on M-sets
+// (per-pixel trap limit = |c|). e.g. filterHere() or filterHere(6)
+dev.filterHere = (dFactor = 4) => {
+	renderer.setFilter(1, 0.08, dFactor);
+	renderer.render(view);
+	console.log("x-ray rings on the current fractal, dFactor=" + dFactor + " · tierazonExposure(n) to tune · reload to reset");
+};
+
 // Progressive readout (optional element): the current render phase plus the live undetermined-point
 // split — `working` (still being iterated) and `abandoned` (given up on once escalation stops).
 // The leading dot pulses while the workers are busy (any non-done phase) and turns green when
 // settled. Phase: first frame → refining → anti-aliasing → done.
 const sharpenStatus = document.querySelector(".sharpen-status") as HTMLElement | null;
 if (sharpenStatus) {
-	renderer.onProgress = ({ working, abandoned, done, phase }) => {
+	renderer.onProgress = ({ working, abandoned, done, phase, etaMs }) => {
 		const parts = [phase];
+		// First-frame ETA (conservative estimate; the refinement/AA tail isn't estimated). Shown as a countdown.
+		if (phase === "first frame" && etaMs !== undefined && etaMs > 250) parts.push("~" + fmtEta(etaMs) + " left");
 		if (working > 0) parts.push(working.toLocaleString() + " working");
 		if (abandoned > 0) parts.push(abandoned.toLocaleString() + " abandoned");
 		sharpenStatus.textContent = parts.join(" · ");
 		sharpenStatus.classList.toggle("is-active", !done);
 		sharpenStatus.classList.toggle("is-done", done);
 	};
+}
+
+// Humanize an ETA in ms: 8400 → "8s", 92000 → "1m 32s".
+function fmtEta(ms: number): string {
+	const s = Math.ceil(ms / 1000);
+	if (s < 60) return s + "s";
+	const m = Math.floor(s / 60), rs = s % 60;
+	return m + "m" + (rs ? " " + rs + "s" : "");
 }
 
 // Telemetry grid (optional element): a cell per stat, updated live as tiles land. Cells are keyed
@@ -161,22 +240,27 @@ if (telemetry) {
 	renderer.onStats = (s) => updateTelemetry(s);
 }
 function setCell(k: string, text: string): void { const el = teleCells[k]; if (el) el.textContent = text; }
+// Set by updateContextualControls: a filter recolors by orbit-trap accumulation, so the escape-time
+// telemetry (composition = trapped/miss, deepest/dwell = meaningless) is relabelled/blanked (V7).
+const filterState = { active: false };
 
 function updateTelemetry(s: FrameStats): void {
 	setCell("zoom", fmtMag(s.zoom));
 	setCell("precision", s.bits + "-bit");
-	setCell("deepest", fmtCount(s.deepest) + " iters" + (s.done ? "" : " …"));
+	setCell("deepest", filterState.active ? "—" : fmtCount(s.deepest) + " iters" + (s.done ? "" : " …"));
 	setCell("throughput", s.itersPerSec > 0 ? fmtCount(Math.round(s.itersPerSec)) + " iters/s" : "—");
 	setCell("composition", compText(s));
 	setCell("method", methodText(s));
-	setCell("thresholds", s.p50 > 0 ? "p50 " + fmtCount(Math.round(s.p50)) + " · p90 " + fmtCount(Math.round(s.p90)) : "—");
+	setCell("thresholds", !filterState.active && s.p50 > 0 ? "p50 " + fmtCount(Math.round(s.p50)) + " · p90 " + fmtCount(Math.round(s.p90)) : "—");
 }
 
-// Composition — status partition of every pixel (sums to 100), one slice per line (the cell's
-// value uses white-space: pre-line). Unresolved shown only when nonzero.
+// Composition — status partition of every pixel (sums to 100), one slice per line (the cell's value
+// uses white-space: pre-line). In filter mode the partition is trapped/miss (the orbit touched the trap
+// or not); in escape-time it's exterior/interior/unresolved. FrameStats carries trapped→escaped, miss→inSet.
 function compText(s: FrameStats): string {
 	const t = s.escaped + s.inSet + s.capped;
 	if (t <= 0) return "—";
+	if (filterState.active) return [fmtPct(s.escaped, t) + "% trapped", fmtPct(s.inSet, t) + "% miss"].join("\n");
 	const parts = [fmtPct(s.escaped, t) + "% exterior", fmtPct(s.inSet, t) + "% interior"];
 	if (s.capped > 0) parts.push(fmtPct(s.capped, t) + "% unresolved");
 	return parts.join("\n");
@@ -430,6 +514,57 @@ function goTo(next: View): void {
 	selector.clear();
 }
 
+// ---- V6: Mandelbrot ↔ Julia toggle. The M-view (c-space) and J-view (z-space) are independent
+// coordinate systems, so we snapshot each mode's {view, history} and swap. The J bundle is keyed on its
+// seed: re-entering Julia from the SAME center restores your exploration; a moved center → fresh J. ----
+let mBundle: { view: View; history: View[] } | null = null;                  // saved Mandelbrot state while in Julia
+let jBundle: { seed: number; view: View; history: View[] } | null = null;    // cached Julia state (seed = f64 key)
+
+function snapshotHistory(): View[] { return viewHistory.slice(); }
+function setHistory(h: View[]): void {
+	viewHistory.length = 0;
+	for (const v of h) viewHistory.push(v);
+	if (backButton) backButton.disabled = viewHistory.length === 0;
+}
+function defaultJuliaView(): View {
+	return { cx: 0, cxLo: 0, cy: 0, cyLo: 0, spanX: 4, spanY: 4 / CANVAS_ASPECT };   // origin, |z| < 2, aspect-matched
+}
+function seedKey(cx: number, cy: number): number { return cx * 1e7 + cy; }   // cheap equality key for the seed
+
+function enterJulia(): void {
+	inJulia = true;   // stop the URL tracking the z-space view (see syncUrl)
+	const scx = view.cx + view.cxLo, scy = view.cy + view.cyLo;   // seed = DD center collapsed to f64
+	mBundle = { view, history: snapshotHistory() };
+	renderer.setSetType(true, scx, scy);
+	const key = seedKey(scx, scy);
+	if (jBundle && jBundle.seed === key) { view = jBundle.view; setHistory(jBundle.history); }        // same seed → restore
+	else { view = defaultJuliaView(); setHistory([]); jBundle = { seed: key, view, history: [] }; }    // new seed → fresh
+	syncUrl(view);
+	renderer.render(view);
+}
+function exitJulia(): void {
+	if (jBundle) jBundle = { seed: jBundle.seed, view, history: snapshotHistory() };   // stash the J exploration
+	inJulia = false;   // resume URL tracking; the restored M-view syncs below
+	renderer.setSetType(false);
+	if (mBundle) { view = mBundle.view; setHistory(mBundle.history); }
+	syncUrl(view);
+	renderer.render(view);
+}
+
+// ---- V5: aspect selector. Fixed width, derived height; resize canvas + easel + selector overlay,
+// re-derive spanY = spanX/aspect, re-render. CANVAS_ASPECT stays live for later default-view derivations. ----
+function setAspect(aspect: number): void {
+	const W = 640, H = Math.round(W / aspect);
+	canvas.width = W; canvas.height = H;
+	easel.style.height = H + "px";
+	const overlay = easel.querySelectorAll("canvas")[1] as HTMLCanvasElement | undefined;
+	if (overlay) { overlay.width = W; overlay.height = H; }
+	CANVAS_ASPECT = aspect;
+	view = { ...view, spanY: view.spanX / aspect };
+	syncUrl(view);
+	renderer.render(view);
+}
+
 selector.onChange = () => { zoomButton.disabled = !selector.hasSelection(); };
 zoomButton.disabled = true;
 
@@ -485,29 +620,76 @@ if (coloringSelect) {
 	});
 }
 
-// Palette instrument — palette picker, wrap toggle, density slider. All optional
-// (absent on pages without them); each recolors instantly from the stored field.
-const wrapToggle = document.querySelector(".wrap-toggle") as HTMLInputElement | null;
-if (wrapToggle) {
-	wrapToggle.checked = currentPalette.cyclic;
-	wrapToggle.addEventListener("change", () => renderer.setWrap(wrapToggle.checked));
-}
-
+// Palette instrument — palette picker + density slider. Wrap is no longer user-facing: each palette's
+// own default (cyclic) is used (setPalette resets it), so the colorful palettes band and subtle ramps.
 const densitySlider = document.querySelector(".density-slider") as HTMLInputElement | null;
 if (densitySlider) {
 	densitySlider.value = String(currentPalette.density);
 	densitySlider.addEventListener("input", () => renderer.setDensity(Number(densitySlider.value)));
 }
 
-
 const paletteSelect = document.querySelector(".palette-select") as HTMLSelectElement | null;
 if (paletteSelect) {
 	paletteSelect.addEventListener("change", () => {
 		const p = PALETTES[paletteSelect.value];
 		if (!p) return;
-		renderer.setPalette(p);
-		// Sync the wrap/density controls to the newly selected palette's defaults.
-		if (wrapToggle) wrapToggle.checked = p.cyclic;
+		renderer.setPalette(p);   // resets effective wrap to the palette default (E7)
 		if (densitySlider) densitySlider.value = String(p.density);
 	});
 }
+
+//---------------------------------------------------------------------------\\
+// Render-settings controls (V3–V6): formula, Julia toggle + seed, filter + params, aspect. All
+// optional (absent on pages without them). Formula/set-type/filter/strands/aspect re-iterate; exposure
+// recolors instantly. Kernel selection is derived inside the renderer (deriveKernel).
+//---------------------------------------------------------------------------\\
+
+const formulaSelect = document.querySelector(".formula-select") as HTMLSelectElement | null;
+const juliaToggle = document.querySelector(".julia-toggle") as HTMLInputElement | null;
+const filterSelect = document.querySelector(".filter-select") as HTMLSelectElement | null;
+const strandsSlider = document.querySelector(".strands-slider") as HTMLInputElement | null;
+const exposureSlider = document.querySelector(".exposure-slider") as HTMLInputElement | null;
+const aspectSelect = document.querySelector(".aspect-select") as HTMLSelectElement | null;
+const coloringBody = coloringSelect?.closest(".ctrl-section")?.querySelector<HTMLElement>(".ctrl-body") ?? null;
+
+// Reflect the current control state into the renderer + show/hide contextual controls.
+function currentFilterId(): number { return filterSelect ? Number(filterSelect.value) : 0; }
+function pushFilter(): void {
+	renderer.setFilter(currentFilterId(), strandsSlider ? Number(strandsSlider.value) : 0.08, exposureSlider ? Number(exposureSlider.value) : 4);
+}
+function updateContextualControls(): void {
+	const filterOn = currentFilterId() !== 0;
+	const k2 = (formulaSelect ? Number(formulaSelect.value) !== 0 : false) || !!juliaToggle?.checked || filterOn;
+	document.querySelectorAll<HTMLElement>(".filter-param").forEach((el) => el.classList.toggle("hidden", !filterOn));
+	coloringBody?.classList.toggle("inactive", filterOn);   // escape-time coloring is bypassed by a filter
+	// Distance coloring needs Kernel 1's derivative; disable it on Kernel 2 (fall back to log if it was picked).
+	const distOpt = coloringSelect?.querySelector<HTMLOptionElement>('option[value="distance"]');
+	if (distOpt) distOpt.disabled = k2;
+	if (k2 && coloringSelect?.value === "distance") { coloringSelect.value = "log"; renderer.setColoring(0, 2); }
+	filterState.active = filterOn;   // telemetry relabels in filter mode (V7)
+}
+
+if (formulaSelect) {
+	formulaSelect.addEventListener("change", () => {
+		renderer.setFormula(Number(formulaSelect.value));
+		updateContextualControls();
+		renderer.render(view);
+	});
+}
+
+if (filterSelect) {
+	filterSelect.addEventListener("change", () => { pushFilter(); updateContextualControls(); renderer.render(view); });
+}
+if (strandsSlider) {   // trap band half-width — re-iterates, so 'change' (on release), not 'input'
+	strandsSlider.addEventListener("change", () => { pushFilter(); renderer.render(view); });
+}
+if (exposureSlider) {   // exposure — instant recolor from the stored accumulators, so live 'input'
+	exposureSlider.addEventListener("input", () => renderer.setFilterExposure(Number(exposureSlider.value)));
+}
+if (aspectSelect) {
+	aspectSelect.addEventListener("change", () => setAspect(Number(aspectSelect.value)));
+}
+if (juliaToggle) {
+	juliaToggle.addEventListener("change", () => { if (juliaToggle.checked) enterJulia(); else exitJulia(); });
+}
+updateContextualControls();   // initial state: filter params hidden (filter = none by default)

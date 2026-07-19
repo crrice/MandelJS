@@ -79,6 +79,28 @@ h1 {
 	transition: opacity 0.25s ease;
 }
 .sharpen-status:not(:empty) { opacity: 1; }
+
+/* Heuristic-map flag: shown (JS sets the text) only when the "Mandelbrot" is really a z₀=c parameter
+   map — a formula with no z₀=0 set. Amber to signal "heads up, not the canonical thing." Top-left,
+   opposite the sharpen readout. Hidden (empty) for true Mandelbrot sets and Julia sets. */
+.map-note {
+	position: absolute;
+	left: 10px;
+	top: 10px;
+	z-index: 2;
+	cursor: help;
+	font: 500 0.72rem/1 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+	letter-spacing: 0.04em;
+	color: #f0b656;
+	background: rgba(10, 11, 14, 0.62);
+	border: 1px solid #6b5326;
+	border-radius: 5px;
+	padding: 5px 8px;
+	opacity: 0;
+	transition: opacity 0.25s ease;
+}
+.map-note.is-shown { opacity: 1; }
+.map-note::before { content: "≈ "; color: #c99646; }
 .sharpen-status::before {
 	content: "";
 	display: inline-block;
@@ -140,8 +162,46 @@ h1 {
 .btn:disabled { opacity: 0.4; cursor: default; }
 .btn:disabled:hover { color: #cdd6e6; border-color: #2a2c31; background: #1a1c20; }
 
-/* Color instrument: palette picker, wrap toggle, density slider. */
-.color-controls { flex-wrap: wrap; margin-top: 12px; }
+/* Collapsible control sections (native <details>/<summary> accordion), grouped by cost:
+   "coloring" = instant recolors, "render" = re-iterating changes. */
+.ctrl-section {
+	margin-top: 12px;
+	border: 1px solid #2a2c31;
+	border-radius: 6px;
+	background: #141519;
+}
+.ctrl-section > summary {
+	list-style: none;
+	cursor: pointer;
+	padding: 9px 14px;
+	font: 600 0.68rem/1 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+	text-transform: uppercase;
+	letter-spacing: 0.1em;
+	color: #a9aab0;
+	user-select: none;
+}
+.ctrl-section > summary::-webkit-details-marker { display: none; }
+.ctrl-section > summary::before {
+	content: "▸";
+	display: inline-block;
+	margin-right: 8px;
+	color: #6d7078;
+	transition: transform 0.15s ease;
+}
+.ctrl-section[open] > summary::before { transform: rotate(90deg); }
+.ctrl-section > summary:hover { color: #fff; }
+.ctrl-section > summary:focus-visible { outline: 2px solid #4c6ef5; outline-offset: 2px; }
+.ctrl-body {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 12px 16px;
+	padding: 4px 14px 14px;
+}
+/* Contextual: filter params appear only with a filter selected; escape-time coloring dims when a filter is active. */
+.filter-param.hidden { display: none; }
+.ctrl-body.inactive { opacity: 0.38; pointer-events: none; }
+
 .field {
 	display: inline-flex;
 	align-items: center;

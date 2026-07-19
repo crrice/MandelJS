@@ -36,6 +36,11 @@ const EDGE_TH = 30;
 // smoother continuous coloring; 256 (radius 16) is the usual sweet spot.
 const BAILOUT2 = 256;
 
+// Escape radius² for the custom-formula path (escapeSmoothTierazon). The Tierazon repro
+// specifies the classic |z|² ≥ 4 bailout; kept SEPARATE from BAILOUT2 so the z²+c coloring
+// (which relies on the wide radius for smooth bands) is entirely unaffected.
+const BAILOUT_CUSTOM2 = 4;
+
 // Periodicity checking. If an orbit returns within this squared distance of a
 // saved reference point, it has settled onto an attracting cycle -> the point is
 // in-set, so we stop early instead of burning the whole iteration budget.
@@ -116,6 +121,63 @@ let useDD = false;
 // no re-iterate). Set per tile like periodOn; colorSample reads it. sqrt/log give
 // zoom-stable, consistent banding across depth — see bandTransform.
 let bandMap = 0;
+// Kernel selector, read ONCE per pixel at the escapeAtPt boundary (never in a hot loop):
+//   0 = "Kernel 1" — the hyper-optimized z²+c MANDELBROT engine (escapeSmooth/DD/pert, interior
+//       shortcuts), the fast common case, left untouched.
+//   1 = "Kernel 2" (escapeCustom) — a GENERALIZED version of Kernel 1: the same escape loop written
+//       set-type-agnostically (takes z₀ and c explicitly), plus a formula switch and orbit-trap filter
+//       hooks. It handles Mandelbrot AND Julia, any registered formula, escape-time or a filter — f64.
+// The renderer routes to Kernel 1 only when nothing general is needed (z²+c ∧ Mandelbrot ∧ escape-time ∧
+// no filter); everything else goes to Kernel 2. The z²+c fast path pays one well-predicted per-pixel branch.
+let fractalMode = 0;
+// Set type for Kernel 2: false = Mandelbrot (c = the pixel, z₀ = 0), true = Julia (c = the seed below,
+// z₀ = the pixel). escapeAtPt wires z₀/c from this. Mandelbrot is the default.
+let juliaMode = false;
+let juliaCx = 0, juliaCy = 0;   // Julia seed c (used only when juliaMode)
+// Iteration-formula selector for Kernel 2 (constant per frame → the per-iteration switch is predicted).
+// 0 = z²+c (same math as Kernel 1), 1 = Cthulu, the map (z²+c)·sin(z^(c·i)). Additive: a future parser
+// registers more ids behind the same switch.
+const FORMULA_MANDEL = 0;
+const FORMULA_CTHULU = 1;
+let formulaId = 0;
+// Mandelbrot seed selector for Kernel 2. Normally z₀ = 0 (the canonical Mandelbrot seed). But some
+// formulas are undefined at z=0 (Cthulu: z^(c·i) needs log 0), which makes the z₀=0 Mandelbrot degenerate
+// (every pixel NaN-escapes → solid color). For those, the renderer probes f(0), finds it non-finite, and
+// sets mSeedAtC → seed z₀ = c instead. That's NOT a true Mandelbrot set (c isn't the critical orbit) — it's
+// a heuristic PARAMETER MAP, flagged as such in the UI. Only ever true when z₀=0 genuinely fails.
+let mSeedAtC = false;
+
+// Filter selector for Kernel 2 (escapeCustom). Filters are accumulating orbit-trap colorers — an
+// ALTERNATIVE to escape-time coloring: instead of "when did the orbit escape", they watch every
+// orbit point and fold an accumulator into the pixel color (see filter-interface.md). This is the
+// JS-native translation of that interface — the three hooks (init/onIteration/complete) become
+// frame-constant globals + an inlined switch(filterId), NOT per-pixel objects with per-iteration
+// virtual calls (which would allocate per pixel and defeat JIT inlining / worker stringification).
+// 0 = FILTER_NONE (escape-time, the default — bit-identical to the pre-filter custom kernel).
+const FILTER_NONE = 0;
+const FILTER_XRAY_RINGS = 1;   // Tierazon filter #41: concentric ring orbit-trap, even/odd parity → red/cyan
+let filterId = 0;
+// x-ray rings trap geometry. The trap circle is centered at the z-origin with radius |c|. In JULIA
+// mode c is the constant seed, so this is the "init" hook hoisted to per-FRAME setup (setupFilter,
+// once per tile message). In MANDELBROT mode c = the pixel, so the limit is PER-PIXEL — escapeCustom
+// recomputes it from the pixel's c at the top of each pixel (these globals hold the Julia case). trapDf
+// is the falloff numerator (= dStrands).
+let trapDStrands = 0.08;
+let trapLimit = 0, trapLo = 0, trapHi = 0, trapDf = 0;
+// Filter COLOR params (read by filterColor, not the kernel). filterDFactor is the exposure knob;
+// filterRef is the frame-wide intensity reference (a dFactor-INDEPENDENT high percentile of the raw
+// trap magnitude, set by the main thread's computeLevels — workers leave it 0 → per-pixel self-scale,
+// a rough provisional the main thread then overwrites). filterBg is the packed miss/background color.
+let filterDFactor = 1, filterRef = 0, filterBg = (255 << 24) >>> 0;   // bg default = opaque black
+// Recompute the JULIA (frame-constant) trap geometry from the seed + dStrands. Called once per tile
+// message (worker) and once per sync render — the per-frame "init" for the Julia case. Mandelbrot uses
+// a per-pixel limit computed in escapeCustom instead. Stringify-safe (Math + the globals above).
+function setupFilter(): void {
+	trapLimit = Math.hypot(juliaCx, juliaCy);   // ring radius = |seed|
+	trapLo = trapLimit - trapDStrands;
+	trapHi = trapLimit + trapDStrands;
+	trapDf = trapDStrands;
+}
 // DD op result scratch (hi, lo). The DD primitives write their two-limb result here
 // instead of allocating a pair — keeps the hot path allocation-free, same trick as
 // deDist. Copy _dhi/_dlo into locals immediately after each call (they're clobbered
@@ -447,6 +509,138 @@ function escapeSmoothPert(cr: number, ci: number, dcx: number, dcy: number, maxI
 	return CAPPED;
 }
 
+//---------------------------------------------------------------------------\\
+// Complex arithmetic for the custom-formula path — a complex number is a real f64
+// pair (re, im). JS's Math library is real→real, so each "complex" op is an identity
+// that decomposes into real Math calls (there is no complex sin/log/exp to call). Each
+// op writes its two-component result to the _cre/_cim scratch pair instead of allocating
+// a pair — the same allocation-free trick as the DD _dhi/_dlo scratch — so copy _cre/_cim
+// into locals immediately after each call (the next op clobbers them). Only escapeSmoothTierazon
+// uses these; the z²+c kernels keep their inlined multiply/add, so nothing here touches that path.
+// Self-contained for worker stringification (Math + the scratch globals only).
+//---------------------------------------------------------------------------\\
+
+// Complex op result scratch (re, im) — see above.
+let _cre = 0, _cim = 0;
+
+// (ax,ay) + (bx,by)
+function cAdd(ax: number, ay: number, bx: number, by: number): void { _cre = ax + bx; _cim = ay + by; }
+// (ax,ay) · (bx,by) = (ax·bx − ay·by, ax·by + ay·bx)
+function cMul(ax: number, ay: number, bx: number, by: number): void { _cre = ax * bx - ay * by; _cim = ax * by + ay * bx; }
+// sin(x+iy) = sin(x)·cosh(y) + i·cos(x)·sinh(y)   (angle-addition + cos(iy)=cosh y, sin(iy)=i·sinh y)
+function cSin(x: number, y: number): void { _cre = Math.sin(x) * Math.cosh(y); _cim = Math.cos(x) * Math.sinh(y); }
+// exp(x+iy) = eˣ·(cos y + i·sin y)   (Euler)
+function cExp(x: number, y: number): void { const ex = Math.exp(x); _cre = ex * Math.cos(y); _cim = ex * Math.sin(y); }
+// log(z) = ln|z| + i·arg(z)   (principal branch via atan2)
+function cLog(x: number, y: number): void { _cre = Math.log(Math.hypot(x, y)); _cim = Math.atan2(y, x); }
+// z^w = exp(w · log z) — the only route for a COMPLEX exponent w (can't repeat-multiply). Composes
+// clog → cmul → cexp; each sub-call clobbers _cre/_cim, so the intermediates are copied into locals.
+function cPow(zx: number, zy: number, wx: number, wy: number): void {
+	cLog(zx, zy); const lx = _cre, ly = _cim;
+	cMul(wx, wy, lx, ly); const px = _cre, py = _cim;
+	cExp(px, py);
+}
+
+// M-mode seed probe: is the formula's FIRST step from z=0 finite? The renderer calls this on a few sample
+// c to choose the Mandelbrot seed — z₀=0 when finite (the canonical set), else z₀=c (a heuristic parameter
+// map). Returns 1 if f_c(0) is finite, 0 if not. One step only; MIRRORS the formula switch in escapeCustom
+// (keep them in sync when adding a formula). Runs once per render on the main thread, so cost is irrelevant.
+function probeFormulaAtZero(cx: number, cy: number): number {
+	let zx = 0, zy = 0;
+	if (formulaId === FORMULA_CTHULU) {
+		const wx = -cy, wy = cx;
+		cMul(zx, zy, zx, zy); cAdd(_cre, _cim, cx, cy); const ax = _cre, ay = _cim;
+		cPow(zx, zy, wx, wy); cSin(_cre, _cim); const sx = _cre, sy = _cim;
+		cMul(ax, ay, sx, sy); zx = _cre; zy = _cim;
+	} else {                       // FORMULA_MANDEL: z²+c at z=0 → c
+		zx = cx; zy = cy;
+	}
+	return (isFinite(zx) && isFinite(zy)) ? 1 : 0;
+}
+
+// KERNEL 2 — a GENERALIZED version of Kernel 1 (escapeSmooth): the same escape loop, written
+// set-type-agnostically, plus a formula switch and orbit-trap filter hooks. z₀ and c are passed in
+// EXPLICITLY, so escapeAtPt wires them per set-type — Mandelbrot: c = pixel, z₀ = 0; Julia: c = seed,
+// z₀ = pixel. ALWAYS f64 — no DD/perturbation (those don't generalize to arbitrary/transcendental maps,
+// and escapeAtPt dispatches here BEFORE its useDD/usePert checks, so it can't reach them). NO cardioid/
+// bulb shortcuts (z²+c-specific), but DOES do generic z-periodicity (cycle detection generalizes — see the
+// loop). Escape radius BAILOUT_CUSTOM2 (|z|²≥4). No derivative (no distance mode).
+//
+// formulaId picks the step (constant per frame → the branch is predicted): z²+c, or Cthulu (z²+c)·sin(z^(c·i)).
+//
+// Two coloring regimes, selected by filterId:
+//   FILTER_NONE — escape-time. Returns the smooth escape count (same convention as escapeSmooth) or
+//     CAPPED if still bounded. FINITE GUARD: sin of a large imaginary part overflows to Inf, and a
+//     following Inf·0 yields NaN; a NaN magnitude fails the escape test and would iterate to the cap
+//     (wrongly painting in-set), so a non-finite z is treated as escaped at n. The z²+c formula matches
+//     Kernel 1's exterior math (the parity oracle); the smooth term assumes degree-2 escape.
+//   a filter — an accumulating orbit trap (filter-interface.md), hooks inlined not virtual: init = the
+//     trap geometry (frame-constant |seed| in Julia; PER-PIXEL |c| in Mandelbrot, computed below);
+//     onIteration = the switch(filterId) on the POST-update z; complete = the switch at loop exit. Output
+//     is the RAW two-channel accumulator (return = ch1, deDist = ch2) — dFactor/normalize/RGB happen in
+//     the color path. A miss (never trapped) returns 0 in both channels → background. ORDERING: escape
+//     test on PRE-update z, filter on POST-update (a point can be trapped one step before escape culls it).
+// escapeSmooth (Kernel 1) is left byte-for-byte untouched. Self-contained for stringification.
+function escapeCustom(z0x: number, z0y: number, cx: number, cy: number, maxIters: number): number {
+	const wx = -cy, wy = cx;   // w = c·i (c rotated 90°) — the Cthulu formula's exponent, from THIS pixel's c
+	// Trap geometry: frame-constant globals in Julia; per-pixel limit = |c| in Mandelbrot (filter-interface.md).
+	let tLimit = trapLimit, tLo = trapLo, tHi = trapHi;
+	if (filterId !== FILTER_NONE && !juliaMode) { tLimit = Math.sqrt(cx * cx + cy * cy); tLo = tLimit - trapDStrands; tHi = tLimit + trapDStrands; }
+	let zx = z0x, zy = z0y, n = 0, escaped = false;
+	let xtot = 0, ytot = 0;    // filter accumulators (even/odd parity) — unused when FILTER_NONE
+	let prx = z0x, pry = z0y, pchk = PERIOD_WARMUP;   // Brent cycle detection: saved point + next-save schedule
+	while (n < maxIters) {
+		const mag2 = zx * zx + zy * zy;                     // escape test on PRE-update z
+		if (!(mag2 < BAILOUT_CUSTOM2)) { escaped = true; break; }   // escaped, OR non-finite (NaN/Inf fail "< R")
+		// formula step (formulaId): z ← f(z, c)
+		if (formulaId === FORMULA_CTHULU) {                 // (z²+c)·sin(z^(c·i))
+			cMul(zx, zy, zx, zy); cAdd(_cre, _cim, cx, cy); const ax = _cre, ay = _cim;   // z² + c
+			cPow(zx, zy, wx, wy); cSin(_cre, _cim); const sx = _cre, sy = _cim;           // sin( z^(c·i) )
+			cMul(ax, ay, sx, sy); zx = _cre; zy = _cim;                                   // (z²+c)·sin(…)
+		} else {                                            // FORMULA_MANDEL: z² + c (matches Kernel 1)
+			const nzx = zx * zx - zy * zy + cx, nzy = 2 * zx * zy + cy;
+			zx = nzx; zy = nzy;
+		}
+		n++;
+		// filter onIteration — observe the POST-update z
+		if (filterId === FILTER_XRAY_RINGS) {
+			const r = Math.sqrt(zx * zx + zy * zy);
+			if (r > tLo && r < tHi) {
+				// Proximity weight; the +ε keeps it FINITE at an exact hit r==limit. That case is systematic in
+				// Mandelbrot mode — z₁ = c lands |z₁| = |c| = limit exactly every pixel — so without ε it'd be Inf→NaN.
+				const temp = Math.log(2 + trapDf / (Math.abs(tLimit - r) + 1e-9));
+				if ((n & 1) === 0) xtot += temp; else ytot += temp;         // even → x channel, odd → y channel
+			}
+		}
+		// Interior via REAL z-periodicity (Brent) — generalizes to ANY formula: an orbit settling back onto a
+		// saved point is on an attracting cycle → bounded → in-set. Bails out of interior pixels instead of
+		// grinding them to the cap. Escape-time ONLY: a filter must observe the full orbit, so never bail then.
+		if (filterId === FILTER_NONE && periodOn && n >= PERIOD_WARMUP) {
+			const rx = zx - prx, ry = zy - pry;
+			if (rx * rx + ry * ry < periodEps2) { iterAcc += n; perAcc++; return IN_SET; }
+			if (n === pchk) { prx = zx; pry = zy; pchk *= 2; }   // refresh the reference (Brent doubling schedule)
+		}
+	}
+	iterAcc += n;
+	// filter complete
+	if (filterId !== FILTER_NONE) {
+		if (escaped) escAcc++; else capAcc++;
+		if (xtot === 0 && ytot === 0) { deDist = 0; return 0; }   // never trapped → miss (both channels 0 → background)
+		deDist = ytot;                                            // channel 2
+		return xtot;                                              // channel 1 (raw; color path applies dFactor + normalize)
+	}
+	// FILTER_NONE — escape-time
+	if (escaped) {
+		escAcc++; deDist = 0;
+		const mag2 = zx * zx + zy * zy;
+		if (!isFinite(mag2)) return n;                       // overflow → escaped at n (no smooth term)
+		const mu = n + 1 - Math.log(0.5 * Math.log(mag2)) / Math.LN2;
+		return mu < 0 ? 0 : mu;
+	}
+	capAcc++; deDist = 0;
+	return CAPPED;   // still bounded at the cap
+}
+
 // Band transfer: compress the escape count before it maps to color. Linear is the raw
 // count; sqrt and log grow slower as mu grows, so the per-pixel band rate stays roughly
 // constant across zoom WITHOUT referencing the zoom level. That makes the coloring both
@@ -459,6 +653,27 @@ function bandTransform(mu: number, bandMap: number): number {
 	return mu;
 }
 
+// Filter READOUT: fold a filter's two raw accumulators (xtot=even, ytot=odd; carried in the mu/de
+// fields) into a packed RGBA. Separates BRIGHTNESS (the trap intensity, exposure-mapped so dFactor is
+// a real knob — it would cancel under a plain divide-by-max) from HUE (the even/odd parity that makes
+// R=d+xtot vs G=d+ytot resolve into red vs cyan). filterRef is the frame's intensity scale (workers
+// pass 0 → per-pixel self-scale, a rough provisional; the main thread recolors with the real ref). A
+// (0,0) accumulator means the orbit never touched the trap → the background color. Self-contained
+// (Math + filter globals). Packing matches renderRegion: A<<24 | B<<16 | G<<8 | R (little-endian RGBA).
+function filterColor(xtot: number, ytot: number): number {
+	if (xtot === 0 && ytot === 0) return filterBg;          // miss → background
+	const d = Math.sqrt(xtot * xtot + ytot * ytot);         // trap intensity
+	const ref = filterRef > 0 ? filterRef : d;              // no frame ref (worker) → self-scale
+	let t = d / ref; if (t > 1) t = 1;                      // dFactor-independent normalized intensity
+	const b = 1 - Math.exp(-filterDFactor * t);             // exposure curve — dFactor is the knob
+	const cmax = d + (xtot > ytot ? xtot : ytot);           // largest channel (B=d is smallest; R,G add a pile)
+	let R = b * (d + xtot) / cmax * 255;
+	let G = b * (d + ytot) / cmax * 255;
+	let B = b * d / cmax * 255;
+	R = R > 255 ? 255 : R | 0; G = G > 255 ? 255 : G | 0; B = B > 255 ? 255 : B | 0;
+	return ((255 << 24) | (B << 16) | (G << 8) | R) >>> 0;
+}
+
 // The ONE coloring transfer function: a (mu, deDist) sample -> packed RGBA. Every path
 // routes through this — renderRegion (worker) and colorizeField / pixelColor (main
 // thread) — so escape-time bands, distance coloring, and the auto-leveled ramp can never
@@ -466,12 +681,13 @@ function bandTransform(mu: number, bandMap: number): number {
 // mu through bandTransform. Non-cyclic uses a level window [lvlLo, lvlHi] (transformed
 // the same way): the main thread passes the view's auto-leveled mu range; the worker,
 // which can't see it, passes (0, 1/densityMul) — algebraically a flat clamp for linear.
-// Self-contained for stringification (DIST_SCALE / bandTransform).
+// Self-contained for stringification (DIST_SCALE / bandTransform / filterColor).
 function colorSample(
 	mu: number, de: number, lut: Uint32Array, inSet: number,
 	mode: number, cyclic: boolean, densityMul: number,
 	pixelSize: number, bandMap: number, lvlLo: number, lvlHi: number,
 ): number {
+	if (filterId !== FILTER_NONE) return filterColor(mu, de);   // filter mode: (mu,de) carry (xtot,ytot)
 	if (mu === -Infinity) {                                 // CAPPED (unresolved this pass)
 		if (!provOn || !provLut) return inSet;              //   provisional coloring off -> in-set color (old behavior)
 		let tp = (de - provLo) / (provHi > provLo ? provHi - provLo : 1);   // de carries log|z'| for CAPPED px
@@ -506,6 +722,15 @@ function colorSample(
 function escapeAtPt(px: number, py: number, view: View, maxIters: number, invW: number, invH: number): number {
 	const offX = (px * invW - 0.5) * view.spanX;
 	const offY = (py * invH - 0.5) * view.spanY;
+	// Kernel 2 (generalized): wire z₀/c from the set type. Mandelbrot: c = the pixel, z₀ = 0.
+	// Julia: c = the seed, z₀ = the pixel. One well-predicted branch per pixel (fractalMode +
+	// juliaMode are constant for the frame); the z²+c fast path below is entirely unchanged.
+	if (fractalMode) {
+		const pxc = view.cx + offX, pyc = view.cy + offY;
+		if (juliaMode) return escapeCustom(pxc, pyc, juliaCx, juliaCy, maxIters);   // z₀ = pixel, c = seed
+		// Mandelbrot: z₀ = 0 (canonical) normally; z₀ = c (mSeedAtC) when the formula is undefined at 0.
+		return mSeedAtC ? escapeCustom(pxc, pyc, pxc, pyc, maxIters) : escapeCustom(0, 0, pxc, pyc, maxIters);
+	}
 	if (usePert) {
 		return escapeSmoothPert(view.cx + offX, view.cy + offY, offX - refOffX, offY - refOffY, maxIters);
 	}

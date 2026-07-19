@@ -18,6 +18,7 @@
 			<div class="easel">
 				<canvas class="fractal" width="640" height="320"></canvas>
 				<div class="sharpen-status" aria-live="polite"></div>
+				<div class="map-note" aria-live="polite" title="This formula has no z₀=0 Mandelbrot, so this is a heuristic parameter map (seeded at z₀=c) — not a true Mandelbrot set. It still works as an atlas for finding Julia seeds."></div>
 			</div>
 		</div>
 
@@ -28,30 +29,66 @@
 			<button class="btn reset-button" type="button">↺ reset</button>
 		</div>
 
-		<div class="controls color-controls">
-			<label class="field">palette
-				<select class="palette-select">
-					<option value="escape">escape</option>
-					<option value="subtle">subtle</option>
-					<option value="jupiter">jupiter</option>
-					<option value="ember">ember</option>
-					<option value="abyss">abyss</option>
-					<option value="twilight">twilight</option>
-				</select>
-			</label>
-			<label class="field checkbox"><input class="wrap-toggle" type="checkbox" /> wrap</label>
-			<label class="field">density
-				<input class="density-slider" type="range" min="8" max="128" step="1" />
-			</label>
-			<label class="field">coloring
-				<select class="coloring-select">
-					<option value="linear">linear</option>
-					<option value="sqrt">√ compressed</option>
-					<option value="log" selected>log compressed</option>
-					<option value="distance">distance</option>
-				</select>
-			</label>
-		</div>
+		<details class="ctrl-section" open>
+			<summary>coloring</summary>
+			<div class="ctrl-body">
+				<label class="field">palette
+					<select class="palette-select">
+						<option value="escape">escape</option>
+						<option value="subtle">subtle</option>
+						<option value="jupiter">jupiter</option>
+						<option value="ember">ember</option>
+						<option value="abyss">abyss</option>
+						<option value="twilight">twilight</option>
+					</select>
+				</label>
+				<label class="field">density
+					<input class="density-slider" type="range" min="8" max="128" step="1" />
+				</label>
+				<label class="field">coloring
+					<select class="coloring-select">
+						<option value="linear">linear</option>
+						<option value="sqrt">√ compressed</option>
+						<option value="log" selected>log compressed</option>
+						<option value="distance">distance</option>
+					</select>
+				</label>
+			</div>
+		</details>
+
+		<details class="ctrl-section">
+			<summary>render</summary>
+			<div class="ctrl-body">
+				<label class="field">formula
+					<select class="formula-select">
+						<option value="0">z² + c</option>
+						<option value="1">Cthulu</option>
+					</select>
+				</label>
+				<label class="field checkbox"><input class="julia-toggle" type="checkbox" /> julia</label>
+				<label class="field">filter
+					<select class="filter-select">
+						<option value="0">none</option>
+						<option value="1">x-ray rings</option>
+					</select>
+				</label>
+				<label class="field filter-param">strands
+					<input class="strands-slider" type="range" min="0.01" max="0.3" step="0.005" value="0.08" />
+				</label>
+				<label class="field filter-param">exposure
+					<input class="exposure-slider" type="range" min="0.5" max="20" step="0.5" value="4" />
+				</label>
+				<label class="field">aspect
+					<select class="aspect-select">
+						<option value="2">2:1</option>
+						<option value="1.5">3:2</option>
+						<option value="1.3333333">4:3</option>
+						<option value="1.7777778">16:9</option>
+						<option value="1">1:1</option>
+					</select>
+				</label>
+			</div>
+		</details>
 
 		<div class="telemetry" aria-live="polite">
 			<div class="tstat" data-k="zoom"><div class="tstat-k">zoom</div><div class="tstat-v"></div></div>

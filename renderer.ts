@@ -105,6 +105,8 @@ interface TileMsg {
 	ox: number; oy: number; tw: number; th: number;
 	canvasW: number; canvasH: number; view: View; maxIters: number; densityMul: number; mode: number;
 	usePeriod: boolean; periodEps2: number; useDD: boolean; usePert: boolean; pertRhoThresh: number; bandMap: number;
+	fractalMode?: number; formulaId?: number; juliaMode?: boolean; mSeedAtC?: boolean; juliaCx?: number; juliaCy?: number;   // Kernel 2 (absent/0 => Kernel 1 z²+c-M)
+	filterId?: number; trapDStrands?: number; filterDFactor?: number; filterBg?: number;   // orbit-trap filter (absent/0 => escape-time)
 	ssaaOn?: boolean;   // full-render only: false => 1-sample fast frame (initial pass); default true (sync path)
 	idx?: Int32Array;   // present => point job (sharpen or ssaa) over these tile-local pixels
 	ssaaJob?: boolean;  // with idx => background SSAA (supersample edges → colors) instead of sharpen (re-iterate → mu/de)
@@ -170,6 +172,14 @@ function buildWorkerSource(): string {
 		"let _dhi = 0, _dlo = 0;",                  // DD op scratch
 		"const DD_SPLIT = " + DD_SPLIT + ";",
 		"let bandMap = 0;",
+			"const BAILOUT_CUSTOM2 = " + BAILOUT_CUSTOM2 + ";",   // custom-formula escape radius²
+			"const FORMULA_MANDEL = 0, FORMULA_CTHULU = 1;",       // Kernel-2 formula ids
+			"let fractalMode = 0, juliaMode = false, formulaId = 0, juliaCx = 0, juliaCy = 0;",   // kernel selector + set type + formula + Julia seed
+			"let mSeedAtC = false;",   // Mandelbrot seed: z₀=0 (canonical) vs z₀=c (heuristic map, formulas singular at 0)
+			"let _cre = 0, _cim = 0;",                            // complex-op scratch (re, im)
+			"const FILTER_NONE = 0, FILTER_XRAY_RINGS = 1;",      // filter ids (Kernel 2 orbit-trap colorers)
+			"let filterId = 0, trapDStrands = 0.08, trapLimit = 0, trapLo = 0, trapHi = 0, trapDf = 0;",   // filter selector + trap geometry
+			"let filterDFactor = 1, filterRef = 0, filterBg = (255 << 24) >>> 0;",   // filter color params (exposure, frame ref, background)
 		"let provOn = false, provLo = 0, provHi = 1, provLut = null;",   // provisional CAPPED coloring: workers keep it OFF (→black per tile); main thread recolors
 		"let ssaaOn = true;",   // SSAA toggle; initial tiles send false (1-sample fast frame), SSAA runs as a background pass
 		"let usePert = false;",
@@ -187,9 +197,19 @@ function buildWorkerSource(): string {
 		refOrbitLen.toString(),
 		computeRef.toString(),
 		escapeSmoothPert.toString(),
+			cAdd.toString(),
+			cMul.toString(),
+			cSin.toString(),
+			cExp.toString(),
+			cLog.toString(),
+			cPow.toString(),
+			setupFilter.toString(),
+				probeFormulaAtZero.toString(),
+				escapeCustom.toString(),
 		escapeAtPt.toString(),
 		bandTransform.toString(),
-		colorSample.toString(),
+		filterColor.toString(),
+			colorSample.toString(),
 		renderRegion.toString(),
 		sharpenPoints.toString(),
 		ssaaPoints.toString(),
@@ -203,6 +223,12 @@ function buildWorkerSource(): string {
 		"  usePert = m.usePert;",
 		"  pertRhoThresh = m.pertRhoThresh;",
 		"  bandMap = m.bandMap;",
+			"  fractalMode = m.fractalMode || 0;",   // Kernel 1 (0) vs Kernel 2 (1)
+			"  formulaId = m.formulaId || 0; juliaMode = !!m.juliaMode; mSeedAtC = !!m.mSeedAtC;",   // formula + set type + M seed
+			"  juliaCx = m.juliaCx || 0; juliaCy = m.juliaCy || 0;",
+			"  filterId = m.filterId || 0;",         // orbit-trap filter (0 = escape-time)
+			"  trapDStrands = m.trapDStrands || 0.08; filterDFactor = m.filterDFactor || 1; filterBg = (m.filterBg >>> 0) || (255 << 24) >>> 0;",
+			"  setupFilter();",                      // per-frame filter 'init' — recompute trap geometry from seed + dStrands
 		"  ssaaOn = m.ssaaOn !== false;",   // default true; initial full-render sends false
 		"  iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;",
 		"  if (usePert && m.gen !== _refGen) { computeRef(m.view, m.maxIters); _refGen = m.gen; }",   // reference once per gen (covers full + ssaa jobs)
@@ -237,6 +263,7 @@ function buildWorkerSource(): string {
 class FractalRenderer {
 	private workers: Worker[] = [];
 	private idle: boolean[] = [];
+	private workerUrl = "";   // the worker blob URL, kept alive so busy workers can be respawned (respawnBusy)
 	private queue: TileJob[] = [];
 	private gen = 0;
 	private view: View = { ...DEFAULT_VIEW };
@@ -249,6 +276,29 @@ class FractalRenderer {
 	private densityMul = 1 / 32;
 	private bandMap = 2;           // escape-time band transfer (0 linear / 1 sqrt / 2 log) — log is the default
 	private mode = 0; // 0 = escape-time, 1 = distance
+	// Kernel-2 (generalized) state. fractalMode (0 = Kernel 1 fast path, 1 = Kernel 2) is DERIVED from
+	// these by deriveKernel(); formulaId picks the map, juliaMode the set type, juliaCx/juliaCy the Julia
+	// seed. Threaded to workers via TileMsg + mirrored into the kernel globals on the sync path. Defaults
+	// (z²+c, Mandelbrot, no filter) keep Kernel 1 and leave every existing path unchanged.
+	private fractalMode = 0;
+	private formulaId = 0;
+	private juliaMode = false;
+	private juliaCx = 0;
+	private juliaCy = 0;
+	// Mandelbrot seed for Kernel 2: z₀=0 (canonical) or z₀=c (mSeedAtC — the heuristic parameter-map fallback
+	// for formulas undefined at 0, decided by probing f(0) in render()). heuristicMap mirrors it for the UI
+	// (onMapMode), so the user can tell a true Mandelbrot from a heuristic map.
+	private mSeedAtC = false;
+	private heuristicMap = false;
+	public onMapMode: ((heuristic: boolean) => void) | null = null;
+	// Orbit-trap filter (Kernel 2). filterId 0 = escape-time (default). dStrands = trap band half-width
+	// (re-iterate on change); dFactor = exposure (cheap recolor); filterBg = packed miss/background color;
+	// filterRef = the frame-wide intensity reference, computed by computeLevels and pushed to the kernel.
+	private filterId = 0;
+	private dStrands = 0.08;
+	private dFactor = 1;
+	private filterBg = (255 << 24) >>> 0;
+	private filterRef = 0;
 	// Escape-count range of the current view, for the auto-leveled (non-cyclic)
 	// ramp. Recomputed from the field when each render completes; a monotonic
 	// ramp needs this or it clamps to one end once escape counts get large (which
@@ -324,7 +374,17 @@ class FractalRenderer {
 	private ssaaMu: Float32Array = new Float32Array(0); // ssaaCount × SS² subsample mu
 	private ssaaDe: Float32Array = new Float32Array(0); // ssaaCount × SS² subsample de
 	private ssaaCount = 0;                              // edge pixels cached so far this frame
-	public onProgress: ((p: { working: number; abandoned: number; sharpening: boolean; done: boolean; phase: string }) => void) | null = null;
+	public onProgress: ((p: { working: number; abandoned: number; sharpening: boolean; done: boolean; phase: string; etaMs?: number }) => void) | null = null;
+	// First-frame ETA. ffEstIters = probe-estimated total FF iterations (conservative); as FF tiles land we
+	// track done tiles/iters + start time and project remaining wall-time = elapsed·(estTotal/doneIters − 1).
+	// Shown only during the first frame (the refinement/AA tail is adaptive and not worth estimating).
+	private ffEstIters = 0;
+	private ffStartMs = 0;
+	private ffTiles = 0;
+	private ffDoneTiles = 0;
+	private ffDoneIters = 0;
+	private ffActive = false;
+	private lastEtaEmit = 0;
 	// Fired alongside onProgress as a generation lands, carrying the frame's headline telemetry
 	// (zoom, precision, deepest iterations reached) for the UI stats line.
 	public onStats: ((s: FrameStats) => void) | null = null;
@@ -348,22 +408,35 @@ class FractalRenderer {
 		this.muField = new Float32Array(canvas.width * canvas.height);
 		this.deField = new Float32Array(canvas.width * canvas.height);
 		try {
-			const url = URL.createObjectURL(
-				new Blob([buildWorkerSource()], { type: "application/javascript" }),
-			);
+			// Keep the worker blob URL alive (not revoked) so busy workers can be respawned mid-session
+			// on a new render — see respawnBusy(). The source is deterministic, so one URL serves all spawns.
+			this.workerUrl = URL.createObjectURL(new Blob([buildWorkerSource()], { type: "application/javascript" }));
 			const n = Math.max(1, Math.min(navigator.hardwareConcurrency || 4, WORKER_CAP));
-			for (let i = 0; i < n; i++) {
-				const w = new Worker(url);
-				const idx = i;
-				w.onmessage = (e: MessageEvent) => this.onDone(idx, e.data as DoneMsg);
-				w.onerror = (e: ErrorEvent) => console.error("MandelJS worker error:", e.message);
-				this.workers.push(w);
-				this.idle.push(true);
-			}
-			URL.revokeObjectURL(url);
-			this.sendPalette();
+			for (let i = 0; i < n; i++) this.spawnWorker(i);
 		} catch {
 			this.workers = []; // no workers available -> synchronous fallback
+		}
+	}
+
+	// Create (or replace) worker i: wire its message/error handlers, mark it idle, hand it the current
+	// palette. Shared by the initial pool and respawnBusy(). Index i is captured so results route back correctly.
+	private spawnWorker(i: number): void {
+		const w = new Worker(this.workerUrl);
+		w.onmessage = (e: MessageEvent) => this.onDone(i, e.data as DoneMsg);
+		w.onerror = (e: ErrorEvent) => console.error("MandelJS worker error:", e.message);
+		this.workers[i] = w;
+		this.idle[i] = true;
+		w.postMessage({ type: "palette", lut: this.lut, inSet: this.inSet, cyclic: this.wrap });   // palette before any tile
+	}
+
+	// Terminate + respawn every worker still BUSY when a new render begins. Two wins: (1) it frees workers
+	// stuck on the previous frame's now-discarded refinement tiles immediately (~15ms respawn) instead of
+	// waiting out a slow deep tile, and (2) it's a clean-slate safety net — a worker hung on a pathological
+	// input (a future user formula, a bug that never terminates) is recovered by simply navigating. No-op
+	// when every worker is idle (the previous render finished), so navigating after completion costs nothing.
+	private respawnBusy(): void {
+		for (let i = 0; i < this.workers.length; i++) {
+			if (!this.idle[i]) { this.workers[i].terminate(); this.spawnWorker(i); }
 		}
 	}
 
@@ -485,6 +558,9 @@ class FractalRenderer {
 		// Push provisional-coloring state into the kernel globals colorSample reads, so CAPPED
 		// pixels shade via the paper→ink ramp (or stay in-set when provOn is off).
 		provOn = this.provOn; provLo = this.provLo; provHi = this.provHi; provLut = this.provLut;
+		// Filter color globals colorSample→filterColor reads: when a filter is active, (mu,de) carry the raw
+		// (xtot,ytot) accumulators, and these turn them into RGB (frame-normalized by filterRef).
+		filterId = this.filterId; filterDFactor = this.dFactor; filterRef = this.filterRef; filterBg = this.filterBg;
 		// Auto-leveled range for the non-cyclic escape-time ramp — normalizes mu to the
 		// view's escape-count range so the gradient spans the visible structure at any
 		// depth; cyclic and distance modes ignore it (see colorSample).
@@ -506,6 +582,7 @@ class FractalRenderer {
 	// few near-boundary outliers (mu ~ maxIters right against the set) don't
 	// compress the whole gradient. Cheap: a couple of O(N) passes.
 	private computeLevels(): void {
+		if (this.filterId !== 0) { this.computeFilterRef(); return; }   // filter mode: fields carry (xtot,ytot), not mu
 		const mu = this.muField, N = mu.length;
 		let mn = Infinity, mx = -Infinity, cnt = 0, capped = 0, inset = 0;
 		for (let i = 0; i < N; i++) {
@@ -555,6 +632,36 @@ class FractalRenderer {
 		}
 		this.p50 = Math.exp(lmn + (p50Bin < 0 ? 0 : p50Bin) / lscale);
 		this.p90 = Math.exp(lmn + (p90Bin < 0 ? 0 : p90Bin) / lscale);
+	}
+
+	// Filter-mode auto-level: the fields carry the raw trap accumulators (xtot in muField, ytot in
+	// deField). Set filterRef = a high percentile of the trap magnitude d = hypot(xtot, ytot), so the
+	// exposure curve normalizes to the frame. A high percentile (not the max) keeps a few exact-ring
+	// spikes (|limit-r|→0 → temp→large) from crushing the exposure. dFactor-INDEPENDENT by construction
+	// (computed from the raw accumulators), so the exposure knob stays meaningful. Also repurposes the
+	// composition tallies as trapped/miss for the telemetry footer.
+	private computeFilterRef(): void {
+		const mu = this.muField, de = this.deField, N = mu.length;
+		let mx = 0, trapped = 0, miss = 0;
+		for (let i = 0; i < N; i++) {
+			const x = mu[i], y = de[i];
+			if (x === 0 && y === 0) { miss++; continue; }
+			trapped++;
+			const d = Math.sqrt(x * x + y * y);
+			if (d > mx) mx = d;
+		}
+		this.wfEsc = trapped; this.wfCap = 0; this.wfIns = miss; this.muMax = mx; this.p50 = this.p90 = 0;
+		if (trapped === 0 || mx <= 0) { this.filterRef = 1; return; }
+		const BINS = 512, hist = new Uint32Array(BINS), scale = (BINS - 1) / mx;
+		for (let i = 0; i < N; i++) {
+			const x = mu[i], y = de[i];
+			if (x === 0 && y === 0) continue;
+			hist[(Math.sqrt(x * x + y * y) * scale) | 0]++;
+		}
+		const target = trapped * 0.98;
+		let acc = 0, refBin = BINS - 1;
+		for (let b = 0; b < BINS; b++) { acc += hist[b]; if (acc >= target) { refBin = b; break; } }
+		this.filterRef = refBin / scale || mx;
 	}
 
 	// Pack a provisional heat color for one CAPPED pixel's structure signal (log|z'|),
@@ -620,6 +727,7 @@ class FractalRenderer {
 	// Fired once a render generation fully lands (worker or sync path): auto-level
 	// the ramp, record timing, log stats when debugging, and resolve any waiter.
 	private onGenerationComplete(): void {
+		this.ffActive = false;   // the first frame has landed — the ETA is a first-frame-only number
 		this.finalizeColors();
 		this.lastMs = performance.now() - this.renderStart;
 		if (DEBUG) this.logStats();
@@ -838,6 +946,48 @@ class FractalRenderer {
 	// for clean A/B benchmarking of the first-frame path.
 	public setSharpen(on: boolean): void { this.sharpenOn = on; }
 
+	// ---- E6: the fractal API the UI drives. Each setter updates state + re-derives which kernel to
+	// use (deriveKernel); the caller then re-renders. The renderer never exposes kernel internals. ----
+
+	// Choose the iteration formula: 0 = z²+c, 1 = Cthulu (z²+c)·sin(z^(c·i)).
+	public setFormula(formulaId: number): void { this.formulaId = formulaId; this.deriveKernel(); }
+
+	// Choose the set type: juliaMode false = Mandelbrot (c per pixel), true = Julia with seed (cx,cy).
+	public setSetType(juliaMode: boolean, cx = 0, cy = 0): void {
+		this.juliaMode = juliaMode;
+		if (juliaMode) { this.juliaCx = cx; this.juliaCy = cy; }
+		this.deriveKernel();
+	}
+
+	// Configure the orbit-trap filter. filterId 0 = escape-time coloring (default); >0 selects a filter
+	// (currently only FILTER_XRAY_RINGS = 1). dStrands = trap band half-width — changes WHICH points are
+	// trapped, so a change needs a re-render. dFactor = exposure — post-accumulation, so a cheap recolor
+	// (see setFilterExposure). A filter routes to Kernel 2 (see deriveKernel).
+	public setFilter(filterId: number, dStrands = 0.08, dFactor = 1): void {
+		this.filterId = filterId;
+		this.dStrands = dStrands;
+		this.dFactor = dFactor;
+		this.deriveKernel();
+	}
+
+	// E4 dispatch: pick the kernel from (formula, set-type, filter). Kernel 1 (the optimized z²+c
+	// Mandelbrot engine, with DD/pert) is used ONLY when nothing general is needed — z²+c AND Mandelbrot
+	// AND no filter. Anything else routes to Kernel 2 (generalized, f64), which forces DD/pert off.
+	private deriveKernel(): void {
+		const k2 = this.formulaId !== 0 || this.juliaMode || this.filterId !== 0;
+		this.fractalMode = k2 ? 1 : 0;
+		if (k2) { this.ddOverride = false; this.pertOverride = false; }
+		else { this.ddOverride = null; this.pertOverride = null; }
+	}
+
+	// Exposure knob for the active filter — recolors instantly from the stored (xtot,ytot) fields (no
+	// re-iterate), since dFactor is applied at readout, not accumulation. filterRef is dFactor-independent
+	// so it needn't recompute. e.g. tune the core/striation brightness by eye.
+	public setFilterExposure(dFactor: number): void {
+		this.dFactor = dFactor;
+		this.colorizeField();
+	}
+
 	private logStats(): void {
 		console.log("[mandel] " + this.statLine());
 	}
@@ -888,27 +1038,41 @@ class FractalRenderer {
 		const zoom = DEFAULT_VIEW.spanX / view.spanX;
 		const budgetPerPx = FF_BUDGET_BASE + FF_BUDGET_SLOPE * Math.max(0, Math.log2(zoom));   // scales with depth
 		const probeCeil = Math.max(floor, Math.round(budgetPerPx * FF_PROBE_CEIL_MULT));       // dwell measurement ceiling
-		periodOn = this.usePeriod;                        // kernel globals escapeSmooth reads
+		periodOn = this.usePeriod;                        // kernel globals the probe kernel reads
 		periodEps2 = this.periodEps2;
+		fractalMode = this.fractalMode; formulaId = this.formulaId; juliaMode = this.juliaMode;   // probe the ACTIVE fractal
+		juliaCx = this.juliaCx; juliaCy = this.juliaCy;
+		filterId = FILTER_NONE;   // probe measures escape DWELL to size the cap — not filter output — even when a filter is active
 		const dwells: number[] = [];
 		for (let j = 0; j < FF_PROBE_NY; j++) {
 			const offY = ((j + 0.5) / FF_PROBE_NY - 0.5) * view.spanY;
 			for (let i = 0; i < FF_PROBE_NX; i++) {
 				const offX = ((i + 0.5) / FF_PROBE_NX - 0.5) * view.spanX;
-				const mu = escapeSmooth(view.cx + offX, view.cy + offY, probeCeil);
+				const pxc = view.cx + offX, pyc = view.cy + offY;
+				const mu = !this.fractalMode
+					? escapeSmooth(pxc, pyc, probeCeil)
+					: this.juliaMode ? escapeCustom(pxc, pyc, this.juliaCx, this.juliaCy, probeCeil)
+						: this.mSeedAtC ? escapeCustom(pxc, pyc, pxc, pyc, probeCeil)   // heuristic map: z₀=c
+							: escapeCustom(0, 0, pxc, pyc, probeCeil);                    // canonical: z₀=0
 				if (mu === CAPPED) dwells.push(probeCeil);   // unresolved by the ceiling → drives cap up
 				else if (isFinite(mu)) dwells.push(mu);        // escaped at ~mu → its dwell
 				// IN_SET (+∞): interior, resolves via periodicity regardless of cap → ignore
 			}
 		}
-		if (dwells.length === 0) return floor;               // all-interior view → nothing to size against
+		if (dwells.length === 0) { this.ffEstIters = floor * canvas.width * canvas.height; return floor; }   // all-interior view
 		dwells.sort((a, b) => a - b);
 		// Quality target: the cap that resolves ~FF_PROBE_PCT of the escaping pixels this pass.
 		const pct = dwells[Math.min(dwells.length - 1, Math.floor(dwells.length * FF_PROBE_PCT))];
 		const target = Math.ceil(pct * FF_PROBE_MARGIN);
 		// Budget ceiling: the largest cap whose mean iters/px stays within the depth-scaled budget.
 		const budgetCap = this.capForBudget(dwells, budgetPerPx, probeCeil);
-		return Math.max(floor, Math.min(target, budgetCap, probeCeil));
+		const cap = Math.max(floor, Math.min(target, budgetCap, probeCeil));
+		// FF-iteration estimate for the first-frame ETA: mean clamped dwell over the ESCAPING sample × all
+		// pixels. Interior pixels (ignored here) run FEWER iters via periodicity, so this errs HIGH — the safe
+		// side for an ETA. View-wide sample, so it isn't biased by tile dispatch order.
+		let sum = 0; for (const d of dwells) sum += d < cap ? d : cap;
+		this.ffEstIters = (sum / dwells.length) * canvas.width * canvas.height;
+		return cap;
 	}
 
 	// Largest cap C such that the sampled mean of min(dwell, C) stays within budgetPerPx. Mean-iters
@@ -979,7 +1143,30 @@ class FractalRenderer {
 	}
 
 	public render(view: View, maxItersArg?: number): void {
+		// A new user-initiated frame supersedes any in-flight one. Free (and clean-slate) any worker still
+		// busy on the old frame's discarded work instead of waiting out its current tile. Only render() does
+		// this — the internal sharpen/SSAA generations call beginGeneration directly, so a frame's own passes
+		// never respawn mid-flight. No-op if the pool is idle.
+		this.respawnBusy();
 		this.view = view;
+		// The per-pixel fields are sized to the canvas; if it was resized since the last render (e.g. the
+		// custom-formula preset switches to a 4:3 buffer), re-allocate them. Otherwise tiles below the old
+		// height write past the end of muField/deField → "offset is out of bounds" in storeField.
+		const px = canvas.width * canvas.height;
+		if (this.muField.length !== px) { this.muField = new Float32Array(px); this.deField = new Float32Array(px); }
+		// Mandelbrot seed choice (Kernel 2 only): probe f(0) on a few sample c. Use z₀=0 (canonical) if the
+		// formula is finite at 0 anywhere; fall back to z₀=c (a heuristic parameter map) only if it's non-finite
+		// EVERYWHERE (a universal singularity, e.g. Cthulu). Never mislabels a z=0-friendly formula. onMapMode
+		// tells the UI which it is. (Julia mode + Kernel 1 always canonical.)
+		this.mSeedAtC = false; this.heuristicMap = false;
+		if (this.fractalMode && !this.juliaMode) {
+			formulaId = this.formulaId;   // the kernel global probeFormulaAtZero reads
+			const S = [[0, 0], [0.31, 0.19], [-0.29, 0.23], [0.27, -0.21], [-0.33, -0.17]];
+			let anyFinite = false;
+			for (const [fx, fy] of S) { if (probeFormulaAtZero(view.cx + fx * view.spanX, view.cy + fy * view.spanY)) { anyFinite = true; break; } }
+			if (!anyFinite) { this.mSeedAtC = true; this.heuristicMap = true; }
+		}
+		if (this.onMapMode) this.onMapMode(this.heuristicMap);
 		this.densityMul = this.densityMulFor(view);
 		this.useDD = this.ddOverride !== null ? this.ddOverride : this.useDDFor(view);
 		this.usePert = this.pertOverride !== null ? this.pertOverride : this.useDD;   // perturbation where DD would engage
@@ -1007,7 +1194,10 @@ class FractalRenderer {
 		// Size the initial cap. f64 path: probe the view's actual dwell so a high-dwell window gets a
 		// cap that resolves its first frame (not the zoom-only formula's blind guess → all-black). Runs
 		// after the wash so the wash is instant. DD/pert keep the formula/pert budget for now.
+		this.ffEstIters = 0;   // probeCap sets this (f64 path) → enables the FF ETA; DD/pert leave it 0 → no ETA
 		const maxIters = maxItersArg ?? (this.useDD || this.usePert ? this.itersForView(view, this.usePert) : this.probeCap(view));
+		// First-frame ETA tracking (reset each render; the ETA shows only while the first frame is in flight).
+		this.ffActive = true; this.ffStartMs = performance.now(); this.ffDoneTiles = 0; this.ffDoneIters = 0; this.lastEtaEmit = 0;
 
 		if (this.workers.length === 0) {
 			this.maxIters = maxIters;
@@ -1024,6 +1214,15 @@ class FractalRenderer {
 		for (let oy = 0; oy < H; oy += TILE_H)
 			for (let ox = 0; ox < W; ox += TILE_W)
 				tiles.push({ ox, oy, tw: Math.min(TILE_W, W - ox), th: Math.min(TILE_H, H - oy) });
+		// Disperse the dispatch order (deterministic Fisher–Yates). Row-major order renders fast exterior
+		// tiles first then slow detail last, which makes the FF-ETA's tile projection swing from wild
+		// over-estimate to under-estimate; a scattered order keeps every in-flight subset a representative
+		// spatial sample, so the projection is unbiased throughout. Purely cosmetic for the paint order.
+		for (let i = tiles.length - 1, seed = 0x9e3779b9; i > 0; i--) {
+			seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+			const j = seed % (i + 1), t = tiles[i]; tiles[i] = tiles[j]; tiles[j] = t;
+		}
+		this.ffTiles = tiles.length;
 		this.beginGeneration(maxIters, tiles);
 	}
 
@@ -1054,6 +1253,8 @@ class FractalRenderer {
 			// A sharpen job forces the DD path ONLY in the 'dd' sub-phase; the 'pert' sub-phase (and the
 			// initial full render + SSAA jobs) keep the view's perturbation path.
 			usePert: (tile.idx && !tile.ssaaJob && this.sharpenMode === "dd") ? false : this.usePert, pertRhoThresh: this.pertRhoThresh, bandMap: this.bandMap,
+			fractalMode: this.fractalMode, formulaId: this.formulaId, juliaMode: this.juliaMode, mSeedAtC: this.mSeedAtC, juliaCx: this.juliaCx, juliaCy: this.juliaCy,
+			filterId: this.filterId, trapDStrands: this.dStrands, filterDFactor: this.dFactor, filterBg: this.filterBg,
 			ssaaOn: false,   // initial full render is 1-sample (fast frame); point jobs ignore this
 		};
 		if (tile.idx) {
@@ -1079,6 +1280,7 @@ class FractalRenderer {
 				} else {                              // FF: fresh classification
 					this.wfEsc += m.esc; this.wfIns += m.ins; this.wfCap += m.cap;
 					this.addMethod(this.usePert, m.esc);
+					if (this.ffActive) { this.ffDoneTiles++; this.ffDoneIters += m.iters; this.emitEta(); }
 				}
 				const now = performance.now();       // throttled live emit so the grid ticks, not floods
 				if (now - this.lastStatsEmit > 60) { this.lastStatsEmit = now; this.emitStats(false); }
@@ -1092,6 +1294,29 @@ class FractalRenderer {
 		if (this.queue.length === 0 && this.idle.every((x) => x)) {
 			this.onGenerationComplete();
 		}
+	}
+
+	// First-frame ETA: projected remaining wall-time = elapsed·(estTotal/doneIters − 1). estTotal is the MAX
+	// of the probe estimate (view-wide, so unbiased while few tiles are in) and the live tile extrapolation
+	// (accurate as it fills in). Throttled; emitted via onProgress so the phase badge shows a countdown. Errs
+	// high by construction (over-estimates are fine; under-promising a long render is the thing to avoid).
+	private emitEta(): void {
+		// ffEstIters > 0 gates the ETA to the f64 probe path (DD/pert skip it). Wait for a REPRESENTATIVE
+		// sample (~5% of the dispersed tiles, min 6) so the projection has settled — 4 tiles is still noisy
+		// enough to swing the estimate 10×. Throttled so it doesn't flood the badge.
+		if (this.ffEstIters <= 0 || this.ffDoneIters <= 0) return;
+		if (this.ffDoneTiles < 6 || this.ffDoneTiles < this.ffTiles * 0.05) return;
+		const now = performance.now();
+		if (now - this.lastEtaEmit < 200) return;
+		this.lastEtaEmit = now;
+		const elapsed = now - this.ffStartMs;
+		// Total iters = the live tile projection (unbiased now that dispatch is dispersed) × a small 10% cushion
+		// to bias slightly toward over-estimating. The target is loose on purpose — it's a "wait / grab a coffee
+		// / bail" signal, not a stopwatch — and short-remaining error is bounded by the ~10s that reads as "soon"
+		// anyway; the cushion only matters on long renders, which are the estimates that have stabilized.
+		const est = this.ffDoneIters * this.ffTiles / this.ffDoneTiles * 1.1;
+		const etaMs = Math.max(0, elapsed * (est / this.ffDoneIters - 1));
+		if (this.onProgress) this.onProgress({ working: 0, abandoned: 0, sharpening: false, done: false, phase: "first frame", etaMs });
 	}
 
 	// Initial/full render of a tile: blit its pixels and stash its (mu, deDist) field.
@@ -1206,6 +1431,8 @@ class FractalRenderer {
 		bandMap = this.bandMap;
 		usePert = this.usePert;
 		pertRhoThresh = this.pertRhoThresh;
+		fractalMode = this.fractalMode; formulaId = this.formulaId; juliaMode = this.juliaMode; mSeedAtC = this.mSeedAtC; juliaCx = this.juliaCx; juliaCy = this.juliaCy;   // Kernel 2 (sync fallback)
+		filterId = this.filterId; trapDStrands = this.dStrands; filterDFactor = this.dFactor; filterBg = this.filterBg; setupFilter();   // orbit-trap filter
 		provOn = false;   // paint CAPPED black in the blocking pass; finalizeColors levels + recolors the underlay
 		ssaaOn = true;    // no-worker fallback renders crisp (with SSAA) in one blocking pass; no background AA pass
 		if (usePert) computeRef(this.view, this.maxIters);
