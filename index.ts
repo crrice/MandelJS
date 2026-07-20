@@ -26,9 +26,9 @@ const DEBUG = new URLSearchParams(location.search).has("debug");
 
 const renderer = new FractalRenderer(currentPalette);
 
-// View <-> URL. The address bar always reflects the current view (?cx&cy&span),
-// so any zoom is a permalink: copy it, or reload it verbatim to reproduce the
-// exact same view — essential for apples-to-apples before/after benchmarks.
+// State <-> URL. The address bar reflects the FULL state (view + formula + set type/seed + filter +
+// aspect + coloring — see syncUrl/restoreFromUrl), so any view is a permalink: copy it, or reload it
+// verbatim to reproduce exactly what's on screen. Also essential for apples-to-apples benchmarks.
 let CANVAS_ASPECT = canvas.width / canvas.height;   // live: the aspect selector updates it (V5)
 function viewFromUrl(): View | null {
 	const p = new URLSearchParams(location.search);
@@ -37,25 +37,42 @@ function viewFromUrl(): View | null {
 	if (!isFinite(cx) || !isFinite(cy) || !isFinite(span) || span <= 0) return null;
 	return { cx, cxLo: isFinite(cxLo) ? cxLo : 0, cy, cyLo: isFinite(cyLo) ? cyLo : 0, spanX: span, spanY: span / CANVAS_ASPECT };
 }
-// True while a Julia set is on screen. The URL currently carries only the VIEW (cx/cy/span), not the
-// formula/set-type/seed (the permalink for those is deferred). So a Julia's z-space view must NOT be
-// written to the URL — otherwise a refresh re-applies that view (centered at the z-origin) to the default
-// z²+c Mandelbrot, landing it at the origin instead of its usual center. Gating syncUrl on Mandelbrot mode
-// keeps the URL a valid Mandelbrot permalink at all times; a refresh mid-Julia returns to the last M-view.
+// True while a Julia set is on screen. The URL now carries the FULL state (formula/set-type/seed/filter/
+// aspect/coloring — see syncUrl), so a Julia z-view is a valid permalink: no gate needed, and a mid-Julia
+// refresh restores the Julia set. inJulia only tells syncUrl which set type to record + which seed.
 let inJulia = false;
-function syncUrl(v: View): void {
-	if (inJulia) return;   // don't let a Julia z-view pollute the (Mandelbrot-only) URL
-	const p = new URLSearchParams(location.search);
-	p.set("cx", String(v.cx)); p.set("cy", String(v.cy)); p.set("span", String(v.spanX));
-	// DD center lo-limbs, only when nonzero (deep views) so shallow permalinks stay clean. Each limb is an
-	// f64 and String()↔parseFloat round-trips it EXACTLY, so cx+cxLo reconstructs the DD center bit-for-bit.
-	if (v.cxLo !== 0) p.set("cxl", String(v.cxLo)); else p.delete("cxl");
-	if (v.cyLo !== 0) p.set("cyl", String(v.cyLo)); else p.delete("cyl");
+let currentSeed = { cx: 0, cy: 0 };   // the active Julia seed, for the URL (set by enterJulia / restoreFromUrl)
+
+// Serialize the ENTIRE app state into the address bar so any view is a shareable permalink. One snapshot
+// of everything — view, formula (+ custom text), set type + seed, filter + params, aspect, coloring — read
+// live from `view` and the controls. Non-default fields only, so a plain Mandelbrot stays ?cx&cy&span.
+// Every f64 round-trips exactly through String()↔parseFloat, and URLSearchParams handles escaping (the
+// formula's ^, +, *, () encode + decode cleanly). Called by every mutating control (and restoreFromUrl).
+function syncUrl(): void {
+	const p = new URLSearchParams();
+	p.set("cx", String(view.cx)); p.set("cy", String(view.cy)); p.set("span", String(view.spanX));
+	if (view.cxLo !== 0) p.set("cxl", String(view.cxLo));   // DD center lo-limbs, only on deep views
+	if (view.cyLo !== 0) p.set("cyl", String(view.cyLo));
+	const fKey = formulaSelect ? formulaSelect.value : "0";
+	if (fKey !== "0") p.set("f", fKey);
+	if (fKey === "custom" && formulaInput) p.set("expr", formulaInput.value);
+	if (inJulia) { p.set("j", "1"); p.set("jx", String(currentSeed.cx)); p.set("jy", String(currentSeed.cy)); }
+	const filt = filterSelect ? Number(filterSelect.value) : 0;
+	if (filt !== 0) {
+		p.set("filt", String(filt));
+		if (strandsSlider) p.set("str", strandsSlider.value);
+		if (exposureSlider) p.set("exp", exposureSlider.value);
+	}
+	if (aspectSelect && aspectSelect.value !== "2") p.set("ar", aspectSelect.value);   // default 2:1 omitted
+	const palKey = paletteSelect ? paletteSelect.value : "escape";
+	if (palKey !== "escape") p.set("pal", palKey);
+	const palDensity = PALETTES[palKey] ? PALETTES[palKey].density : -1;
+	if (densitySlider && Number(densitySlider.value) !== palDensity) p.set("dens", densitySlider.value);
+	if (coloringSelect && coloringSelect.value !== "log") p.set("col", coloringSelect.value);
 	history.replaceState(null, "", "?" + p.toString());
 }
 
 let view: View = viewFromUrl() || { ...DEFAULT_VIEW };
-syncUrl(view);
 
 // High-precision (double-double) badge: lit when a view is deep enough to switch to DD.
 // Wired BEFORE the first render — onPrecision fires inside render(), so a later hookup
@@ -74,8 +91,9 @@ const mapNote = document.querySelector(".map-note") as HTMLElement | null;
 if (mapNote) {
 	renderer.onMapMode = (heuristic) => { mapNote.textContent = heuristic ? "parameter map" : ""; mapNote.classList.toggle("is-shown", heuristic); };
 }
-
-renderer.render(view);
+// The first render is deferred to restoreFromUrl() at the end of setup — it applies the URL's full state
+// (formula/filter/aspect/Julia/coloring) to the controls + renderer, then renders once. The precision +
+// map-note hooks above are already wired, so they still catch that initial (possibly deep) permalink frame.
 
 // Benchmark helper (console): re-render the current view n times and report the
 // timing spread plus the (deterministic) iteration total. Run it at a fixed URL
@@ -504,7 +522,7 @@ function pushHistory(v: View): void {
 // Navigate to a view: swap it in, mirror to the URL, render, and drop any selection.
 function goTo(next: View): void {
 	view = next;
-	syncUrl(view);
+	syncUrl();
 	// Show the new magnification immediately and blank the rest to a dash — the figures fill back in
 	// as the first tiles land, so the grid never lingers on the previous frame's numbers.
 	if (telemetry) {
@@ -559,36 +577,41 @@ function defaultViewFor(): View {
 function seedKey(cx: number, cy: number): number { return cx * 1e7 + cy; }   // cheap equality key for the seed
 
 function enterJulia(): void {
-	inJulia = true;   // stop the URL tracking the z-space view (see syncUrl)
+	inJulia = true;
 	const scx = view.cx + view.cxLo, scy = view.cy + view.cyLo;   // seed = DD center collapsed to f64
+	currentSeed = { cx: scx, cy: scy };
 	mBundle = { view, history: snapshotHistory() };
 	renderer.setSetType(true, scx, scy);
 	const key = seedKey(scx, scy);
 	if (jBundle && jBundle.seed === key) { view = jBundle.view; setHistory(jBundle.history); }        // same seed → restore
 	else { view = defaultJuliaView(); setHistory([]); jBundle = { seed: key, view, history: [] }; }    // new seed → fresh
-	syncUrl(view);
+	syncUrl();
 	renderer.render(view);
 }
 function exitJulia(): void {
 	if (jBundle) jBundle = { seed: jBundle.seed, view, history: snapshotHistory() };   // stash the J exploration
-	inJulia = false;   // resume URL tracking; the restored M-view syncs below
+	inJulia = false;
 	renderer.setSetType(false);
 	if (mBundle) { view = mBundle.view; setHistory(mBundle.history); }
-	syncUrl(view);
+	syncUrl();
 	renderer.render(view);
 }
 
-// ---- V5: aspect selector. Fixed width, derived height; resize canvas + easel + selector overlay,
-// re-derive spanY = spanX/aspect, re-render. CANVAS_ASPECT stays live for later default-view derivations. ----
-function setAspect(aspect: number): void {
+// ---- V5: aspect selector. Fixed width, derived height. applyAspect just resizes canvas + easel +
+// selector overlay and updates CANVAS_ASPECT (used by restoreFromUrl before the first render); setAspect
+// is the user handler — resize, re-derive spanY = spanX/aspect, re-sync, re-render. ----
+function applyAspect(aspect: number): void {
 	const W = 640, H = Math.round(W / aspect);
 	canvas.width = W; canvas.height = H;
 	easel.style.height = H + "px";
 	const overlay = easel.querySelectorAll("canvas")[1] as HTMLCanvasElement | undefined;
 	if (overlay) { overlay.width = W; overlay.height = H; }
 	CANVAS_ASPECT = aspect;
+}
+function setAspect(aspect: number): void {
+	applyAspect(aspect);
 	view = { ...view, spanY: view.spanX / aspect };
-	syncUrl(view);
+	syncUrl();
 	renderer.render(view);
 }
 
@@ -639,12 +662,13 @@ resetButton.addEventListener("click", () => {
 // Coloring method (optional control) — one dropdown for all four paths: escape-time bands with the
 // linear / √ / log transforms, plus distance estimate. Each recolors instantly from the stored field.
 const coloringSelect = document.querySelector(".coloring-select") as HTMLSelectElement | null;
+function applyColoringFromControls(): void {
+	const v = coloringSelect ? coloringSelect.value : "log";
+	if (v === "distance") renderer.setColoring(1, 0);
+	else renderer.setColoring(0, v === "sqrt" ? 1 : v === "log" ? 2 : 0);
+}
 if (coloringSelect) {
-	coloringSelect.addEventListener("change", () => {
-		const v = coloringSelect.value;
-		if (v === "distance") renderer.setColoring(1, 0);
-		else renderer.setColoring(0, v === "sqrt" ? 1 : v === "log" ? 2 : 0);
-	});
+	coloringSelect.addEventListener("change", () => { applyColoringFromControls(); syncUrl(); });
 }
 
 // Palette instrument — palette picker + density slider. Wrap is no longer user-facing: each palette's
@@ -652,7 +676,7 @@ if (coloringSelect) {
 const densitySlider = document.querySelector(".density-slider") as HTMLInputElement | null;
 if (densitySlider) {
 	densitySlider.value = String(currentPalette.density);
-	densitySlider.addEventListener("input", () => renderer.setDensity(Number(densitySlider.value)));
+	densitySlider.addEventListener("input", () => { renderer.setDensity(Number(densitySlider.value)); syncUrl(); });
 }
 
 const paletteSelect = document.querySelector(".palette-select") as HTMLSelectElement | null;
@@ -662,6 +686,7 @@ if (paletteSelect) {
 		if (!p) return;
 		renderer.setPalette(p);   // resets effective wrap to the palette default (E7)
 		if (densitySlider) densitySlider.value = String(p.density);
+		syncUrl();
 	});
 }
 
@@ -719,24 +744,39 @@ function applyCustomFormula(): boolean {
 	return true;
 }
 
+// Configure the renderer for the CURRENT formula-select value (+ optional custom expr) WITHOUT touching
+// the view or rendering. Shared by the change handler's non-custom branch and by restoreFromUrl.
+function applyFormulaFromControls(expr?: string | null): void {
+	const key = formulaSelect ? formulaSelect.value : "0";
+	if (key === "custom") {
+		if (formulaInput && expr != null) formulaInput.value = expr;
+		if (formulaInput) {
+			const res = compileFormula(formulaInput.value);
+			if (res.ok && res.body) { renderer.setCustomFormula(res.body); showFormulaError(res.refsC === false && !juliaToggle?.checked ? "note: no c — every point is identical" : ""); }
+			else showFormulaError(res.error || "invalid formula");
+		}
+		return;
+	}
+	const preset = PRESETS[key];
+	if (preset && preset.formula) {
+		const res = compileFormula(preset.formula);   // presets are known-valid, but guard anyway
+		if (res.ok && res.body) renderer.setCustomFormula(res.body);
+	} else {
+		renderer.setFormula(FORMULA_MANDEL);          // "0" → standard z²+c (Kernel 1)
+	}
+}
+
 if (formulaSelect) {
 	formulaSelect.addEventListener("change", () => {
 		// A new formula is a new fractal: land on its default window (per-preset center) and drop the old
 		// zoom history. Julia keeps its own view/bundle (already origin-centered).
 		if (!inJulia) { view = defaultViewFor(); setHistory([]); }
-		const key = formulaSelect.value;
-		if (key === "custom") {
+		if (formulaSelect.value === "custom") {
 			updateContextualControls();   // reveal the text field
 			applyCustomFormula();         // compile the field + install + render the reset view
 			return;
 		}
-		const preset = PRESETS[key];
-		if (preset && preset.formula) {
-			const res = compileFormula(preset.formula);   // presets are known-valid, but guard anyway
-			if (res.ok && res.body) renderer.setCustomFormula(res.body);
-		} else {
-			renderer.setFormula(FORMULA_MANDEL);          // "0" → standard z²+c (Kernel 1)
-		}
+		applyFormulaFromControls();
 		updateContextualControls();
 		goTo(view);
 	});
@@ -752,13 +792,13 @@ if (formulaInput) {
 }
 
 if (filterSelect) {
-	filterSelect.addEventListener("change", () => { pushFilter(); updateContextualControls(); renderer.render(view); });
+	filterSelect.addEventListener("change", () => { pushFilter(); updateContextualControls(); syncUrl(); renderer.render(view); });
 }
 if (strandsSlider) {   // trap band half-width — re-iterates, so 'change' (on release), not 'input'
-	strandsSlider.addEventListener("change", () => { pushFilter(); renderer.render(view); });
+	strandsSlider.addEventListener("change", () => { pushFilter(); syncUrl(); renderer.render(view); });
 }
 if (exposureSlider) {   // exposure — instant recolor from the stored accumulators, so live 'input'
-	exposureSlider.addEventListener("input", () => renderer.setFilterExposure(Number(exposureSlider.value)));
+	exposureSlider.addEventListener("input", () => { renderer.setFilterExposure(Number(exposureSlider.value)); syncUrl(); });
 }
 if (aspectSelect) {
 	aspectSelect.addEventListener("change", () => setAspect(Number(aspectSelect.value)));
@@ -767,3 +807,58 @@ if (juliaToggle) {
 	juliaToggle.addEventListener("change", () => { if (juliaToggle.checked) enterJulia(); else exitJulia(); });
 }
 updateContextualControls();   // initial state: filter params hidden (filter = none by default)
+
+// ---- Permalink restore + first render. Runs LAST (all controls + renderer methods exist). Reads the
+// full state from the URL, applies it directly to the controls + renderer (no change events → no
+// premature renders/syncs), then does the single first render. Missing/invalid params fall back to
+// defaults, so a bare URL and old ?cx&cy&span links still load. ----
+function restoreFromUrl(): void {
+	const p = new URLSearchParams(location.search);
+
+	// Aspect first — it resizes the canvas and sets CANVAS_ASPECT, which the view's spanY derives from.
+	const ar = p.get("ar");
+	if (ar && aspectSelect && isFinite(Number(ar)) && Number(ar) > 0) { aspectSelect.value = ar; applyAspect(Number(ar)); }
+
+	// Formula (+ custom text). Unknown key → standard z²+c.
+	const fKey = p.get("f") || "0";
+	if (formulaSelect) formulaSelect.value = PRESETS[fKey] ? fKey : "0";
+	applyFormulaFromControls(p.get("expr"));
+
+	// Filter + params.
+	const filt = p.get("filt");
+	if (filt && filterSelect) filterSelect.value = filt;
+	const str = p.get("str"); if (str && strandsSlider) strandsSlider.value = str;
+	const exp = p.get("exp"); if (exp && exposureSlider) exposureSlider.value = exp;
+	pushFilter();
+
+	// Coloring: palette (resets density to its default) → density override → transfer mode.
+	const pal = p.get("pal");
+	if (pal && paletteSelect && PALETTES[pal]) { paletteSelect.value = pal; renderer.setPalette(PALETTES[pal]); if (densitySlider) densitySlider.value = String(PALETTES[pal].density); }
+	const dens = p.get("dens");
+	if (dens && densitySlider) { densitySlider.value = dens; renderer.setDensity(Number(dens)); }
+	const col = p.get("col");
+	if (col && coloringSelect) coloringSelect.value = col;
+	applyColoringFromControls();
+
+	// View + set type. urlView uses the now-correct CANVAS_ASPECT for spanY.
+	const urlView = viewFromUrl();
+	if (p.get("j") === "1") {
+		const jx = parseFloat(p.get("jx") || ""), jy = parseFloat(p.get("jy") || "");
+		const sx = isFinite(jx) ? jx : 0, sy = isFinite(jy) ? jy : 0;
+		mBundle = { view: defaultViewFor(), history: [] };   // inJulia still false → a sensible M-view for a later exit
+		inJulia = true;
+		if (juliaToggle) juliaToggle.checked = true;
+		currentSeed = { cx: sx, cy: sy };
+		renderer.setSetType(true, sx, sy);
+		view = urlView || defaultJuliaView();
+		jBundle = { seed: seedKey(sx, sy), view, history: [] };
+	} else {
+		inJulia = false;
+		view = urlView || defaultViewFor();
+	}
+
+	updateContextualControls();   // fix any conflicts (e.g. distance coloring on Kernel 2 → log)
+	syncUrl();                    // normalize the address bar to the canonical serialization
+	renderer.render(view);
+}
+restoreFromUrl();
