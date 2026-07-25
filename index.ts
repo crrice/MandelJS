@@ -519,6 +519,15 @@ class ZoomSelector {
 	public hasSelection(): boolean { return !!this.rect; }
 
 	public clear(): void { this.setRect(null); }
+
+	// Re-lock the box aspect after applyAspect() changes the frame ratio (a URL permalink or the aspect
+	// dropdown). Without this the selector keeps its construction-time ratio (the HTML canvas default,
+	// 2:1), so diving from a non-default-aspect view draws a mismatched box and lands squished. Drops
+	// any current selection, which was aspect-locked to the old ratio.
+	public syncAspect(aspect: number): void {
+		this.aspect = aspect;
+		this.clear();
+	}
 }
 
 const selector = new ZoomSelector(canvas);
@@ -624,11 +633,12 @@ function applyAspect(aspect: number): void {
 	easel.style.height = H + "px";
 	const overlay = easel.querySelectorAll("canvas")[1] as HTMLCanvasElement | undefined;
 	if (overlay) { overlay.width = W; overlay.height = H; }
-	CANVAS_ASPECT = aspect;
+	CANVAS_ASPECT = W / H;                 // the REALIZED integer-pixel ratio, not the requested aspect — keeps
+	selector.syncAspect(CANVAS_ASPECT);    // pixels exactly square when H rounds, and the box lock in step (else dives squish)
 }
 function setAspect(aspect: number): void {
 	applyAspect(aspect);
-	view = { ...view, spanY: view.spanX / aspect };
+	view = { ...view, spanY: view.spanX / CANVAS_ASPECT };
 	syncUrl();
 	renderer.render(view);
 }
