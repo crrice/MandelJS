@@ -69,7 +69,9 @@ const PERIOD_EPS_ZOOM0 = 1e5;       // below this zoom, stay at the loose base
 // per-iteration periodicity overhead; only near-boundary / interior orbits do.
 const PERIOD_WARMUP = 64;
 
-// Perturbation periodicity pre-filter (escapeSmoothPert only). The z-periodicity test
+// VESTIGIAL after the rebasing rewrite: escapeSmoothPert now runs a plain-f64 Brent test on the
+// full reconstructed z, not this DD-gated pre-filter — kept only because it's still embedded in the
+// worker source string. Original rationale: the z-periodicity test
 // needs a DD-precise |z_n − z_saved| to survive past the f64 wall, but running those DD
 // ops on EVERY non-escaped iteration triples the (cheap f64) perturbation first-frame.
 // So gate the DD compare behind a plain-f64 estimate of the same distance²: a non-cyclic
@@ -209,8 +211,9 @@ let ssaaOn = true;
 // high-precision reference orbit, in plain f64 — ~30x cheaper than a per-pixel DD orbit.
 // `usePert` gates it. `refZx/refZy` hold the reference orbit (f64 hi-limbs, length refLen);
 // `refOffX/refOffY` its offset from the view center; computed once per generation by
-// computeRef(). `pertRhoThresh` is the error-bound flag: a pixel whose accumulated relative
-// error exceeds it returns CAPPED, so idle-sharpening re-resolves it exactly in DD.
+// computeRef(). NOTE: `pertRhoThresh` (+ `PERT_GATE2`, `refZxl/refZyl`) are vestigial since the
+// rebasing rewrite — the error-bound glitch-flag and the DD periodicity pre-filter were replaced by
+// inline rebasing + a full-z Brent test. Still plumbed through the worker message; unused now.
 let usePert = false;
 let refZx = new Float64Array(1), refZy = new Float64Array(1), refLen = 0;
 let refZxl = new Float64Array(1), refZyl = new Float64Array(1);   // reference lo-limbs (DD) for z-periodicity
@@ -444,12 +447,19 @@ function computeRef(view: View, maxIters: number): void {
 	refZx[refLen] = zxh; refZy[refLen] = zyh; refZxl[refLen] = zxl; refZyl[refLen] = zyl;
 }
 
-// Perturbation escape: iterate the pixel deviation δ (f64) off the reference, carrying a
-// derivative (for deDist) and a running error bound. Returns the smooth escape count (same
-// convention as escapeSmoothDD), IN_SET via the interior shortcuts, or CAPPED — the latter
-// for non-escaping points AND glitch-flagged ones (accumulated relative error e/|δ| >
-// pertRhoThresh), so idle-sharpening resolves those exactly in DD. cr/ci = full pixel
-// coordinate (shortcuts only); dcx/dcy = δc = pixel − reference. Stringify-safe (Math/Number).
+// Perturbation escape with REBASING (Zhuoran's method): iterate the pixel deviation δ (f64) off the
+// shared reference orbit, tracking the reference index `m` SEPARATELY from the total iteration count
+// `n`. The true value is z = Z_m + δ. Whenever δ has outgrown the true value (|z| < |δ| — the
+// Pauldelbrot glitch, δ's significant bits are gone) OR the reference runs out (m reaches refLen), we
+// fold the full value back into δ (δ := z) and restart the reference at index 0 (where Z₀ = 0); z is
+// unchanged by that substitution. A single short OR interior reference then serves EVERY pixel
+// exactly — no glitch-defer-to-DD, and no cap at the reference length. THIS is what resolves deep
+// minibrots whose nucleus the coarse 8×8 probe can't land on: the old code truncated the loop at
+// refLen, so every pixel needing more iterations than the (short) reference ran off the end and came
+// back CAPPED → a black blob over the minibrot and its halo. Returns the smooth escape count (same
+// convention as escapeSmoothDD), IN_SET (interior shortcut or a detected attracting cycle), or CAPPED
+// (still bounded at the cap → sharpening). cr/ci = full pixel coord (shortcuts only); dcx/dcy = δc =
+// pixel − reference. Stringify-safe (Math only).
 function escapeSmoothPert(cr: number, ci: number, dcx: number, dcy: number, maxIters: number): number {
 	const b = cr + 1;
 	if (b * b + ci * ci < 0.0625) { inAcc++; return IN_SET; }
@@ -457,52 +467,37 @@ function escapeSmoothPert(cr: number, ci: number, dcx: number, dcy: number, maxI
 	if (q * (q + xq) < 0.25 * ci * ci) { inAcc++; return IN_SET; }
 	if (ci === 0 && cr >= -2 && cr <= 0.25) { inAcc++; return IN_SET; }
 
-	const EPS = Number.EPSILON, adc = Math.sqrt(dcx * dcx + dcy * dcy);
-	let dx = 0, dy = 0, e = 0, dzx = 0, dzy = 0, n = 0;
-	let szxh = 0, szxl = 0, szyh = 0, szyl = 0, pSaved = false, checkAt = PERIOD_WARMUP;   // z-periodicity (Brent, DD ref)
-	const lim = maxIters < refLen ? maxIters : refLen;
-	while (n < lim) {
-		const Zx = refZx[n], Zy = refZy[n];
-		const zx = Zx + dx, zy = Zy + dy;
+	let dx = 0, dy = 0, dzx = 0, dzy = 0, n = 0, m = 0;   // δ, derivative z', total iter n, reference index m
+	let refx = 0, refy = 0, checkAt = PERIOD_WARMUP;      // Brent periodicity on the FULL value z (rebase-safe)
+	while (n < maxIters) {
+		const Zx = refZx[m], Zy = refZy[m];
+		const zx = Zx + dx, zy = Zy + dy;                  // full z_n — invariant under rebasing
 		const z2 = zx * zx + zy * zy;
-		const dm = Math.sqrt(dx * dx + dy * dy);
 		if (z2 > BAILOUT2) {
-			if (dm > 0 && e / dm > pertRhoThresh) { iterAcc += n; capAcc++; deDist = 0.5 * Math.log(dzx * dzx + dzy * dzy + 1e-300); return CAPPED; }   // glitch → DD in sharpening
 			const zmag = Math.sqrt(z2), dmag = Math.sqrt(dzx * dzx + dzy * dzy);
 			deDist = dmag > 1e-300 ? 2 * zmag * Math.log(zmag) / dmag : 1e30;
 			const mu = n + 1 - Math.log(0.5 * Math.log(z2)) / Math.LN2;
 			iterAcc += n; escAcc++;
 			return mu < 0 ? 0 : mu;
 		}
-		const zm = Math.sqrt(Zx * Zx + Zy * Zy);
-		e = 2 * Math.sqrt(z2) * e + EPS * (2 * zm * dm + dm * dm + adc);            // error: amplify + inject
-		const ndzx = 2 * (zx * dzx - zy * dzy) + 1, ndzy = 2 * (zx * dzy + zy * dzx);   // z' = 2·z·z' + 1
-		dzx = ndzx; dzy = ndzy;
-		const ndx = 2 * (Zx * dx - Zy * dy) + (dx * dx - dy * dy) + dcx;            // δ' = 2·Z·δ + δ² + δc
-		const ndy = 2 * (Zx * dy + Zy * dx) + 2 * dx * dy + dcy;
-		dx = ndx; dy = ndy;
-		n++;
-		// Interior via REAL z-periodicity (Brent): compare z_n to a saved point. The O(1) reference
-		// difference (Z_n − Z_saved) is formed in DD so the test stays precise past the f64 wall; the
-		// δ diff is f64. Resolves in-set minibrot points in the cheap pass instead of via DD sharpening.
-		if (periodOn && n >= PERIOD_WARMUP && n <= refLen) {
-			const nxh = refZx[n], nyh = refZy[n];   // hi limbs only in the hot path; lo limbs deferred
-			if (pSaved) {
-				const gx = (nxh - szxh) + dx, gy = (nyh - szyh) + dy;   // f64 estimate of z_n − z_saved
-				if (gx * gx + gy * gy < PERT_GATE2) {   // cheap gate: skip DD unless a real cycle candidate
-					const nxl = refZxl[n], nyl = refZyl[n];
-					ddAdd(nxh, nxl, -szxh, -szxl); ddAdd(_dhi, _dlo, dx, 0); const drx = _dhi;   // (z_n − z_saved).x, DD
-					ddAdd(nyh, nyl, -szyh, -szyl); ddAdd(_dhi, _dlo, dy, 0); const dry = _dhi;
-					if (drx * drx + dry * dry < periodEps2) { iterAcc += n; perAcc++; return IN_SET; }
-				}
-			}
-			if (n === checkAt) {
-				const nxl = refZxl[n], nyl = refZyl[n];
-				ddAdd(nxh, nxl, dx, 0); szxh = _dhi; szxl = _dlo;                             // save z_n as DD
-				ddAdd(nyh, nyl, dy, 0); szyh = _dhi; szyl = _dlo;
-				pSaved = true; checkAt *= 2;
-			}
+		// Interior via z-periodicity (Brent) on the FULL value: an orbit settling back onto a saved
+		// point is on an attracting cycle ⇒ bounded ⇒ in-set. Comparing the reconstructed z (not a
+		// reference index) keeps this correct across rebases, and — because it tests the real orbit —
+		// avoids the periodic-reference false positive the old index-based DD test had near a nucleus.
+		if (periodOn && n >= PERIOD_WARMUP) {
+			const rx = zx - refx, ry = zy - refy;
+			if (rx * rx + ry * ry < periodEps2) { iterAcc += n; perAcc++; return IN_SET; }
+			if (n === checkAt) { refx = zx; refy = zy; checkAt *= 2; }
 		}
+		const ndzx = 2 * (zx * dzx - zy * dzy) + 1, ndzy = 2 * (zx * dzy + zy * dzx);   // z' = 2·z·z' + 1 (full z)
+		dzx = ndzx; dzy = ndzy;
+		// Rebase before stepping: fold z into δ and reset the reference to index 0 when it's exhausted
+		// or δ has outgrown the true value. bZx/bZy become Z₀ = 0 so the step continues from the restart.
+		let bZx = Zx, bZy = Zy;
+		if (z2 < dx * dx + dy * dy || m + 1 >= refLen) { dx = zx; dy = zy; bZx = 0; bZy = 0; m = 0; }
+		const ndx = 2 * (bZx * dx - bZy * dy) + (dx * dx - dy * dy) + dcx;          // δ' = 2·Z_m·δ + δ² + δc
+		const ndy = 2 * (bZx * dy + bZy * dx) + 2 * dx * dy + dcy;
+		dx = ndx; dy = ndy; m++; n++;
 	}
 	iterAcc += n; capAcc++;
 	deDist = 0.5 * Math.log(dzx * dzx + dzy * dzy + 1e-300);   // provisional log|z'| at the cap
