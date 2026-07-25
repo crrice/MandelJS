@@ -62,11 +62,17 @@ function syncUrl(): void {
 		p.set("filt", String(filt));
 		if (strandsSlider) p.set("str", strandsSlider.value);
 		if (exposureSlider) p.set("exp", exposureSlider.value);
+		if (blendSelect && blendSelect.value !== "0") p.set("fb", blendSelect.value);   // A/B blend (A=0 omitted)
 	}
 	if (aspectSelect && aspectSelect.value !== "2") p.set("ar", aspectSelect.value);   // default 2:1 omitted
 	const palKey = paletteSelect ? paletteSelect.value : "escape";
 	if (palKey !== "escape") p.set("pal", palKey);
-	const palDensity = PALETTES[palKey] ? PALETTES[palKey].density : -1;
+	if (palKey === "custom") {   // the whole gradient: stops (hex, '-'-joined), in-set color, bands flag
+		p.set("stops", customStops.map((s) => s.replace("#", "")).join("-"));
+		if (palInset) p.set("inset", palInset.value.replace("#", ""));
+		if (palCyclic && !palCyclic.checked) p.set("cyc", "0");   // bands default ON → omit
+	}
+	const palDensity = palKey === "custom" ? CUSTOM_DENSITY : (PALETTES[palKey] ? PALETTES[palKey].density : -1);
 	if (densitySlider && Number(densitySlider.value) !== palDensity) p.set("dens", densitySlider.value);
 	if (coloringSelect && coloringSelect.value !== "log") p.set("col", coloringSelect.value);
 	history.replaceState(null, "", "?" + p.toString());
@@ -169,34 +175,46 @@ dev.mandelPert = (on = true) => {
 // mandelSharpen(false) to freeze an all-CAPPED frame and flip it. e.g. mandelProv(false)
 dev.mandelProv = (on = true) => { renderer.setProv(on); console.log("provisional coloring " + (on ? "ON" : "OFF")); };
 
-// Custom-formula preview (the "Tierazon" repro): a Julia set of z ← (z²+c)·sin(z^(c·i)) with the
-// seed and window from tierazon-basic-repro.md, f64. NOT wired into the UI yet — a console hook to
-// eyeball the shape. The cap is left to the normal probe-cap + idle-sharpening machinery (more
-// accurate than the old program's fixed cap). The target window is 4:3, so the canvas is resized to
-// 4:3 (square pixels → undistorted); reload to return to the normal 2:1 Mandelbrot explorer. e.g. tierazon()
+// Custom-formula preview (the "Tierazon" repro): a Julia set of z ← (z²+c)·sin(z^(c·i)) with the seed
+// and window from tierazon-basic-repro.md, f64. Now SYNCS the UI controls to what it sets, so afterward
+// every control (formula / julia / filter / aspect / palette / blend / exposure) lines up and you can swap
+// modes freely on this config — and it becomes a full permalink (survives reload). 4:3 window. e.g. tierazon()
 dev.tierazon = (opts?: { rings?: boolean; dStrands?: number; dFactor?: number }) => {
 	const W = 640, H = 480;   // 4:3, matching the target window's aspect (square pixels, no stretch)
 	canvas.width = W; canvas.height = H;
 	easel.style.height = H + "px";
 	const overlay = easel.querySelectorAll("canvas")[1] as HTMLCanvasElement | undefined;
 	if (overlay) { overlay.width = W; overlay.height = H; }   // keep the selector overlay in sync
-	// Window + seed straight from the brief.
+	CANVAS_ASPECT = W / H;
+	// Window + seed + formula straight from the brief.
 	const XMIN = -0.1499053515515627, XMAX = 1.188366179688075;
 	const YMIN = 0.2655855689131403, YMAX = 1.269289217342869;
 	view = { cx: (XMIN + XMAX) / 2, cxLo: 0, cy: (YMIN + YMAX) / 2, cyLo: 0, spanX: XMAX - XMIN, spanY: YMAX - YMIN };
-	const ct = compileFormula("(z^2 + c) * sin(z^(c*i))");   // the old Cthulu formula, now via the compiler
+	const FORMULA = "(z^2 + c) * sin(z^(c*i))", SX = 0.4206477290564087, SY = 0.5647650444593624;
+	const rings = !!(opts && opts.rings), dStrands = opts?.dStrands ?? 0.08, dFactor = opts?.dFactor ?? 4;
+	const ct = compileFormula(FORMULA);
 	if (ct.ok && ct.body) renderer.setCustomFormula(ct.body);
-	renderer.setSetType(true, 0.4206477290564087, 0.5647650444593624);   // Julia, the brief's seed
-	if (opts && opts.rings) {
-		const dStrands = opts.dStrands ?? 0.08, dFactor = opts.dFactor ?? 4;
-		renderer.setFilter(1, dStrands, dFactor);
-		renderer.render(view, 128);
-		console.log("tierazon x-ray rings: dStrands=" + dStrands + ", dFactor=" + dFactor + " · tierazonExposure(n) to tune · reload to reset");
-	} else {
-		renderer.setFilter(0);   // escape-time coloring
-		renderer.render(view);
-		console.log("tierazon: Cthulu Julia, escape-time, window 4:3 · tierazon({rings:true}) for the x-ray filter · reload to reset");
-	}
+	renderer.setSetType(true, SX, SY);   // Julia, the brief's seed
+	renderer.setFilter(rings ? 1 : 0, dStrands, dFactor);
+
+	// ---- Sync the UI controls + navigation state to the renderer, so the config is fully hand-controllable.
+	if (formulaSelect) formulaSelect.value = "custom";
+	if (formulaInput) formulaInput.value = FORMULA;
+	if (aspectSelect) aspectSelect.value = "1.3333333";
+	if (filterSelect) filterSelect.value = rings ? "1" : "0";
+	if (strandsSlider) strandsSlider.value = String(dStrands);
+	if (exposureSlider) exposureSlider.value = String(dFactor);
+	mBundle = { view: defaultViewFor(), history: [] };   // sensible M-view for toggling julia off (inJulia still false here)
+	inJulia = true;
+	currentSeed = { cx: SX, cy: SY };
+	if (juliaToggle) juliaToggle.checked = true;
+	jBundle = { seed: seedKey(SX, SY), view, history: [] };
+	setHistory([]);
+	updateContextualControls();   // reveal the f(z,c)= field + filter params to match
+	syncUrl();
+
+	if (rings) renderer.render(view, 128); else renderer.render(view);
+	console.log("tierazon: Cthulu Julia" + (rings ? " + x-ray rings" : ", escape-time") + " — UI + URL synced; swap modes freely. reload to reset.");
 };
 
 // Tune the x-ray filter exposure by eye — instant recolor from the stored accumulators (no re-iterate).
@@ -625,7 +643,7 @@ zoomButton.addEventListener("click", () => {
 	// Recenter in double-double: newCenter = oldCenter + boxOffset. In f64 the offset is lost once it
 	// drops below the center's ULP (~|c|·ε); ddAdd's twoSum keeps it, so the box lands where you drew it.
 	const offX = ((r[0] + r[2] / 2) / W - 0.5) * view.spanX;
-	const offY = ((r[1] + r[3] / 2) / H - 0.5) * view.spanY;
+	const offY = (0.5 - (r[1] + r[3] / 2) / H) * view.spanY;   // Im up: match the render's flipped y-map so the box lands where drawn
 	ddAdd(view.cx, view.cxLo, offX, 0); const ncx = _dhi, ncxLo = _dlo;
 	ddAdd(view.cy, view.cyLo, offY, 0); const ncy = _dhi, ncyLo = _dlo;
 	pushHistory(view);
@@ -680,8 +698,52 @@ if (densitySlider) {
 }
 
 const paletteSelect = document.querySelector(".palette-select") as HTMLSelectElement | null;
+
+// ---- Custom palette: a small gradient editor (arbitrary color stops + in-set color), baked through the
+// SAME LUT as the built-in palettes. Applies to escape-time AND filters (mapping B). Live — every edit
+// rebuilds the Palette and recolors from the stored field (no re-iterate). ----
+const paletteEditor = document.querySelector(".palette-editor") as HTMLElement | null;
+const palBar = document.querySelector(".pal-bar") as HTMLElement | null;
+const palStops = document.querySelector(".pal-stops") as HTMLElement | null;
+const palInset = document.querySelector(".pal-inset") as HTMLInputElement | null;
+const palCyclic = document.querySelector(".pal-cyclic") as HTMLInputElement | null;
+const palAdd = document.querySelector(".pal-add") as HTMLButtonElement | null;
+const palRemove = document.querySelector(".pal-remove") as HTMLButtonElement | null;
+const CUSTOM_DENSITY = 32;
+let customStops = ["#0d0221", "#3a0ca3", "#7209b7", "#f72585", "#ffd60a"];
+
+function updatePalBar(): void { if (palBar) palBar.style.background = "linear-gradient(90deg, " + customStops.join(", ") + ")"; }
+function buildCustomPalette(): Palette {
+	return customPalette(customStops, palInset ? palInset.value : "#000000", palCyclic ? palCyclic.checked : true, CUSTOM_DENSITY);
+}
+function applyCustomPalette(): void {
+	renderer.setPalette(buildCustomPalette());
+	if (densitySlider) densitySlider.value = String(CUSTOM_DENSITY);
+	updatePalBar();
+	syncUrl();
+}
+// (Re)build the stop swatches from customStops — one native color input each, wired to live edits.
+function renderStops(): void {
+	if (!palStops) return;
+	palStops.textContent = "";
+	customStops.forEach((hex, i) => {
+		const inp = document.createElement("input");
+		inp.type = "color"; inp.value = hex;
+		inp.addEventListener("input", () => { customStops[i] = inp.value; applyCustomPalette(); });
+		palStops.appendChild(inp);
+	});
+}
+
+if (palAdd) palAdd.addEventListener("click", () => { customStops.push(customStops[customStops.length - 1] || "#ffffff"); renderStops(); applyCustomPalette(); });
+if (palRemove) palRemove.addEventListener("click", () => { if (customStops.length > 2) { customStops.pop(); renderStops(); applyCustomPalette(); } });
+if (palInset) palInset.addEventListener("input", () => applyCustomPalette());
+if (palCyclic) palCyclic.addEventListener("change", () => applyCustomPalette());
+
 if (paletteSelect) {
 	paletteSelect.addEventListener("change", () => {
+		const isCustom = paletteSelect.value === "custom";
+		paletteEditor?.classList.toggle("hidden", !isCustom);
+		if (isCustom) { renderStops(); applyCustomPalette(); return; }
 		const p = PALETTES[paletteSelect.value];
 		if (!p) return;
 		renderer.setPalette(p);   // resets effective wrap to the palette default (E7)
@@ -704,8 +766,8 @@ const juliaToggle = document.querySelector(".julia-toggle") as HTMLInputElement 
 const filterSelect = document.querySelector(".filter-select") as HTMLSelectElement | null;
 const strandsSlider = document.querySelector(".strands-slider") as HTMLInputElement | null;
 const exposureSlider = document.querySelector(".exposure-slider") as HTMLInputElement | null;
+const blendSelect = document.querySelector(".blend-select") as HTMLSelectElement | null;
 const aspectSelect = document.querySelector(".aspect-select") as HTMLSelectElement | null;
-const coloringBody = coloringSelect?.closest(".ctrl-section")?.querySelector<HTMLElement>(".ctrl-body") ?? null;
 
 // Reflect the current control state into the renderer + show/hide contextual controls.
 function currentFilterId(): number { return filterSelect ? Number(filterSelect.value) : 0; }
@@ -719,7 +781,9 @@ function updateContextualControls(): void {
 	document.querySelectorAll<HTMLElement>(".filter-param").forEach((el) => el.classList.toggle("hidden", !filterOn));
 	formulaCustom?.classList.toggle("hidden", !customOn);   // the f(z,c)= text field appears only for "custom…"
 	if (!customOn && formulaError) formulaError.textContent = "";   // clear a stale error when leaving custom
-	coloringBody?.classList.toggle("inactive", filterOn);   // escape-time coloring is bypassed by a filter
+	// A filter reads through the palette (mapping B), so the palette + its editor stay live in filter mode;
+	// only the escape-time-specific controls (density, transfer mode) dim — they don't touch a trap readout.
+	document.querySelectorAll<HTMLElement>(".escape-only").forEach((el) => el.classList.toggle("is-dimmed", filterOn));
 	// Distance coloring needs Kernel 1's derivative; disable it on Kernel 2 (fall back to log if it was picked).
 	const distOpt = coloringSelect?.querySelector<HTMLOptionElement>('option[value="distance"]');
 	if (distOpt) distOpt.disabled = k2;
@@ -800,6 +864,9 @@ if (strandsSlider) {   // trap band half-width — re-iterates, so 'change' (on 
 if (exposureSlider) {   // exposure — instant recolor from the stored accumulators, so live 'input'
 	exposureSlider.addEventListener("input", () => { renderer.setFilterExposure(Number(exposureSlider.value)); syncUrl(); });
 }
+if (blendSelect) {   // A/B color-mapping method (experimental) — instant recolor
+	blendSelect.addEventListener("change", () => { renderer.setFilterBlend(Number(blendSelect.value)); syncUrl(); });
+}
 if (aspectSelect) {
 	aspectSelect.addEventListener("change", () => setAspect(Number(aspectSelect.value)));
 }
@@ -829,11 +896,29 @@ function restoreFromUrl(): void {
 	if (filt && filterSelect) filterSelect.value = filt;
 	const str = p.get("str"); if (str && strandsSlider) strandsSlider.value = str;
 	const exp = p.get("exp"); if (exp && exposureSlider) exposureSlider.value = exp;
+	const fb = p.get("fb"); if (fb && blendSelect) blendSelect.value = fb;
 	pushFilter();
+	if (blendSelect) renderer.setFilterBlend(Number(blendSelect.value));
 
 	// Coloring: palette (resets density to its default) → density override → transfer mode.
 	const pal = p.get("pal");
-	if (pal && paletteSelect && PALETTES[pal]) { paletteSelect.value = pal; renderer.setPalette(PALETTES[pal]); if (densitySlider) densitySlider.value = String(PALETTES[pal].density); }
+	if (pal === "custom") {   // rebuild the custom gradient from stops/inset/cyc, reveal the editor
+		if (paletteSelect) paletteSelect.value = "custom";
+		const stopsParam = p.get("stops");
+		if (stopsParam) {
+			const parsed = stopsParam.split("-").map((h) => "#" + h).filter((h) => /^#[0-9a-fA-F]{6}$/.test(h));
+			if (parsed.length >= 2) customStops = parsed;
+		}
+		if (palInset && /^[0-9a-fA-F]{6}$/.test(p.get("inset") || "")) palInset.value = "#" + p.get("inset");
+		if (palCyclic) palCyclic.checked = p.get("cyc") !== "0";
+		paletteEditor?.classList.remove("hidden");
+		renderStops();
+		renderer.setPalette(buildCustomPalette());
+		updatePalBar();
+		if (densitySlider) densitySlider.value = String(CUSTOM_DENSITY);
+	} else if (pal && paletteSelect && PALETTES[pal]) {
+		paletteSelect.value = pal; renderer.setPalette(PALETTES[pal]); if (densitySlider) densitySlider.value = String(PALETTES[pal].density);
+	}
 	const dens = p.get("dens");
 	if (dens && densitySlider) { densitySlider.value = dens; renderer.setDensity(Number(dens)); }
 	const col = p.get("col");

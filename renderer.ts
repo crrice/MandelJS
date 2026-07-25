@@ -106,7 +106,7 @@ interface TileMsg {
 	canvasW: number; canvasH: number; view: View; maxIters: number; densityMul: number; mode: number;
 	usePeriod: boolean; periodEps2: number; useDD: boolean; usePert: boolean; pertRhoThresh: number; bandMap: number;
 	fractalMode?: number; formulaId?: number; juliaMode?: boolean; mSeedAtC?: boolean; juliaCx?: number; juliaCy?: number;   // Kernel 2 (absent/0 => Kernel 1 z²+c-M)
-	filterId?: number; trapDStrands?: number; filterDFactor?: number; filterBg?: number;   // orbit-trap filter (absent/0 => escape-time)
+	filterId?: number; trapDStrands?: number; filterDFactor?: number; filterBlend?: number; filterDensity?: number;   // orbit-trap filter (absent/0 => escape-time)
 	ssaaOn?: boolean;   // full-render only: false => 1-sample fast frame (initial pass); default true (sync path)
 	idx?: Int32Array;   // present => point job (sharpen or ssaa) over these tile-local pixels
 	ssaaJob?: boolean;  // with idx => background SSAA (supersample edges → colors) instead of sharpen (re-iterate → mu/de)
@@ -181,7 +181,8 @@ function buildWorkerSource(customStepSrc?: string): string {
 			"let _cre = 0, _cim = 0;",                            // complex-op scratch (re, im)
 			"const FILTER_NONE = 0, FILTER_XRAY_RINGS = 1;",      // filter ids (Kernel 2 orbit-trap colorers)
 			"let filterId = 0, trapDStrands = 0.08, trapLimit = 0, trapLo = 0, trapHi = 0, trapDf = 0;",   // filter selector + trap geometry
-			"let filterDFactor = 1, filterRef = 0, filterBg = (255 << 24) >>> 0;",   // filter color params (exposure, frame ref, background)
+			"let filterDFactor = 1, filterBlend = 0, filterDensity = 1;",   // filter color params (gamma, parity-accent method, intensity cycles) — no frame stats
+			"let _okL = 0, _okA = 0, _okB = 0;",   // OKLab scratch for filter Method B
 		"let provOn = false, provLo = 0, provHi = 1, provLut = null;",   // provisional CAPPED coloring: workers keep it OFF (→black per tile); main thread recolors
 		"let ssaaOn = true;",   // SSAA toggle; initial tiles send false (1-sample fast frame), SSAA runs as a background pass
 		"let usePert = false;",
@@ -207,6 +208,9 @@ function buildWorkerSource(customStepSrc?: string): string {
 				escapeCustom.toString(),
 		escapeAtPt.toString(),
 		bandTransform.toString(),
+			_srgbToLin.toString(),
+			rgbToOklab.toString(),
+			oklabToPacked.toString(),
 		filterColor.toString(),
 			colorSample.toString(),
 		renderRegion.toString(),
@@ -226,7 +230,7 @@ function buildWorkerSource(customStepSrc?: string): string {
 			"  formulaId = m.formulaId || 0; juliaMode = !!m.juliaMode; mSeedAtC = !!m.mSeedAtC;",   // formula + set type + M seed
 			"  juliaCx = m.juliaCx || 0; juliaCy = m.juliaCy || 0;",
 			"  filterId = m.filterId || 0;",         // orbit-trap filter (0 = escape-time)
-			"  trapDStrands = m.trapDStrands || 0.08; filterDFactor = m.filterDFactor || 1; filterBg = (m.filterBg >>> 0) || (255 << 24) >>> 0;",
+			"  trapDStrands = m.trapDStrands || 0.08; filterDFactor = m.filterDFactor || 1; filterBlend = m.filterBlend || 0; filterDensity = m.filterDensity || 1;",
 			"  setupFilter();",                      // per-frame filter 'init' — recompute trap geometry from seed + dStrands
 		"  ssaaOn = m.ssaaOn !== false;",   // default true; initial full-render sends false
 		"  iterAcc = 0; escAcc = 0; inAcc = 0; perAcc = 0; capAcc = 0;",
@@ -258,6 +262,11 @@ function buildWorkerSource(customStepSrc?: string): string {
 		"};",
 	].join("\n");
 }
+
+// Per-filter LUT treatment (data-driven — each filter may want a different palette bake). Keyed by filterId.
+// x-ray (1) forces a NON-cyclic LUT: its parity axis maps the gradient's two endpoints to all-even vs
+// all-odd, so they must stay distinct — a looped (cyclic) palette would collapse even↔odd into one color.
+const FILTER_COLORING: { [id: number]: { cyclic: boolean } } = { 1: { cyclic: false } };
 
 class FractalRenderer {
 	private workers: Worker[] = [];
@@ -292,13 +301,13 @@ class FractalRenderer {
 	private heuristicMap = false;
 	public onMapMode: ((heuristic: boolean) => void) | null = null;
 	// Orbit-trap filter (Kernel 2). filterId 0 = escape-time (default). dStrands = trap band half-width
-	// (re-iterate on change); dFactor = exposure (cheap recolor); filterBg = packed miss/background color;
-	// filterRef = the frame-wide intensity reference, computed by computeLevels and pushed to the kernel.
+	// (re-iterate on change); dFactor = exposure GAMMA (cheap recolor); filterBlend = A/B parity-accent
+	// style (cheap recolor). The pixel's (intensity, parity) come out of escapeCustom already window-
+	// independent, so there is NO frame-wide reference to compute — coloring is fully per-pixel.
 	private filterId = 0;
 	private dStrands = 0.08;
 	private dFactor = 1;
-	private filterBg = (255 << 24) >>> 0;
-	private filterRef = 0;
+	private filterBlend = 0;
 	// Escape-count range of the current view, for the auto-leveled (non-cyclic)
 	// ramp. Recomputed from the field when each render completes; a monotonic
 	// ramp needs this or it clamps to one end once escape counts get large (which
@@ -442,7 +451,11 @@ class FractalRenderer {
 
 	private rebuildPalette(): void {
 		const { ink, paper } = themeColors();
-		const built = this.palette.build(ink, paper, this.wrap);
+		// Per-filter coloring override (data-driven): a filter can force a non-cyclic LUT regardless of the
+		// palette's bands setting — the x-ray parity axis maps gradient endpoints to all-even vs all-odd, so
+		// they must be DISTINCT (a looped palette collapses even↔odd). Escape-time (filterId 0) uses this.wrap.
+		const ov = FILTER_COLORING[this.filterId];
+		const built = this.palette.build(ink, paper, ov ? ov.cyclic : this.wrap);
 		this.lut = built.lut;
 		this.inSet = built.inSet;
 		// Provisional CAPPED ramp: a theme-aware paper→ink gradient (the `subtle` palette),
@@ -558,9 +571,9 @@ class FractalRenderer {
 		// Push provisional-coloring state into the kernel globals colorSample reads, so CAPPED
 		// pixels shade via the paper→ink ramp (or stay in-set when provOn is off).
 		provOn = this.provOn; provLo = this.provLo; provHi = this.provHi; provLut = this.provLut;
-		// Filter color globals colorSample→filterColor reads: when a filter is active, (mu,de) carry the raw
-		// (xtot,ytot) accumulators, and these turn them into RGB (frame-normalized by filterRef).
-		filterId = this.filterId; filterDFactor = this.dFactor; filterRef = this.filterRef; filterBg = this.filterBg;
+		// Filter color globals colorSample→filterColor reads: when a filter is active, (mu,de) carry the pixel's
+		// (intensity, parity) — window-independent — and these turn them into RGB (no frame reference needed).
+		filterId = this.filterId; filterDFactor = this.dFactor; filterBlend = this.filterBlend; filterDensity = this.densityBase / 32;
 		// Auto-leveled range for the non-cyclic escape-time ramp — normalizes mu to the
 		// view's escape-count range so the gradient spans the visible structure at any
 		// depth; cyclic and distance modes ignore it (see colorSample).
@@ -582,7 +595,7 @@ class FractalRenderer {
 	// few near-boundary outliers (mu ~ maxIters right against the set) don't
 	// compress the whole gradient. Cheap: a couple of O(N) passes.
 	private computeLevels(): void {
-		if (this.filterId !== 0) { this.computeFilterRef(); return; }   // filter mode: fields carry (xtot,ytot), not mu
+		if (this.filterId !== 0) { this.computeFilterStats(); return; }   // filter mode: fields carry (intensity, parity)
 		const mu = this.muField, N = mu.length;
 		let mn = Infinity, mx = -Infinity, cnt = 0, capped = 0, inset = 0;
 		for (let i = 0; i < N; i++) {
@@ -634,34 +647,14 @@ class FractalRenderer {
 		this.p90 = Math.exp(lmn + (p90Bin < 0 ? 0 : p90Bin) / lscale);
 	}
 
-	// Filter-mode auto-level: the fields carry the raw trap accumulators (xtot in muField, ytot in
-	// deField). Set filterRef = a high percentile of the trap magnitude d = hypot(xtot, ytot), so the
-	// exposure curve normalizes to the frame. A high percentile (not the max) keeps a few exact-ring
-	// spikes (|limit-r|→0 → temp→large) from crushing the exposure. dFactor-INDEPENDENT by construction
-	// (computed from the raw accumulators), so the exposure knob stays meaningful. Also repurposes the
-	// composition tallies as trapped/miss for the telemetry footer.
-	private computeFilterRef(): void {
-		const mu = this.muField, de = this.deField, N = mu.length;
-		let mx = 0, trapped = 0, miss = 0;
-		for (let i = 0; i < N; i++) {
-			const x = mu[i], y = de[i];
-			if (x === 0 && y === 0) { miss++; continue; }
-			trapped++;
-			const d = Math.sqrt(x * x + y * y);
-			if (d > mx) mx = d;
-		}
-		this.wfEsc = trapped; this.wfCap = 0; this.wfIns = miss; this.muMax = mx; this.p50 = this.p90 = 0;
-		if (trapped === 0 || mx <= 0) { this.filterRef = 1; return; }
-		const BINS = 512, hist = new Uint32Array(BINS), scale = (BINS - 1) / mx;
-		for (let i = 0; i < N; i++) {
-			const x = mu[i], y = de[i];
-			if (x === 0 && y === 0) continue;
-			hist[(Math.sqrt(x * x + y * y) * scale) | 0]++;
-		}
-		const target = trapped * 0.98;
-		let acc = 0, refBin = BINS - 1;
-		for (let b = 0; b < BINS; b++) { acc += hist[b]; if (acc >= target) { refBin = b; break; } }
-		this.filterRef = refBin / scale || mx;
+	// Filter-mode "levels": with window-independent coloring there is no frame reference to compute — the
+	// fields carry (intensity, parity) and a miss is intensity < 0 (see escapeCustom). So this only tallies
+	// trapped vs miss for the telemetry footer's composition line. One cheap O(N) pass.
+	private computeFilterStats(): void {
+		const mu = this.muField, N = mu.length;
+		let trapped = 0, miss = 0;
+		for (let i = 0; i < N; i++) { if (mu[i] < 0) miss++; else trapped++; }
+		this.wfEsc = trapped; this.wfCap = 0; this.wfIns = miss; this.muMax = 0; this.p50 = this.p90 = 0;
 	}
 
 	// Pack a provisional heat color for one CAPPED pixel's structure signal (log|z'|),
@@ -997,6 +990,10 @@ class FractalRenderer {
 		this.dStrands = dStrands;
 		this.dFactor = dFactor;
 		this.deriveKernel();
+		// The filter's LUT treatment (FILTER_COLORING) may differ from escape-time (x-ray forces non-cyclic),
+		// so rebuild + resend the palette on any filter toggle. Caller re-renders (a filter change re-iterates).
+		this.rebuildPalette();
+		this.sendPalette();
 	}
 
 	// E4 dispatch: pick the kernel from (formula, set-type, filter). Kernel 1 (the optimized z²+c
@@ -1009,11 +1006,17 @@ class FractalRenderer {
 		else { this.ddOverride = null; this.pertOverride = null; }
 	}
 
-	// Exposure knob for the active filter — recolors instantly from the stored (xtot,ytot) fields (no
-	// re-iterate), since dFactor is applied at readout, not accumulation. filterRef is dFactor-independent
-	// so it needn't recompute. e.g. tune the core/striation brightness by eye.
+	// Exposure GAMMA for the active filter — recolors instantly from the stored (intensity, parity) fields
+	// (no re-iterate), applied at readout. e.g. push detail up/down the gradient by eye.
 	public setFilterExposure(dFactor: number): void {
 		this.dFactor = dFactor;
+		this.colorizeField();
+	}
+
+	// Filter blend method (mapping A vs B): applied at the filter readout, so — like exposure — a pure
+	// recolor from the stored accumulators, no re-iterate. 0 = A (bg-anchored triangle), 1 = B (curtain).
+	public setFilterBlend(mode: number): void {
+		this.filterBlend = mode;
 		this.colorizeField();
 	}
 
@@ -1074,7 +1077,7 @@ class FractalRenderer {
 		filterId = FILTER_NONE;   // probe measures escape DWELL to size the cap — not filter output — even when a filter is active
 		const dwells: number[] = [];
 		for (let j = 0; j < FF_PROBE_NY; j++) {
-			const offY = ((j + 0.5) / FF_PROBE_NY - 0.5) * view.spanY;
+			const offY = (0.5 - (j + 0.5) / FF_PROBE_NY) * view.spanY;   // Im up (consistency; symmetric grid so no functional change)
 			for (let i = 0; i < FF_PROBE_NX; i++) {
 				const offX = ((i + 0.5) / FF_PROBE_NX - 0.5) * view.spanX;
 				const pxc = view.cx + offX, pyc = view.cy + offY;
@@ -1283,7 +1286,7 @@ class FractalRenderer {
 			// initial full render + SSAA jobs) keep the view's perturbation path.
 			usePert: (tile.idx && !tile.ssaaJob && this.sharpenMode === "dd") ? false : this.usePert, pertRhoThresh: this.pertRhoThresh, bandMap: this.bandMap,
 			fractalMode: this.fractalMode, formulaId: this.formulaId, juliaMode: this.juliaMode, mSeedAtC: this.mSeedAtC, juliaCx: this.juliaCx, juliaCy: this.juliaCy,
-			filterId: this.filterId, trapDStrands: this.dStrands, filterDFactor: this.dFactor, filterBg: this.filterBg,
+			filterId: this.filterId, trapDStrands: this.dStrands, filterDFactor: this.dFactor, filterBlend: this.filterBlend, filterDensity: this.densityBase / 32,
 			ssaaOn: false,   // initial full render is 1-sample (fast frame); point jobs ignore this
 		};
 		if (tile.idx) {
@@ -1461,7 +1464,7 @@ class FractalRenderer {
 		usePert = this.usePert;
 		pertRhoThresh = this.pertRhoThresh;
 		fractalMode = this.fractalMode; formulaId = this.formulaId; juliaMode = this.juliaMode; mSeedAtC = this.mSeedAtC; juliaCx = this.juliaCx; juliaCy = this.juliaCy;   // Kernel 2 (sync fallback)
-		filterId = this.filterId; trapDStrands = this.dStrands; filterDFactor = this.dFactor; filterBg = this.filterBg; setupFilter();   // orbit-trap filter
+		filterId = this.filterId; trapDStrands = this.dStrands; filterDFactor = this.dFactor; filterBlend = this.filterBlend; filterDensity = this.densityBase / 32; setupFilter();   // orbit-trap filter
 		provOn = false;   // paint CAPPED black in the blocking pass; finalizeColors levels + recolors the underlay
 		ssaaOn = true;    // no-worker fallback renders crisp (with SSAA) in one blocking pass; no background AA pass
 		if (usePert) computeRef(this.view, this.maxIters);

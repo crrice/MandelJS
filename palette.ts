@@ -65,6 +65,24 @@ function stopsPalette(hexes: string[], cyclic: boolean, density: number): Palett
 	};
 }
 
+// A USER-authored palette: arbitrary hex color stops + an explicit in-set color (the interior for
+// escape-time, and the background/miss color for a filter — see filterColor's mapping B). Same bake as
+// stopsPalette, but the interior is user-chosen rather than forced black. buildStopsLut needs ≥2 stops,
+// so a single stop is duplicated into a flat gradient. index.ts rebuilds one of these on every edit.
+function customPalette(hexes: string[], insetHex: string, cyclic: boolean, density: number): Palette {
+	let stops = hexes.map((h) => hexToRgb(h, [0, 0, 0]));
+	if (stops.length === 0) stops = [[0, 0, 0]];
+	if (stops.length === 1) stops = [stops[0], stops[0]];
+	const inset = hexToRgb(insetHex, [0, 0, 0]);
+	return {
+		cyclic,
+		density,
+		build(_ink: RGB, _paper: RGB, wrap: boolean): { lut: Uint32Array; inSet: number } {
+			return { lut: buildStopsLut(stops, wrap), inSet: pack(inset[0], inset[1], inset[2]) };
+		},
+	};
+}
+
 const PALETTES: Record<string, Palette> = {
 	// Colorful escape-time bands — the default for the explorer.
 	escape: {

@@ -224,6 +224,29 @@ h1 {
 }
 .formula-error:empty { display: none; }
 
+/* Escape-time-only coloring controls (density, transfer mode): they don't apply to a filter's readout,
+   so dim them in filter mode — but the palette itself stays live (it now colors filters too, mapping B). */
+.escape-only.is-dimmed { opacity: 0.4; pointer-events: none; }
+
+/* Custom-palette gradient editor: a full-width block under the coloring controls, shown for palette=custom. */
+.palette-editor { flex-basis: 100%; display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
+.palette-editor.hidden { display: none; }
+.pal-bar {
+	height: 22px; border-radius: 6px; border: 1px solid #2a2c31;
+	background: linear-gradient(90deg, #000, #fff);   /* replaced live from the stops */
+}
+.pal-stops { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+/* Native color swatches, squared off to read as gradient stops. */
+.pal-stops input[type="color"], .pal-inset {
+	width: 30px; height: 26px; padding: 0; border: 1px solid #2a2c31; border-radius: 5px;
+	background: none; cursor: pointer;
+}
+.pal-stops input[type="color"]::-webkit-color-swatch-wrapper { padding: 2px; }
+.pal-stops input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
+.pal-inset { width: 26px; }
+.pal-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.pal-row .btn { padding: 5px 11px; font-size: 0.78rem; }
+
 .field {
 	display: inline-flex;
 	align-items: center;

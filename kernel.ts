@@ -164,11 +164,11 @@ let filterId = 0;
 // is the falloff numerator (= dStrands).
 let trapDStrands = 0.08;
 let trapLimit = 0, trapLo = 0, trapHi = 0, trapDf = 0;
-// Filter COLOR params (read by filterColor, not the kernel). filterDFactor is the exposure knob;
-// filterRef is the frame-wide intensity reference (a dFactor-INDEPENDENT high percentile of the raw
-// trap magnitude, set by the main thread's computeLevels — workers leave it 0 → per-pixel self-scale,
-// a rough provisional the main thread then overwrites). filterBg is the packed miss/background color.
-let filterDFactor = 1, filterRef = 0, filterBg = (255 << 24) >>> 0;   // bg default = opaque black
+// Filter COLOR params (read by filterColor, not the kernel). filterDFactor = a GAMMA/contrast knob on the
+// (already [0,1], scale-free) intensity. filterBlend = the parity-accent style: 0 = A (gradient-position
+// nudge + bg blend), 1 = B (OKLab lightness nudge). filterDensity = palette cycles across intensity.
+// No frame stats — coloring is fully per-pixel/window-independent. See filterColor + xray-ring-coloring.md.
+let filterDFactor = 1, filterBlend = 0, filterDensity = 1;
 // Recompute the JULIA (frame-constant) trap geometry from the seed + dStrands. Called once per tile
 // message (worker) and once per sync render — the per-frame "init" for the Julia case. Mandelbrot uses
 // a per-pixel limit computed in escapeCustom instead. Stringify-safe (Math + the globals above).
@@ -419,7 +419,7 @@ function computeRef(view: View, maxIters: number): void {
 	let bx = 0, by = 0, best = -1;
 	for (let j = 0; j < PH && best < maxIters; j++) {
 		for (let i = 0; i < PW; i++) {
-			const ox = ((i + 0.5) / PW - 0.5) * view.spanX, oy = ((j + 0.5) / PH - 0.5) * view.spanY;
+			const ox = ((i + 0.5) / PW - 0.5) * view.spanX, oy = (0.5 - (j + 0.5) / PH) * view.spanY;   // Im up (matches escapeAtPt) — keeps δ consistent
 			ddAdd(view.cx, view.cxLo, ox, 0); const crhi = _dhi, crlo = _dlo;
 			ddAdd(view.cy, view.cyLo, oy, 0); const cihi = _dhi, cilo = _dlo;
 			const len = refOrbitLen(crhi, crlo, cihi, cilo, maxIters);
@@ -570,7 +570,7 @@ function escapeCustom(z0x: number, z0y: number, cx: number, cy: number, maxIters
 	let tLimit = trapLimit, tLo = trapLo, tHi = trapHi;
 	if (filterId !== FILTER_NONE && !juliaMode) { tLimit = Math.sqrt(cx * cx + cy * cy); tLo = tLimit - trapDStrands; tHi = tLimit + trapDStrands; }
 	let zx = z0x, zy = z0y, n = 0, escaped = false;
-	let xtot = 0, ytot = 0;    // filter accumulators (even/odd parity) — unused when FILTER_NONE
+	let xtot = 0, ytot = 0, minRing = Infinity;   // xtot/ytot = even/odd HIT COUNTS (→ parity ratio); minRing = closest approach to the exact ring (→ scale-free intensity). Unused when FILTER_NONE.
 	let prx = z0x, pry = z0y, pchk = PERIOD_WARMUP;   // Brent cycle detection: saved point + next-save schedule
 	while (n < maxIters) {
 		const mag2 = zx * zx + zy * zy;                     // escape test on PRE-update z
@@ -583,14 +583,15 @@ function escapeCustom(z0x: number, z0y: number, cx: number, cy: number, maxIters
 			zx = nzx; zy = nzy;
 		}
 		n++;
-		// filter onIteration — observe the POST-update z
-		if (filterId === FILTER_XRAY_RINGS) {
+		// filter onIteration — observe the POST-update z. In Mandelbrot mode (z₀=0) SKIP n=1: z₁=c lands on the
+		// |c| ring exactly for every pixel (a trivial, uniform hit that would collapse the closeness to 1
+		// everywhere) — the real structure is later RETURNS to the ring. Julia (z₀=pixel) has no such artifact.
+		if (filterId === FILTER_XRAY_RINGS && (juliaMode || n > 1)) {
 			const r = Math.sqrt(zx * zx + zy * zy);
-			if (r > tLo && r < tHi) {
-				// Proximity weight; the +ε keeps it FINITE at an exact hit r==limit. That case is systematic in
-				// Mandelbrot mode — z₁ = c lands |z₁| = |c| = limit exactly every pixel — so without ε it'd be Inf→NaN.
-				const temp = Math.log(2 + trapDf / (Math.abs(tLimit - r) + 1e-9));
-				if ((n & 1) === 0) xtot += temp; else ytot += temp;         // even → x channel, odd → y channel
+			if (r > tLo && r < tHi) {                     // orbit inside the ring band
+				const dr = Math.abs(tLimit - r);          // distance to the EXACT ring this step
+				if (dr < minRing) minRing = dr;           // closest approach → the scale-free intensity
+				if ((n & 1) === 0) xtot++; else ytot++;   // even/odd HIT COUNTS → parity ratio (scale-stable)
 			}
 		}
 		// Interior via REAL z-periodicity (Brent) — generalizes to ANY formula: an orbit settling back onto a
@@ -603,12 +604,17 @@ function escapeCustom(z0x: number, z0y: number, cx: number, cy: number, maxIters
 		}
 	}
 	iterAcc += n;
-	// filter complete
+	// filter complete. Output is now WINDOW-INDEPENDENT (per-pixel, no frame normalization): INTENSITY is the
+	// orbit's closest approach to the exact ring, mapped to [0,1] by the band width (scale-free — the old
+	// ACCUMULATED magnitude had no fixed scale, so it needed a per-frame percentile ref, which caused the
+	// first-frame recolor "snap"); PARITY is the even/odd hit ratio. Packed: mu = intensity (or -1 = miss),
+	// de = parity ∈ [0,1]. The color path (filterColor) needs only these two, no frame stats.
 	if (filterId !== FILTER_NONE) {
 		if (escaped) escAcc++; else capAcc++;
-		if (xtot === 0 && ytot === 0) { deDist = 0; return 0; }   // never trapped → miss (both channels 0 → background)
-		deDist = ytot;                                            // channel 2
-		return xtot;                                              // channel 1 (raw; color path applies dFactor + normalize)
+		if (minRing === Infinity) { deDist = 0; return -1; }      // never entered the band → miss (mu < 0)
+		const tot = xtot + ytot;
+		deDist = tot > 0 ? ytot / tot : 0.5;                      // parity: 0 all-even .. 1 all-odd
+		return 1 - minRing / trapDStrands;                        // closeness ∈ (0,1]: band edge → 0, exact hit → 1
 	}
 	// FILTER_NONE — escape-time
 	if (escaped) {
@@ -634,24 +640,69 @@ function bandTransform(mu: number, bandMap: number): number {
 	return mu;
 }
 
-// Filter READOUT: fold a filter's two raw accumulators (xtot=even, ytot=odd; carried in the mu/de
-// fields) into a packed RGBA. Separates BRIGHTNESS (the trap intensity, exposure-mapped so dFactor is
-// a real knob — it would cancel under a plain divide-by-max) from HUE (the even/odd parity that makes
-// R=d+xtot vs G=d+ytot resolve into red vs cyan). filterRef is the frame's intensity scale (workers
-// pass 0 → per-pixel self-scale, a rough provisional; the main thread recolors with the real ref). A
-// (0,0) accumulator means the orbit never touched the trap → the background color. Self-contained
-// (Math + filter globals). Packing matches renderRegion: A<<24 | B<<16 | G<<8 | R (little-endian RGBA).
-function filterColor(xtot: number, ytot: number): number {
-	if (xtot === 0 && ytot === 0) return filterBg;          // miss → background
-	const d = Math.sqrt(xtot * xtot + ytot * ytot);         // trap intensity
-	const ref = filterRef > 0 ? filterRef : d;              // no frame ref (worker) → self-scale
-	let t = d / ref; if (t > 1) t = 1;                      // dFactor-independent normalized intensity
-	const b = 1 - Math.exp(-filterDFactor * t);             // exposure curve — dFactor is the knob
-	const cmax = d + (xtot > ytot ? xtot : ytot);           // largest channel (B=d is smallest; R,G add a pile)
-	let R = b * (d + xtot) / cmax * 255;
-	let G = b * (d + ytot) / cmax * 255;
-	let B = b * d / cmax * 255;
-	R = R > 255 ? 255 : R | 0; G = G > 255 ? 255 : G | 0; B = B > 255 ? 255 : B | 0;
+// OKLab conversion (perceptual color space) for filter Method B, which keeps a gradient color's hue+chroma
+// but imposes its own lightness. Only used at COLOR time (per pixel, not the iteration hot loop). Forward
+// writes to the _ok* scratch; inverse packs directly (gamut-clamped). Self-contained (Math + scratch).
+let _okL = 0, _okA = 0, _okB = 0;
+function _srgbToLin(c: number): number { c /= 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+function rgbToOklab(r: number, g: number, b: number): void {
+	const lr = _srgbToLin(r), lg = _srgbToLin(g), lb = _srgbToLin(b);
+	const l = 0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb;
+	const m = 0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb;
+	const s = 0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb;
+	const cl = Math.cbrt(l), cm = Math.cbrt(m), cs = Math.cbrt(s);
+	_okL = 0.2104542553 * cl + 0.7936177850 * cm - 0.0040720468 * cs;
+	_okA = 1.9779984951 * cl - 2.4285922050 * cm + 0.4505937099 * cs;
+	_okB = 0.0259040371 * cl + 0.7827717662 * cm - 0.8086757660 * cs;
+}
+function oklabToPacked(L: number, a: number, b: number): number {
+	const cl = L + 0.3963377774 * a + 0.2158037573 * b;
+	const cm = L - 0.1055613458 * a - 0.0638541728 * b;
+	const cs = L - 0.0894841775 * a - 1.2914855480 * b;
+	const l = cl * cl * cl, m = cm * cm * cm, s = cs * cs * cs;
+	let r = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
+	let g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
+	let bl = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;
+	r = r <= 0.0031308 ? 12.92 * r : 1.055 * Math.pow(r, 1 / 2.4) - 0.055;   // linear → sRGB (neg → linear branch → clamp)
+	g = g <= 0.0031308 ? 12.92 * g : 1.055 * Math.pow(g, 1 / 2.4) - 0.055;
+	bl = bl <= 0.0031308 ? 12.92 * bl : 1.055 * Math.pow(bl, 1 / 2.4) - 0.055;
+	const R = r < 0 ? 0 : r > 1 ? 255 : (r * 255) | 0;
+	const G = g < 0 ? 0 : g > 1 ? 255 : (g * 255) | 0;
+	const B = bl < 0 ? 0 : bl > 1 ? 255 : (bl * 255) | 0;
+	return ((255 << 24) | (B << 16) | (G << 8) | R) >>> 0;
+}
+
+// Filter READOUT: fold a pixel's (intensity, parity) — carried in the mu/de fields, computed WINDOW-
+// INDEPENDENTLY in escapeCustom (intensity = scale-free closeness ∈ [0,1] or -1 for a miss; parity = even/
+// odd hit ratio ∈ [0,1]) — into a packed RGBA via the SAME palette LUT + in-set color as escape-time.
+// INTENSITY drives the gradient, PARITY is a SUBTLE accent only. filterDFactor is a GAMMA (per-region
+// contrast). filterDensity CYCLES the palette across intensity (contour bands). filterBlend: 0=A blends the
+// gradient UP from the in-set bg by intensity (faint→bg); 1=B nudges OKLab lightness by parity. No frame
+// stats — fully per-pixel, so the workers color exactly right (no FF snap). Packing: A<<24|B<<16|G<<8|R.
+function filterColor(inten: number, parity: number, lut: Uint32Array, inSet: number): number {
+	if (inten < 0) return inSet;                           // miss (never entered the band) → in-set backdrop
+	if (inten > 1) inten = 1;
+	const gamma = filterDFactor * 0.25;                    // exposure → gamma (slider 0.5..60 → 0.125..15; 4 = neutral)
+	const u = Math.pow(inten, 1 / gamma);                  // exposure redistributes which pixels get which colors
+	// Density CYCLES the palette across intensity (1 → one sweep, >1 → iso-intensity contour bands). Keep the
+	// peak off an exact band boundary (else it wraps to the gradient start). The A blend-weight stays LINEAR u.
+	const uf = u < 1 ? u : 0.999999;
+	let uc = uf * filterDensity; uc -= Math.floor(uc);
+	if (parity < 0) parity = 0; else if (parity > 1) parity = 1;
+	if (filterBlend === 1) {                                // B — parity nudges LIGHTNESS (OKLab), keeps hue/chroma
+		const col = lut[(uc * (lut.length - 1)) | 0];
+		rgbToOklab(col & 255, (col >> 8) & 255, (col >> 16) & 255);
+		return oklabToPacked(_okL + 0.14 * (parity - 0.5), _okA, _okB);
+	}
+	// A ("triangle") — the gradient color at the (parity-nudged) intensity position, blended UP from the
+	// in-set bg by intensity: faint pixels fade to the bg color, the bright ring structure reaches the full
+	// gradient. So the in-set color is the backdrop everywhere, not just on untrapped pixels.
+	let ua = uc + 0.12 * (parity - 0.5);
+	if (ua < 0) ua = 0; else if (ua > 1) ua = 1;
+	const g = lut[(ua * (lut.length - 1)) | 0];
+	const gr = g & 255, gg = (g >> 8) & 255, gb = (g >> 16) & 255;
+	const ir = inSet & 255, ig = (inSet >> 8) & 255, ib = (inSet >> 16) & 255;
+	const R = (ir + (gr - ir) * u) | 0, G = (ig + (gg - ig) * u) | 0, B = (ib + (gb - ib) * u) | 0;
 	return ((255 << 24) | (B << 16) | (G << 8) | R) >>> 0;
 }
 
@@ -668,7 +719,7 @@ function colorSample(
 	mode: number, cyclic: boolean, densityMul: number,
 	pixelSize: number, bandMap: number, lvlLo: number, lvlHi: number,
 ): number {
-	if (filterId !== FILTER_NONE) return filterColor(mu, de);   // filter mode: (mu,de) carry (xtot,ytot)
+	if (filterId !== FILTER_NONE) return filterColor(mu, de, lut, inSet);   // filter mode: (mu,de) carry (xtot,ytot)
 	if (mu === -Infinity) {                                 // CAPPED (unresolved this pass)
 		if (!provOn || !provLut) return inSet;              //   provisional coloring off -> in-set color (old behavior)
 		let tp = (de - provLo) / (provHi > provLo ? provHi - provLo : 1);   // de carries log|z'| for CAPPED px
@@ -702,7 +753,7 @@ function colorSample(
 // Self-contained for stringification (the escape kernels + dd ops + ref/scratch globals).
 function escapeAtPt(px: number, py: number, view: View, maxIters: number, invW: number, invH: number): number {
 	const offX = (px * invW - 0.5) * view.spanX;
-	const offY = (py * invH - 0.5) * view.spanY;
+	const offY = (0.5 - py * invH) * view.spanY;   // imaginary axis points UP: screen row 0 = MAX Im (standard math convention)
 	// Kernel 2 (generalized): wire z₀/c from the set type. Mandelbrot: c = the pixel, z₀ = 0.
 	// Julia: c = the seed, z₀ = the pixel. One well-predicted branch per pixel (fractalMode +
 	// juliaMode are constant for the frame); the z²+c fast path below is entirely unchanged.
