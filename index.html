@@ -115,6 +115,18 @@
 			</div>
 		</details>
 
+		<details class="ctrl-section">
+			<summary>advanced</summary>
+			<div class="ctrl-body">
+				<label class="field checkbox pert-field" title="Perturbation is a faster deep-zoom path for z² + c that produces the same image; unchecking falls back to double-double. Unavailable for custom formulas, filters, or Julia (which use the general kernel).">
+					<input class="pert-toggle" type="checkbox" checked /> perturbation
+				</label>
+				<label class="field" title="Hard iteration cap: stop at this many iterations and treat anything still unresolved as interior — a fixed Fractint-style maxiter. Blank = adaptive. Skips progressive refinement; anti-aliasing still runs.">iteration cap
+					<input class="itercap-input" type="number" min="0" max="1000000" step="100" placeholder="auto" />
+				</label>
+			</div>
+		</details>
+
 		<div class="telemetry" aria-live="polite">
 			<div class="tstat" data-k="zoom"><div class="tstat-k">zoom</div><div class="tstat-v"></div></div>
 			<div class="tstat" data-k="precision"><div class="tstat-k">precision</div><div class="tstat-v"></div></div>

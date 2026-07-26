@@ -75,6 +75,8 @@ function syncUrl(): void {
 	const palDensity = palKey === "custom" ? CUSTOM_DENSITY : (PALETTES[palKey] ? PALETTES[palKey].density : -1);
 	if (densitySlider && Number(densitySlider.value) !== palDensity) p.set("dens", densitySlider.value);
 	if (coloringSelect && coloringSelect.value !== "log") p.set("col", coloringSelect.value);
+	const iterCap = currentIterCap();
+	if (iterCap != null) p.set("cap", String(iterCap));   // advanced forced maxiter — only when set
 	history.replaceState(null, "", "?" + p.toString());
 }
 
@@ -778,6 +780,8 @@ const strandsSlider = document.querySelector(".strands-slider") as HTMLInputElem
 const exposureSlider = document.querySelector(".exposure-slider") as HTMLInputElement | null;
 const blendSelect = document.querySelector(".blend-select") as HTMLSelectElement | null;
 const aspectSelect = document.querySelector(".aspect-select") as HTMLSelectElement | null;
+const pertToggle = document.querySelector(".pert-toggle") as HTMLInputElement | null;   // advanced: z²+c perturbation fast-path A/B (perf only — same image, so no view state)
+const itercapInput = document.querySelector(".itercap-input") as HTMLInputElement | null;   // advanced: hard maxiter (blank = adaptive); changes the image, so it IS view state
 
 // Reflect the current control state into the renderer + show/hide contextual controls.
 function currentFilterId(): number { return filterSelect ? Number(filterSelect.value) : 0; }
@@ -799,6 +803,15 @@ function updateContextualControls(): void {
 	if (distOpt) distOpt.disabled = k2;
 	if (k2 && coloringSelect?.value === "distance") { coloringSelect.value = "log"; renderer.setColoring(0, 2); }
 	filterState.active = filterOn;   // telemetry relabels in filter mode (V7)
+	// Perturbation is a z²+c-only fast path — mirror deriveKernel(): disabled + off on Kernel 2 (custom /
+	// Julia / filter, which force it false), enabled + on (auto) on Kernel 1. Reflective only; the change
+	// handler drives the renderer. Runs on the same config changes that re-derive the kernel, so it never
+	// clobbers a mid-navigation user choice (those config changes reset the override anyway).
+	if (pertToggle) {
+		pertToggle.disabled = k2;
+		pertToggle.checked = !k2;
+		pertToggle.closest(".field")?.classList.toggle("is-dimmed", k2);
+	}
 }
 
 // Show/clear a formula error; empty text hides the pill (see .formula-error:empty in CSS).
@@ -880,6 +893,22 @@ if (blendSelect) {   // A/B color-mapping method (experimental) — instant reco
 if (aspectSelect) {
 	aspectSelect.addEventListener("change", () => setAspect(Number(aspectSelect.value)));
 }
+if (pertToggle) {
+	// Perturbation is a pure performance path (identical image to the double-double engine), so it carries
+	// no view state / URL — just flip the override and re-iterate. Only visibly differs on deep z²+c views
+	// (telemetry method flips perturbation ↔ double-double). checked = auto (pert where DD engages); unchecked = force DD.
+	pertToggle.addEventListener("change", () => { renderer.setPert(pertToggle.checked ? null : false); renderer.render(view); });
+}
+// Forced iteration cap (advanced): blank/0 = adaptive, a positive integer = a hard maxiter. It changes the
+// image (pixels still capped become interior), so it re-iterates AND is view state (URL). See setIterCap.
+function currentIterCap(): number | null {
+	if (!itercapInput || itercapInput.value.trim() === "") return null;
+	const n = Math.round(Number(itercapInput.value));
+	return isFinite(n) && n > 0 ? n : null;
+}
+if (itercapInput) {
+	itercapInput.addEventListener("change", () => { renderer.setIterCap(currentIterCap()); syncUrl(); renderer.render(view); });
+}
 if (juliaToggle) {
 	juliaToggle.addEventListener("change", () => { if (juliaToggle.checked) enterJulia(); else exitJulia(); });
 }
@@ -934,6 +963,11 @@ function restoreFromUrl(): void {
 	const col = p.get("col");
 	if (col && coloringSelect) coloringSelect.value = col;
 	applyColoringFromControls();
+
+	// Forced iteration cap (advanced) — a hard maxiter (blank = adaptive), applied before the first render.
+	const capParam = p.get("cap");
+	if (capParam && itercapInput) itercapInput.value = capParam;
+	renderer.setIterCap(currentIterCap());
 
 	// View + set type. urlView uses the now-correct CANVAS_ASPECT for spanY.
 	const urlView = viewFromUrl();

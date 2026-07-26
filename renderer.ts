@@ -55,6 +55,7 @@ const FF_PROBE_CEIL_MULT = 6;      // probe iterates to this × the budget (dwel
 // scratch (the wasted low-cap iters are a few %, not worth a resume-state buffer).
 const SHARPEN_MULT = 10;              // cap multiplier per sharpening stage
 const SHARPEN_CEILING = 100_000_000;  // past this, points are precision-limited, not iteration-limited
+const ITER_CAP_FORCED_MAX = 1_000_000;  // ceiling for the advanced forced iteration cap — keeps the pert reference orbit (a stored f64 quad per iteration, per worker) memory-safe
 const SHARPEN_MIN_YIELD = 0.01;       // a stage resolving < this share of what remained is "unproductive"
 const SHARPEN_CHEAP_MS = 150;         // ...but a stage faster than this is a free tickle — keep going anyway
 // Perturbation-first sharpening ceiling. A pert window sharpens its CAPPED pixels in the cheap f64
@@ -276,6 +277,10 @@ class FractalRenderer {
 	private gen = 0;
 	private view: View = { ...DEFAULT_VIEW };
 	private maxIters = ITER_BASE;
+	// Forced iteration cap (advanced): a hard maxiter that overrides the adaptive probe/pert budget AND
+	// short-circuits the sharpening escalation — pixels still capped at it stay capped (→ interior), exactly
+	// a fixed Fractint-style maxiter. null = adaptive (default). SSAA still runs. Set via setIterCap.
+	private iterCapForced: number | null = null;
 	private palette: Palette;
 	private wrap: boolean;         // effective wrap (palette default; user-overridable)
 	private densityBase: number;   // effective density (palette default; user-overridable)
@@ -510,6 +515,13 @@ class FractalRenderer {
 		this.pertOverride = on;
 	}
 
+	// Force a hard iteration cap (advanced): overrides the adaptive cap and stops the sharpening ladder, so
+	// capped pixels resolve as interior at exactly this many iterations (a fixed Fractint-style maxiter).
+	// null = adaptive. Clamped to a memory-safe ceiling (the pert reference stores one f64 quad per iter).
+	public setIterCap(n: number | null): void {
+		this.iterCapForced = n != null && n > 0 ? Math.min(Math.round(n), ITER_CAP_FORCED_MAX) : null;
+	}
+
 	// Toggle provisional CAPPED coloring on/off and recolor instantly from the stored field
 	// — the live A/B of the developing-underlay vs the old all-black first frame. Freeze the
 	// frame first (mandelSharpen(false)) to hold CAPPED pixels for a clean comparison.
@@ -570,7 +582,7 @@ class FractalRenderer {
 		const mu = this.muField, de = this.deField;
 		// Push provisional-coloring state into the kernel globals colorSample reads, so CAPPED
 		// pixels shade via the paper→ink ramp (or stay in-set when provOn is off).
-		provOn = this.provOn; provLo = this.provLo; provHi = this.provHi; provLut = this.provLut;
+		provOn = this.provOn && this.iterCapForced == null; provLo = this.provLo; provHi = this.provHi; provLut = this.provLut;
 		// Filter color globals colorSample→filterColor reads: when a filter is active, (mu,de) carry the pixel's
 		// (intensity, parity) — window-independent — and these turn them into RGB (no frame reference needed).
 		filterId = this.filterId; filterDFactor = this.dFactor; filterBlend = this.filterBlend; filterDensity = this.densityBase / 32;
@@ -711,7 +723,7 @@ class FractalRenderer {
 	// left those pixels black), so a high-dwell all-CAPPED frame develops instead of blacking out.
 	private finalizeColors(): void {
 		this.computeLevels();
-		if (this.provOn && this.sharpenStage === 0) this.computeProvLevels();
+		if (this.provOn && this.sharpenStage === 0 && this.iterCapForced == null) this.computeProvLevels();
 		// Skip the recolor after the SSAA generation — colorizeField repaints from the 1-sample
 		// field and would clobber the just-blitted anti-aliased edge pixels (matters for non-cyclic).
 		if (!this.ssaaPhase && ((this.provOn && this.sharpenStage === 0) || (!this.wrap && this.mode === 0))) this.colorizeField();
@@ -797,7 +809,7 @@ class FractalRenderer {
 	// renderRegion SSAA, so the deferred pass anti-aliases exactly the pixels it would have.
 	private scanEdges(): { count: number; tiles: TileJob[] } {
 		const W = canvas.width, H = canvas.height, N = W * H;
-		provOn = this.provOn; provLo = this.provLo; provHi = this.provHi; provLut = this.provLut;
+		provOn = this.provOn && this.iterCapForced == null; provLo = this.provLo; provHi = this.provHi; provLut = this.provLut;
 		const mu = this.muField, de = this.deField, lut = this.lut, inSet = this.inSet;
 		const densityMul = this.densityMul, cyclic = this.wrap, mode = this.mode, bandMap = this.bandMap;
 		const pixelSize = this.view.spanX / W, lo = this.muLo, hi = this.muHi;
@@ -846,6 +858,15 @@ class FractalRenderer {
 			return;
 		}
 		if (!this.sharpenOn) return;   // clean initial-frame path (bench): no sharpen, no AA
+		// Forced iteration cap: don't climb the sharpening ladder — pixels still capped at the cap stay
+		// capped (→ interior), which is exactly a fixed maxiter. Jump straight to edge anti-aliasing (still
+		// wanted for a crisp resting frame; maybeStartSSAA re-samples at the same forced cap).
+		if (this.iterCapForced != null) {
+			this.undetermined = this.scanCapped().count;
+			this.emitStats(true);
+			this.maybeStartSSAA();
+			return;
+		}
 		const prev = this.undetermined;                       // capped count entering this stage
 		const { count, tiles } = this.scanCapped();           // capped count after it
 		const resolved = this.sharpenStage === 0 ? 0 : prev - count;
@@ -1227,7 +1248,7 @@ class FractalRenderer {
 		// cap that resolves its first frame (not the zoom-only formula's blind guess → all-black). Runs
 		// after the wash so the wash is instant. DD/pert keep the formula/pert budget for now.
 		this.ffEstIters = 0;   // probeCap sets this (f64 path) → enables the FF ETA; DD/pert leave it 0 → no ETA
-		const maxIters = maxItersArg ?? (this.useDD || this.usePert ? this.itersForView(view, this.usePert) : this.probeCap(view));
+		const maxIters = maxItersArg ?? this.iterCapForced ?? (this.useDD || this.usePert ? this.itersForView(view, this.usePert) : this.probeCap(view));
 		// First-frame ETA tracking (reset each render; the ETA shows only while the first frame is in flight).
 		this.ffActive = true; this.ffStartMs = performance.now(); this.ffDoneTiles = 0; this.ffDoneIters = 0; this.lastEtaEmit = 0;
 
@@ -1408,7 +1429,7 @@ class FractalRenderer {
 	private applySSAA(m: DoneMsg): void {
 		const idx = m.idx!, mu = new Float32Array(m.mu!), de = new Float32Array(m.de!);
 		const nSub = SS * SS, W = canvas.width;
-		provOn = this.provOn; provLo = this.provLo; provHi = this.provHi; provLut = this.provLut;   // colorSample globals
+		provOn = this.provOn && this.iterCapForced == null; provLo = this.provLo; provHi = this.provHi; provLut = this.provLut;   // colorSample globals
 		const img = ctx.getImageData(m.ox, m.oy, m.tw, m.th);
 		const data32 = new Uint32Array(img.data.buffer);
 		for (let k = 0; k < idx.length; k++) {
