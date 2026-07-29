@@ -12,6 +12,8 @@ import { AppState, PRESETS, CUSTOM_DENSITY, urlFromState, stateFromUrl, parFromS
 import { FILTERS } from "./filters/index";
 import type { RawView } from "./config";
 import { easel, canvas, ctx, DEBUG } from "./ui/dom";
+import { computeGeometry, applyGeometry, pinGeometry, getResolution, setResolution } from "./ui/viewport";
+import type { ResolutionMode } from "./ui/viewport";
 
 //---------------------------------------------------------------------------\\
 // Orchestration
@@ -22,7 +24,10 @@ const renderer = new RenderPipeline(new CanvasSink(canvas), currentPalette, { de
 // State <-> URL. The address bar reflects the FULL state (view + formula + set type/seed +
 // filter + aspect + coloring — see syncUrl/restoreFromUrl), so any view is a permalink:
 // copy it, or reload it verbatim to reproduce exactly what's on screen.
-let CANVAS_ASPECT = canvas.width / canvas.height;   // live: the aspect selector updates it
+// The REQUESTED view aspect (the URL's ar param). spanY always derives from THIS — never
+// from the realized buffer ratio — so a permalink frames the SAME complex-plane window on
+// every device; the device-local resolution setting only changes the pixel count.
+let VIEW_ASPECT = 2;
 // True while a Julia set is on screen. The URL carries the FULL state, so a Julia z-view is
 // a valid permalink. inJulia only tells syncUrl which set type to record + which seed.
 let inJulia = false;
@@ -159,11 +164,9 @@ dev.mandelProv = (on = true) => { renderer.recolor({ prov: on }); console.log("p
 // becomes a full permalink (survives reload). 4:3 window. e.g. tierazon()
 dev.tierazon = (opts?: { rings?: boolean; dStrands?: number; dFactor?: number }) => {
 	const W = 640, H = 480;   // 4:3, matching the target window's aspect (square pixels, no stretch)
-	canvas.width = W; canvas.height = H;
-	easel.style.height = H + "px";
-	const overlay = easel.querySelectorAll("canvas")[1] as HTMLCanvasElement | undefined;
-	if (overlay) { overlay.width = W; overlay.height = H; }   // keep the selector overlay in sync
-	CANVAS_ASPECT = W / H;
+	pinGeometry(canvas, easel, W, H);   // the repro is pinned — resolution policy doesn't apply
+	selector.syncGeometry(W, H, W / H);
+	VIEW_ASPECT = W / H;
 	// Window + seed + formula straight from the brief.
 	const XMIN = -0.1499053515515627, XMAX = 1.188366179688075;
 	const YMIN = 0.2655855689131403, YMAX = 1.269289217342869;
@@ -233,7 +236,14 @@ function fnv1a(bytes: Uint8Array | Uint8ClampedArray): string {
 dev.mandelDump = async () => {
 	dev.lastGolden = undefined;
 	renderer.configure({ sharpen: false });   // initial frame only: deterministic pass count
-	const r = await renderer.renderAndWait(view);
+	// GOLDEN PIN: capture at the device-independent legacy geometry — a 640-wide buffer
+	// and the REALIZED-ratio spanY the records were captured with. The live app derives
+	// spanY from the requested aspect and sizes the buffer per device; the goldens must
+	// not vary with either. Restored (and re-rendered) after the capture.
+	const legacyH = Math.round(640 / VIEW_ASPECT);
+	pinGeometry(canvas, easel, 640, legacyH);
+	const viewLegacy: View = { ...view, spanY: view.spanX / (640 / legacyH) };
+	const r = await renderer.renderAndWait(viewLegacy);
 	renderer.configure({ sharpen: true });
 	const f = { muField: renderer.fields.mu, deField: renderer.fields.de };
 	const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -251,6 +261,8 @@ dev.mandelDump = async () => {
 	};
 	console.log("[golden] " + JSON.stringify(rec));
 	dev.lastGolden = rec;
+	applyLayout();               // restore the live layout…
+	renderer.render(view);       // …and the live frame (the pin clobbered both)
 	return rec;
 };
 
@@ -398,53 +410,92 @@ if (themeMq.addEventListener) themeMq.addEventListener("change", () => renderer.
 
 type SelRect = { x: number; y: number; w: number; h: number };
 
-const DRAG_SLOP = 4;      // px of motion before a press counts as a drag (vs a click)
-const SEL_MIN_H = 10;     // smallest selection height worth keeping
-const WHEEL_STEP = 1.12;  // per-notch resize factor
+const DRAG_SLOP_MOUSE = 4;    // px of motion before a press counts as a drag (vs a click)
+const DRAG_SLOP_TOUCH = 10;   // fingers wobble — wider slop before a tap becomes a drag
+const SEL_MIN_H = 10;         // smallest selection height worth keeping (CSS px)
+const WHEEL_STEP = 1.12;      // per-notch resize factor (mouse wheel)
+const DBL_TAP_MS = 350;       // double-tap window (touch): places a quarter-frame box
+const DBL_TAP_PX = 40;        // ...if the second tap lands within this radius
 
+// The zoom selector, in CSS-pixel space (the buffer resolution never touches it — the
+// committed selection is returned as normalized fractions of the frame). Pointer Events
+// give one code path for mouse, touch, and pen: one finger draws/moves the box exactly
+// like the mouse; a two-finger pinch resizes the SELECTION about its center (the wheel's
+// touch equivalent — the view itself never pinches); a touch double-tap places a
+// quarter-frame box. Nothing commits implicitly — the zoom button reads the selection.
 class ZoomSelector {
 	private overlay: HTMLCanvasElement;
 	private octx: CanvasRenderingContext2D;
-	private aspect: number;
+	private cssW = 640;
+	private cssH = 320;
+	private aspect = 2;
+	private dpr = 1;
 
-	private rect: SelRect | null = null;
-	private mode: "none" | "draw" | "move" = "none";
+	private rect: SelRect | null = null;   // CSS px
+	private mode: "none" | "draw" | "move" | "pinch" = "none";
 	private moved = false;
-	private downPt: [number, number] = [0, 0];   // press origin (click-vs-drag test)
+	private downPt: [number, number] = [0, 0];   // press origin (tap-vs-drag test)
 	private anchor: [number, number] = [0, 0];    // draw: the fixed corner
-	private grab: [number, number] = [0, 0];      // move: cursor offset within the box
+	private grab: [number, number] = [0, 0];      // move: pointer offset within the box
+	private pointers = new Map<number, [number, number]>();   // active pointers (pinch)
+	private pinch0 = 1;                    // pinch: starting pointer distance
+	private pinchRect: SelRect | null = null;   // pinch: the box at gesture start
+	private lastTap: { t: number; x: number; y: number } | null = null;
 
 	// Fires whenever the selection appears or clears, so the zoom button can enable/disable.
 	public onChange: (() => void) | null = null;
 
-	public constructor(base: HTMLCanvasElement) {
-		this.aspect = base.width / base.height;
+	public constructor() {
 		this.overlay = document.createElement("canvas");
-		this.overlay.width = base.width;
-		this.overlay.height = base.height;
 		this.overlay.style.cursor = "crosshair";
+		this.overlay.style.touchAction = "none";   // one-finger draw + pinch belong to us; the page scrolls from outside the canvas
 		easel.appendChild(this.overlay);
 		this.octx = this.overlay.getContext("2d")!;
 
-		this.overlay.addEventListener("mousedown", this.onDown);
-		// move/up on window so a drag that leaves the canvas keeps tracking and still releases.
-		window.addEventListener("mousemove", this.onMove);
-		window.addEventListener("mouseup", this.onUp);
+		this.overlay.addEventListener("pointerdown", this.onDown);
+		this.overlay.addEventListener("pointermove", this.onMove);
+		this.overlay.addEventListener("pointerup", this.onUp);
+		this.overlay.addEventListener("pointercancel", this.onCancel);
 		this.overlay.addEventListener("wheel", this.onWheel, { passive: false });
 	}
 
-	private local(ev: MouseEvent): [number, number] {
+	// Re-apply geometry from the layout: CSS box + a dpr-crisp drawing buffer. Drops any
+	// selection — it was locked to the old box.
+	public syncGeometry(cssW: number, cssH: number, aspect: number): void {
+		this.cssW = cssW; this.cssH = cssH; this.aspect = aspect;
+		this.dpr = Math.min(window.devicePixelRatio || 1, 2);
+		this.overlay.width = Math.round(cssW * this.dpr);
+		this.overlay.height = Math.round(cssH * this.dpr);
+		this.overlay.style.width = cssW + "px";
+		this.overlay.style.height = cssH + "px";
+		this.clear();
+	}
+
+	private local(ev: { clientX: number; clientY: number }): [number, number] {
 		const b = this.overlay.getBoundingClientRect();
 		return [ev.clientX - b.left, ev.clientY - b.top];
 	}
+
+	private slop(ev: PointerEvent): number { return ev.pointerType === "mouse" ? DRAG_SLOP_MOUSE : DRAG_SLOP_TOUCH; }
 
 	private inside(p: [number, number]): boolean {
 		const r = this.rect;
 		return !!r && p[0] >= r.x && p[0] <= r.x + r.w && p[1] >= r.y && p[1] <= r.y + r.h;
 	}
 
-	private onDown = (ev: MouseEvent): void => {
+	private onDown = (ev: PointerEvent): void => {
+		try { this.overlay.setPointerCapture(ev.pointerId); } catch { /* synthetic events have no capturable id */ }   // drags that leave the canvas keep tracking + release
 		const p = this.local(ev);
+		this.pointers.set(ev.pointerId, p);
+		if (this.pointers.size === 2 && this.rect) {
+			// Second finger down: pinch-resize the selection about its center.
+			const pts = [...this.pointers.values()];
+			this.pinch0 = Math.hypot(pts[0][0] - pts[1][0], pts[0][1] - pts[1][1]) || 1;
+			this.pinchRect = { ...this.rect };
+			this.mode = "pinch";
+			return;
+		}
+		if (this.pointers.size > 1) return;   // 3+ fingers, or 2 with no box: ignore
 		this.downPt = p;
 		this.moved = false;
 		if (this.inside(p)) {
@@ -456,32 +507,67 @@ class ZoomSelector {
 		}
 	};
 
-	private onMove = (ev: MouseEvent): void => {
+	private onMove = (ev: PointerEvent): void => {
 		const p = this.local(ev);
-		if (this.mode === "none") {
-			this.overlay.style.cursor = this.inside(p) ? "move" : "crosshair";
+		if (this.pointers.has(ev.pointerId)) this.pointers.set(ev.pointerId, p);
+		if (this.mode === "pinch" && this.pinchRect) {
+			const pts = [...this.pointers.values()];
+			if (pts.length >= 2) {
+				const d = Math.hypot(pts[0][0] - pts[1][0], pts[0][1] - pts[1][1]) || 1;
+				const f = d / this.pinch0;
+				const r = this.pinchRect;
+				const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+				this.setRect(this.clampSize({ x: cx - r.w * f / 2, y: cy - r.h * f / 2, w: r.w * f, h: r.h * f }, cx, cy));
+			}
 			return;
 		}
-		if (!this.moved && Math.hypot(p[0] - this.downPt[0], p[1] - this.downPt[1]) > DRAG_SLOP) this.moved = true;
+		if (this.mode === "none") {
+			if (ev.pointerType === "mouse") this.overlay.style.cursor = this.inside(p) ? "move" : "crosshair";
+			return;
+		}
+		if (!this.moved && Math.hypot(p[0] - this.downPt[0], p[1] - this.downPt[1]) > this.slop(ev)) this.moved = true;
 		if (this.mode === "draw") {
-			this.overlay.style.cursor = "crosshair";
 			if (this.moved) this.setRect(this.clampSize(this.drawRect(p)));
-		} else {
-			this.overlay.style.cursor = "move";
+		} else if (this.mode === "move") {
 			if (this.moved) this.setRect(this.clampMove(p[0] - this.grab[0], p[1] - this.grab[1]));
 		}
 	};
 
-	private onUp = (ev: MouseEvent): void => {
+	private onUp = (ev: PointerEvent): void => {
+		this.pointers.delete(ev.pointerId);
+		if (this.mode === "pinch") {
+			// Pinch ends when either finger lifts; the surviving finger doesn't start a drag.
+			if (this.pointers.size < 2) { this.mode = "none"; this.pinchRect = null; }
+			return;
+		}
 		if (this.mode === "none") return;
 		const wasDraw = this.mode === "draw";
 		const moved = this.moved;
 		this.mode = "none";
-		// A click on empty space (draw, no drag) dismisses; a drag too small to matter is
+		const p = this.local(ev);
+		if (wasDraw && !moved && ev.pointerType !== "mouse") {
+			// Touch tap on empty space: dismisses (below, as ever) — but a SECOND tap within
+			// the double-tap window places a quarter-frame selection centered on it: the
+			// quick-dive affordance. The zoom button still commits.
+			const now = performance.now();
+			if (this.lastTap && now - this.lastTap.t < DBL_TAP_MS &&
+				Math.hypot(p[0] - this.lastTap.x, p[1] - this.lastTap.y) < DBL_TAP_PX) {
+				this.lastTap = null;
+				this.setRect(this.clampSize({ x: p[0] - this.cssW / 4, y: p[1] - this.cssH / 4, w: this.cssW / 2, h: this.cssH / 2 }, p[0], p[1]));
+				return;
+			}
+			this.lastTap = { t: now, x: p[0], y: p[1] };
+		}
+		// A tap on empty space (draw, no drag) dismisses; a drag too small to matter is
 		// discarded. A press inside the box that didn't move keeps the selection.
 		if (wasDraw && (!moved || !this.rect || this.rect.h < SEL_MIN_H)) this.clear();
-		const p = this.local(ev);
-		this.overlay.style.cursor = this.inside(p) ? "move" : "crosshair";
+		if (ev.pointerType === "mouse") this.overlay.style.cursor = this.inside(p) ? "move" : "crosshair";
+	};
+
+	private onCancel = (ev: PointerEvent): void => {
+		this.pointers.delete(ev.pointerId);
+		this.mode = "none";
+		this.pinchRect = null;
 	};
 
 	// Scroll over the box → resize about its center, aspect locked. Over empty space (or
@@ -504,11 +590,11 @@ class ZoomSelector {
 		return { x: dx >= 0 ? this.anchor[0] : this.anchor[0] - w, y: dy >= 0 ? this.anchor[1] : this.anchor[1] - h, w, h };
 	}
 
-	// Clamp a rect to the canvas: cap the size to the frame (aspect preserved), then keep it
-	// fully on-canvas. When re-centering (resize) the given center is held; otherwise the
-	// origin is nudged in.
+	// Clamp a rect to the frame (CSS px): cap the size (aspect preserved), then keep it
+	// fully on-canvas. When re-centering (resize/pinch) the given center is held; otherwise
+	// the origin is nudged in.
 	private clampSize(r: SelRect, cx?: number, cy?: number): SelRect {
-		const W = this.overlay.width, H = this.overlay.height;
+		const W = this.cssW, H = this.cssH;
 		let { w, h } = r;
 		const minW = SEL_MIN_H * this.aspect;
 		w = Math.min(Math.max(w, minW), W);
@@ -522,7 +608,7 @@ class ZoomSelector {
 	}
 
 	private clampMove(x: number, y: number): SelRect {
-		const r = this.rect!, W = this.overlay.width, H = this.overlay.height;
+		const r = this.rect!, W = this.cssW, H = this.cssH;
 		return { x: Math.min(Math.max(x, 0), W - r.w), y: Math.min(Math.max(y, 0), H - r.h), w: r.w, h: r.h };
 	}
 
@@ -533,7 +619,8 @@ class ZoomSelector {
 	}
 
 	private redraw(): void {
-		const c = this.octx, W = this.overlay.width, H = this.overlay.height;
+		const c = this.octx, W = this.cssW, H = this.cssH;
+		c.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);   // draw in CSS units, dpr-crisp
 		c.clearRect(0, 0, W, H);
 		const r = this.rect;
 		if (!r) return;
@@ -550,28 +637,20 @@ class ZoomSelector {
 		c.strokeRect(r.x, r.y, r.w, r.h);
 	}
 
-	// The committed selection as [x, y, w, h], or undefined if none / too small to be
-	// intentional.
-	public getRect(): [number, number, number, number] | undefined {
+	// The committed selection as NORMALIZED fractions of the frame [x, y, w, h] — the
+	// CSS/buffer decoupling never touches the view math. Undefined if none / too small.
+	public getRectNorm(): [number, number, number, number] | undefined {
 		const r = this.rect;
 		if (!r || r.h < SEL_MIN_H) return undefined;
-		return [r.x, r.y, r.w, r.h];
+		return [r.x / this.cssW, r.y / this.cssH, r.w / this.cssW, r.h / this.cssH];
 	}
 
 	public hasSelection(): boolean { return !!this.rect; }
 
 	public clear(): void { this.setRect(null); }
-
-	// Re-lock the box aspect after applyAspect() changes the frame ratio (a URL permalink or
-	// the aspect dropdown). Drops any current selection, which was aspect-locked to the old
-	// ratio.
-	public syncAspect(aspect: number): void {
-		this.aspect = aspect;
-		this.clear();
-	}
 }
 
-const selector = new ZoomSelector(canvas);
+const selector = new ZoomSelector();
 
 const zoomButton = document.querySelector(".zoom-button") as HTMLButtonElement;
 const backButton = document.querySelector(".back-button") as HTMLButtonElement | null;
@@ -615,7 +694,7 @@ function setHistory(h: View[]): void {
 	if (backButton) backButton.disabled = viewHistory.length === 0;
 }
 function defaultJuliaView(): View {
-	return { cx: 0, cxLo: 0, cy: 0, cyLo: 0, spanX: 4, spanY: 4 / CANVAS_ASPECT };   // origin, |z| < 2, aspect-matched
+	return { cx: 0, cxLo: 0, cy: 0, cyLo: 0, spanX: 4, spanY: 4 / VIEW_ASPECT };   // origin, |z| < 2, aspect-matched
 }
 
 // The default window for the current mode + formula (reset target; also where a formula
@@ -628,7 +707,7 @@ function defaultViewFor(): View {
 	const cx = p.center ? p.center.cx : (key === "0" ? DEFAULT_VIEW.cx : 0);
 	const cy = p.center ? p.center.cy : 0;
 	const spanX = p.spanX || DEFAULT_VIEW.spanX;
-	return { ...DEFAULT_VIEW, cx, cy, spanX, spanY: spanX / CANVAS_ASPECT };
+	return { ...DEFAULT_VIEW, cx, cy, spanX, spanY: spanX / VIEW_ASPECT };
 }
 function seedKey(cx: number, cy: number): number { return cx * 1e7 + cy; }   // cheap equality key for the seed
 
@@ -653,22 +732,20 @@ function exitJulia(): void {
 	renderer.render(view);
 }
 
-// ---- Aspect selector. Fixed width, derived height. applyAspect just resizes canvas +
-// easel + selector overlay and updates CANVAS_ASPECT (used by restoreFromUrl before the
-// first render); setAspect is the user handler — resize, re-derive spanY, re-sync,
-// re-render. ----
-function applyAspect(aspect: number): void {
-	const W = 640, H = Math.round(W / aspect);
-	canvas.width = W; canvas.height = H;
-	easel.style.height = H + "px";
-	const overlay = easel.querySelectorAll("canvas")[1] as HTMLCanvasElement | undefined;
-	if (overlay) { overlay.width = W; overlay.height = H; }
-	CANVAS_ASPECT = W / H;                 // the REALIZED integer-pixel ratio, not the requested aspect — keeps
-	selector.syncAspect(CANVAS_ASPECT);    // pixels exactly square when H rounds, and the box lock in step
+// ---- Aspect + responsive layout. The CSS box follows the container width and the
+// REQUESTED aspect (ui/viewport computes it; the buffer follows the device resolution
+// policy). applyLayout re-derives everything; setAspect is the user handler — relayout,
+// re-derive spanY from the requested aspect, re-sync, re-render. ----
+function applyLayout(): void {
+	VIEW_ASPECT = aspectSelect ? Number(aspectSelect.value) : 2;
+	const container = easel.parentElement ? easel.parentElement.clientWidth : 640;
+	const g = computeGeometry(container, VIEW_ASPECT, getResolution());
+	applyGeometry(canvas, easel, g);
+	selector.syncGeometry(g.cssW, g.cssH, VIEW_ASPECT);
 }
-function setAspect(aspect: number): void {
-	applyAspect(aspect);
-	view = { ...view, spanY: view.spanX / CANVAS_ASPECT };
+function setAspect(_aspect: number): void {
+	applyLayout();
+	view = { ...view, spanY: view.spanX / VIEW_ASPECT };
 	syncUrl();
 	renderer.render(view);
 }
@@ -677,21 +754,20 @@ selector.onChange = () => { zoomButton.disabled = !selector.hasSelection(); };
 zoomButton.disabled = true;
 
 zoomButton.addEventListener("click", () => {
-	const r = selector.getRect();
+	const r = selector.getRectNorm();   // normalized fractions — buffer resolution never enters
 	if (!r) return;
-	const W = canvas.width, H = canvas.height;
 	// Recenter in double-double: newCenter = oldCenter + boxOffset. In f64 the offset is
 	// lost once it drops below the center's ULP (~|c|·ε); ddAdd's twoSum keeps it, so the
 	// box lands where you drew it.
-	const offX = ((r[0] + r[2] / 2) / W - 0.5) * view.spanX;
-	const offY = (0.5 - (r[1] + r[3] / 2) / H) * view.spanY;   // Im up: match the render's flipped y-map so the box lands where drawn
+	const offX = (r[0] + r[2] / 2 - 0.5) * view.spanX;
+	const offY = (0.5 - (r[1] + r[3] / 2)) * view.spanY;   // Im up: match the render's flipped y-map so the box lands where drawn
 	ddAdd(view.cx, view.cxLo, offX, 0); const ncx = _dhi, ncxLo = _dlo;
 	ddAdd(view.cy, view.cyLo, offY, 0); const ncy = _dhi, ncyLo = _dlo;
 	pushHistory(view);
 	goTo({
 		cx: ncx, cxLo: ncxLo, cy: ncy, cyLo: ncyLo,
-		spanX: view.spanX * (r[2] / W),
-		spanY: view.spanY * (r[3] / H),
+		spanX: view.spanX * r[2],
+		spanY: view.spanY * r[3],
 	});
 });
 
@@ -938,6 +1014,34 @@ if (blendSelect) {   // A/B color-mapping method (experimental) — instant reco
 if (aspectSelect) {
 	aspectSelect.addEventListener("change", () => setAspect(Number(aspectSelect.value)));
 }
+// Resolution: how many pixels get computed on THIS device. A device-local preference
+// (localStorage), deliberately never in the URL — the same permalink renders the same
+// window everywhere, just denser or coarser.
+const resolutionSelect = document.querySelector(".resolution-select") as HTMLSelectElement | null;
+if (resolutionSelect) {
+	resolutionSelect.value = getResolution();
+	resolutionSelect.addEventListener("change", () => {
+		setResolution(resolutionSelect.value as ResolutionMode);
+		applyLayout();
+		renderer.render(view);
+	});
+}
+// Window resizes / rotations: re-derive the layout (debounced). A CSS-only change keeps
+// the frame (the canvas just scales); a buffer change re-renders at the new pixel count.
+let resizeTimer = 0;
+window.addEventListener("resize", () => {
+	clearTimeout(resizeTimer);
+	resizeTimer = setTimeout(() => {
+		const bw = canvas.width, bh = canvas.height;
+		applyLayout();
+		if (canvas.width !== bw || canvas.height !== bh) renderer.render(view);
+	}, 200);
+});
+// Coarse pointers (phones): collapse the control sections — the canvas + the sticky
+// action bar are the interface; everything else is a tap away.
+if (matchMedia("(pointer: coarse)").matches) {
+	document.querySelectorAll<HTMLElement>(".ctrl-section[open]").forEach((el) => el.removeAttribute("open"));
+}
 if (pertToggle) {
 	// Perturbation is a pure performance path (identical image to the double-double
 	// engine), so it carries no view state / URL — just flip the override and re-iterate.
@@ -974,9 +1078,9 @@ function restoreFromUrl(): void {
 // the canvas, and spanY derives from CANVAS_ASPECT), then formula, filter, coloring, cap,
 // and finally the view + set type.
 function applyFullState({ state: s, rawView }: { state: AppState; rawView: RawView | null }): void {
-	// Aspect first.
+	// Aspect first (it sets VIEW_ASPECT, which the view's spanY derives from).
 	if (aspectSelect) aspectSelect.value = s.aspect;
-	applyAspect(Number(s.aspect));
+	applyLayout();
 
 	// Formula (+ custom text).
 	if (formulaSelect) formulaSelect.value = s.formulaKey;
@@ -1019,9 +1123,10 @@ function applyFullState({ state: s, rawView }: { state: AppState; rawView: RawVi
 	if (itercapInput) itercapInput.value = s.cap != null ? String(s.cap) : "";
 	renderer.configure({ iterCap: currentIterCap() });
 
-	// View + set type. The raw view uses the now-correct CANVAS_ASPECT for spanY.
+	// View + set type. spanY derives from the REQUESTED aspect — the same window on
+	// every device regardless of the buffer's pixel count.
 	const urlView: View | null = rawView
-		? { cx: rawView.cx, cxLo: rawView.cxLo, cy: rawView.cy, cyLo: rawView.cyLo, spanX: rawView.span, spanY: rawView.span / CANVAS_ASPECT }
+		? { cx: rawView.cx, cxLo: rawView.cxLo, cy: rawView.cy, cyLo: rawView.cyLo, spanX: rawView.span, spanY: rawView.span / VIEW_ASPECT }
 		: null;
 	if (s.juliaOn) {
 		mBundle = { view: defaultViewFor(), history: [] };   // inJulia still false → a sensible M-view for a later exit

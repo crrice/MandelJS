@@ -13,6 +13,9 @@ body {
 	justify-content: center;
 }
 
+/* One content column for everything, canvas included: on desktop the canvas caps at the
+   control column's width; on phones (viewport < 720px) the same rule lets it fill the
+   screen. Pixel density on top of that is the resolution setting's job, not the layout's. */
 main {
 	width: 100%;
 	max-width: 720px;
@@ -36,20 +39,19 @@ h1 {
 	color: #cdd6e6;
 }
 
-/* horizontal scroll wrapper for narrow screens */
+/* centering wrapper for the easel (no more horizontal scroll — the canvas is responsive) */
 .scroll {
 	width: 100%;
-	overflow-x: auto;
 	display: flex;
 	justify-content: center;
 }
 
 /* the fractal engine requires: a positioned .easel containing an absolutely
-   positioned base canvas + the overlay canvas it appends at runtime. */
+   positioned base canvas + the overlay canvas it appends at runtime.
+   Size (CSS box + buffer) is applied by ui/viewport.ts. */
 .easel {
 	position: relative;
-	width: 640px;
-	height: 320px;
+	max-width: 100%;
 	flex: none;
 	background: #000;
 	border: 1px solid #2a2c31;
@@ -272,6 +274,36 @@ h1 {
 .field input[type="range"] { accent-color: #4c6ef5; width: 104px; cursor: pointer; }
 .field :focus-visible { outline: 2px solid #4c6ef5; outline-offset: 2px; }
 
-@media (max-width: 560px) {
-	main { padding: 32px 16px; }
+/* ---- narrow screens (phones): the canvas + a thumb-reachable action bar ARE the
+   interface; control sections collapse (JS un-opens them on coarse pointers) and every
+   target grows to a comfortable touch size. ---- */
+@media (max-width: 700px) {
+	main { padding: 20px 12px calc(16px + env(safe-area-inset-bottom)); }
+	h1 { font-size: 1.5rem; }
+	.sub { font-size: 0.9rem; margin-bottom: 14px; }
+
+	/* Sticky action bar: rides above the collapsed sections while you scroll, always in
+	   thumb reach during a demo. */
+	.controls {
+		position: sticky;
+		bottom: calc(8px + env(safe-area-inset-bottom));
+		z-index: 5;
+		gap: 8px;
+		padding: 8px;
+		background: rgba(14, 15, 18, 0.86);
+		backdrop-filter: blur(6px);
+		border: 1px solid #2a2c31;
+		border-radius: 10px;
+	}
+	.btn { padding: 12px 14px; min-height: 44px; flex: 1; }
+
+	.ctrl-body { gap: 12px; }
+	.field { min-height: 40px; }
+	.field select { padding: 10px 12px; min-height: 40px; }
+	.field input[type="checkbox"] { width: 20px; height: 20px; }
+	.field input[type="range"] { width: 140px; height: 28px; }
+	.formula-input { width: 100%; min-height: 40px; }
+	.formula-custom { flex-basis: 100%; }
+
+	.telemetry { grid-template-columns: repeat(2, 1fr); gap: 9px 12px; }
 }

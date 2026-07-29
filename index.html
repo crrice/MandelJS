@@ -121,6 +121,14 @@
 				<label class="field" title="Hard iteration cap: stop at this many iterations and treat anything still unresolved as interior — a fixed Fractint-style maxiter. Blank = adaptive. Skips progressive refinement; anti-aliasing still runs.">iteration cap
 					<input class="itercap-input" type="number" min="0" max="1000000" step="100" placeholder="auto" />
 				</label>
+				<label class="field" title="How many pixels get computed, on THIS device (never part of a permalink — the same link renders the same window everywhere, just denser or coarser). auto = screen-native sharpness capped at a sane budget for the device class; 1× = CSS pixels (fastest); native = full screen density; ×2 = supersampled hero mode (slow on deep views).">resolution
+					<select class="resolution-select">
+						<option value="auto">auto</option>
+						<option value="1x">1×</option>
+						<option value="native">native</option>
+						<option value="native2x">native ×2</option>
+					</select>
+				</label>
 			</div>
 		</details>
 
