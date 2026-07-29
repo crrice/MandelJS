@@ -15,7 +15,11 @@ frame only — and fingerprints:
 - `esc / ins / per / cap` — pixel classification tallies (sum = w×h)
 - `muHash` — FNV-1a 32 over the raw muField bytes
 - `deHash` — FNV-1a 32 over the deField bytes **with IN_SET entries masked to 0**
-- `pixHash` — FNV-1a 32 over the canvas ImageData after completion
+- `pixHash` — FNV-1a 32 over the canvas ImageData after completion. **Shell-specific**:
+  the provisional ramp and `subtle` palette bake from the page's `--ink`/`--paper` theme
+  tokens, so these hashes hold on the STANDALONE shell (hardcoded dark fallback) only —
+  the AlephSite-hosted page defines its own tokens and legitimately differs on pixels
+  while matching every field-level value bit-for-bit (verified 2026-07-29).
 
 The two tierazon windows can be reproduced either by loading the recorded URL or by
 running `tierazon()` / `tierazon({rings:true})` — the states are identical (f64 values
