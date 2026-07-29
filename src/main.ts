@@ -1,112 +1,89 @@
-// MandelJS — a from-scratch Mandelbrot explorer.
-//
-// Compute is split into a pure, allocation-free kernel (`escapeSmooth`) and a
-// region primitive (`renderRegion`) that fills an arbitrary rectangle. A pool
-// of Web Workers drives that primitive over tiles: the main thread only
-// dispatches tile jobs and blits results, so long renders never block the UI.
-//
-// The worker is built at runtime by stringifying the very same kernel +
-// primitive into a Blob — one definition, shared by the workers and the
-// synchronous fallback, with no second file to ship. Tile pixels come back as
-// transferable buffers (no SharedArrayBuffer, so no cross-origin-isolation
-// headers), painted progressively, and every job carries a generation id so a
-// re-zoom abandons stale in-flight tiles instantly.
-
-const easel = document.querySelector(".easel") as HTMLDivElement;
-const canvas = document.querySelector(".fractal") as HTMLCanvasElement;
-const ctx = canvas.getContext("2d")!;
-
-// Debug instrumentation toggle (URL: ?debug=1). Off by default so the production
-// console stays quiet; on, every completed render logs timing + iteration counts.
-const DEBUG = new URLSearchParams(location.search).has("debug");
+// main.ts — MandelJS entry: URL state, navigation (zoom selector, history, M↔J bundles),
+// controls wiring, telemetry readouts, and the dev console hooks. Compute lives in
+// src/kernel/, orchestration in src/render/pipeline.ts; the worker pool runs src/worker.ts.
+import { View, DEFAULT_VIEW, FORMULA_MANDEL } from "./kernel/kernel";
+import { ddAdd, _dhi, _dlo } from "./math/dd";
+import { compileFormula } from "./formula";
+import { Palette, PALETTES, customPalette, currentPalette } from "./palette";
+import { RenderPipeline } from "./render/pipeline";
+import { CanvasSink } from "./render/sink";
+import type { GenStats, FrameStats } from "./render/telemetry";
+import { AppState, PRESETS, CUSTOM_DENSITY, urlFromState, stateFromUrl, parFromState, stateFromPar } from "./config";
+import { FILTERS } from "./filters/index";
+import type { RawView } from "./config";
+import { easel, canvas, ctx, DEBUG } from "./ui/dom";
 
 //---------------------------------------------------------------------------\\
 // Orchestration
 //---------------------------------------------------------------------------\\
 
-const renderer = new FractalRenderer(currentPalette);
+const renderer = new RenderPipeline(new CanvasSink(canvas), currentPalette, { debug: DEBUG });
 
-// State <-> URL. The address bar reflects the FULL state (view + formula + set type/seed + filter +
-// aspect + coloring — see syncUrl/restoreFromUrl), so any view is a permalink: copy it, or reload it
-// verbatim to reproduce exactly what's on screen. Also essential for apples-to-apples benchmarks.
-let CANVAS_ASPECT = canvas.width / canvas.height;   // live: the aspect selector updates it (V5)
-function viewFromUrl(): View | null {
-	const p = new URLSearchParams(location.search);
-	const cx = parseFloat(p.get("cx") || ""), cy = parseFloat(p.get("cy") || ""), span = parseFloat(p.get("span") || "");
-	const cxLo = parseFloat(p.get("cxl") || "0"), cyLo = parseFloat(p.get("cyl") || "0");   // DD center lo-limbs (0 if absent)
-	if (!isFinite(cx) || !isFinite(cy) || !isFinite(span) || span <= 0) return null;
-	return { cx, cxLo: isFinite(cxLo) ? cxLo : 0, cy, cyLo: isFinite(cyLo) ? cyLo : 0, spanX: span, spanY: span / CANVAS_ASPECT };
-}
-// True while a Julia set is on screen. The URL now carries the FULL state (formula/set-type/seed/filter/
-// aspect/coloring — see syncUrl), so a Julia z-view is a valid permalink: no gate needed, and a mid-Julia
-// refresh restores the Julia set. inJulia only tells syncUrl which set type to record + which seed.
+// State <-> URL. The address bar reflects the FULL state (view + formula + set type/seed +
+// filter + aspect + coloring — see syncUrl/restoreFromUrl), so any view is a permalink:
+// copy it, or reload it verbatim to reproduce exactly what's on screen.
+let CANVAS_ASPECT = canvas.width / canvas.height;   // live: the aspect selector updates it
+// True while a Julia set is on screen. The URL carries the FULL state, so a Julia z-view is
+// a valid permalink. inJulia only tells syncUrl which set type to record + which seed.
 let inJulia = false;
 let currentSeed = { cx: 0, cy: 0 };   // the active Julia seed, for the URL (set by enterJulia / restoreFromUrl)
 
-// Serialize the ENTIRE app state into the address bar so any view is a shareable permalink. One snapshot
-// of everything — view, formula (+ custom text), set type + seed, filter + params, aspect, coloring — read
-// live from `view` and the controls. Non-default fields only, so a plain Mandelbrot stays ?cx&cy&span.
-// Every f64 round-trips exactly through String()↔parseFloat, and URLSearchParams handles escaping (the
-// formula's ^, +, *, () encode + decode cleanly). Called by every mutating control (and restoreFromUrl).
+// Serialize the ENTIRE app state into the address bar so any view is a shareable
+// permalink. The param schema (config.ts) does the writing — one row per param, write and
+// read co-located; currentState() below gathers the live values. Byte-compatible with the
+// pre-P1 serializer. Called by every mutating control (and restoreFromUrl).
 function syncUrl(): void {
-	const p = new URLSearchParams();
-	p.set("cx", String(view.cx)); p.set("cy", String(view.cy)); p.set("span", String(view.spanX));
-	if (view.cxLo !== 0) p.set("cxl", String(view.cxLo));   // DD center lo-limbs, only on deep views
-	if (view.cyLo !== 0) p.set("cyl", String(view.cyLo));
-	const fKey = formulaSelect ? formulaSelect.value : "0";
-	if (fKey !== "0") p.set("f", fKey);
-	if (fKey === "custom" && formulaInput) p.set("expr", formulaInput.value);
-	if (inJulia) { p.set("j", "1"); p.set("jx", String(currentSeed.cx)); p.set("jy", String(currentSeed.cy)); }
-	const filt = filterSelect ? Number(filterSelect.value) : 0;
-	if (filt !== 0) {
-		p.set("filt", String(filt));
-		if (strandsSlider) p.set("str", strandsSlider.value);
-		if (exposureSlider) p.set("exp", exposureSlider.value);
-		if (blendSelect && blendSelect.value !== "0") p.set("fb", blendSelect.value);   // A/B blend (A=0 omitted)
-	}
-	if (aspectSelect && aspectSelect.value !== "2") p.set("ar", aspectSelect.value);   // default 2:1 omitted
-	const palKey = paletteSelect ? paletteSelect.value : "escape";
-	if (palKey !== "escape") p.set("pal", palKey);
-	if (palKey === "custom") {   // the whole gradient: stops (hex, '-'-joined), in-set color, bands flag
-		p.set("stops", customStops.map((s) => s.replace("#", "")).join("-"));
-		if (palInset) p.set("inset", palInset.value.replace("#", ""));
-		if (palCyclic && !palCyclic.checked) p.set("cyc", "0");   // bands default ON → omit
-	}
-	const palDensity = palKey === "custom" ? CUSTOM_DENSITY : (PALETTES[palKey] ? PALETTES[palKey].density : -1);
-	if (densitySlider && Number(densitySlider.value) !== palDensity) p.set("dens", densitySlider.value);
-	if (coloringSelect && coloringSelect.value !== "log") p.set("col", coloringSelect.value);
-	const iterCap = currentIterCap();
-	if (iterCap != null) p.set("cap", String(iterCap));   // advanced forced maxiter — only when set
-	history.replaceState(null, "", "?" + p.toString());
+	history.replaceState(null, "", urlFromState(view, currentState()));
 }
 
-let view: View = viewFromUrl() || { ...DEFAULT_VIEW };
-
-// High-precision (double-double) badge: lit when a view is deep enough to switch to DD.
-// Wired BEFORE the first render — onPrecision fires inside render(), so a later hookup
-// would miss the initial (URL) frame, which is exactly when a deep permalink loads in DD.
-const precisionStatus = document.querySelector(".precision-status") as HTMLElement | null;
-if (precisionStatus) {
-	renderer.onPrecision = (bits) => {
-		precisionStatus.textContent = bits + "-bit";
-		precisionStatus.classList.toggle("is-elevated", bits > 64);   // amber/prominent past f64
+// Gather the live app state from the controls + module vars — the ONE place serialization
+// reads from. Null-control fallbacks match the old syncUrl's ternaries, so pages without
+// the optional controls serialize identically.
+function currentState(): AppState {
+	return {
+		formulaKey: formulaSelect ? formulaSelect.value : "0",
+		expr: formulaInput ? formulaInput.value : "z^2 + c",
+		juliaOn: inJulia, juliaX: currentSeed.cx, juliaY: currentSeed.cy,
+		filterId: filterSelect ? filterSelect.value : "0",
+		strands: strandsSlider ? strandsSlider.value : "0.08",
+		exposure: exposureSlider ? exposureSlider.value : "4",
+		blend: blendSelect ? blendSelect.value : "0",
+		aspect: aspectSelect ? aspectSelect.value : "2",
+		paletteKey: paletteSelect ? paletteSelect.value : "escape",
+		stops: customStops.slice(),
+		inset: palInset ? palInset.value : "#000000",
+		cyclic: palCyclic ? palCyclic.checked : true,
+		density: densitySlider ? densitySlider.value : "32",
+		coloring: coloringSelect ? coloringSelect.value : "log",
+		cap: currentIterCap(),
 	};
 }
 
-// Heuristic-map flag: shows "parameter map" when a "Mandelbrot" is really a z₀=c heuristic (a formula
-// with no z₀=0 set, e.g. z²+c/z), hidden for true M-sets and Julia. Wired before the first render.
+let view: View = { ...DEFAULT_VIEW };   // placeholder — restoreFromUrl() (end of setup) sets the real view
+
+// High-precision (double-double) badge: lit when a view is deep enough to switch to DD.
+// Subscribed BEFORE the first render — the precision event fires inside render(), so a
+// later hookup would miss the initial (URL) frame — exactly when a deep permalink loads in DD.
+const precisionStatus = document.querySelector(".precision-status") as HTMLElement | null;
+if (precisionStatus) {
+	renderer.events.on("precision", (bits) => {
+		precisionStatus.textContent = bits + "-bit";
+		precisionStatus.classList.toggle("is-elevated", bits > 64);   // amber/prominent past f64
+	});
+}
+
+// Heuristic-map flag: shows "parameter map" when a "Mandelbrot" is really a z₀=c heuristic
+// (a formula with no z₀=0 set), hidden for true M-sets and Julia. Wired before first render.
 const mapNote = document.querySelector(".map-note") as HTMLElement | null;
 if (mapNote) {
-	renderer.onMapMode = (heuristic) => { mapNote.textContent = heuristic ? "parameter map" : ""; mapNote.classList.toggle("is-shown", heuristic); };
+	renderer.events.on("mapmode", (heuristic) => { mapNote.textContent = heuristic ? "parameter map" : ""; mapNote.classList.toggle("is-shown", heuristic); });
 }
-// The first render is deferred to restoreFromUrl() at the end of setup — it applies the URL's full state
-// (formula/filter/aspect/Julia/coloring) to the controls + renderer, then renders once. The precision +
-// map-note hooks above are already wired, so they still catch that initial (possibly deep) permalink frame.
+// The first render is deferred to restoreFromUrl() at the end of setup — it applies the
+// URL's full state to the controls + renderer, then renders once.
 
-// Benchmark helper (console): re-render the current view n times and report the
-// timing spread plus the (deterministic) iteration total. Run it at a fixed URL
-// view to compare an optimization before/after — median ms is the number to
-// trust; iters is noise-free. e.g.  await mandelBench(9)
+// Benchmark helper (console): re-render the current view n times and report the timing
+// spread plus the (deterministic) iteration total. Median ms is the number to trust;
+// iters is noise-free. e.g.  await mandelBench(9)
 const dev = window as unknown as {
 	mandelBench: (n?: number) => Promise<unknown>;
 	mandelPeriod: (on?: boolean) => void;
@@ -119,10 +96,14 @@ const dev = window as unknown as {
 	tierazonExposure: (dFactor: number) => void;
 	juliaHere: () => void;
 	filterHere: (dFactor?: number) => void;
+	mandelDump: () => Promise<unknown>;
+	lastGolden?: unknown;
+	mandelPar: (text?: string) => unknown;
+	mandelUrlRT: (qs: string) => string;
 };
 
 dev.mandelBench = async (n = 9) => {
-	renderer.setSharpen(false); // measure the initial-frame path only, no idle passes
+	renderer.configure({ sharpen: false }); // measure the initial-frame path only, no idle passes
 	const runs: number[] = [];
 	let stats: GenStats = { iters: 0, esc: 0, ins: 0, per: 0, cap: 0 }, maxIters = 0;
 	for (let i = 0; i < n; i++) {
@@ -141,46 +122,41 @@ dev.mandelBench = async (n = 9) => {
 		(100 * stats.per / pts).toFixed(0) + "% period / " + (100 * stats.cap / pts).toFixed(0) +
 		"% capped, burns " + cappedIterPct.toFixed(0) + "% of iters",
 	);
-	renderer.setSharpen(true);
+	renderer.configure({ sharpen: true });
 	return { min, median, mean, stats, cappedIterPct };
 };
 
-// Toggle periodicity checking for A/B benchmarking. e.g.
-//   mandelPeriod(false); await mandelBench(9);  mandelPeriod(true); await mandelBench(9)
-dev.mandelPeriod = (on = true) => { renderer.setPeriod(on); console.log("periodicity " + (on ? "ON" : "OFF")); };
+// Toggle periodicity checking for A/B benchmarking.
+dev.mandelPeriod = (on = true) => { renderer.configure({ period: on }); console.log("periodicity " + (on ? "ON" : "OFF")); };
 
-// Toggle progressive sharpening (idle re-iteration of undetermined points). e.g.
-//   mandelSharpen(false)  // freeze at the initial frame
-dev.mandelSharpen = (on = true) => { renderer.setSharpen(on); console.log("sharpening " + (on ? "ON" : "OFF")); };
+// Toggle progressive sharpening (idle re-iteration of undetermined points).
+dev.mandelSharpen = (on = true) => { renderer.configure({ sharpen: on }); console.log("sharpening " + (on ? "ON" : "OFF")); };
 
 // Switch the escape-time band transfer for A/B. 0 linear, 1 sqrt, 2 log. e.g. mandelBand(1)
-dev.mandelBand = (n = 0) => { renderer.setBandMap(n); console.log("band map = " + (["linear", "sqrt", "log"][n] || n)); };
+dev.mandelBand = (n = 0) => { renderer.recolor({ bandMap: n }); console.log("band map = " + (["linear", "sqrt", "log"][n] || n)); };
 
 // Force double-double precision for A/B on the wall window (null = auto-gate by zoom).
-//   mandelDD(false); await mandelBench(9);  mandelDD(true); await mandelBench(9);  mandelDD(null)
 dev.mandelDD = (on = true) => {
-	renderer.setDD(on);
+	renderer.configure({ dd: on });
 	console.log("DD precision " + (on === null ? "AUTO (zoom-gated)" : on ? "forced ON" : "forced OFF"));
 	renderer.render(view);
 };
 
 // Force the perturbation fast path for A/B at a deep window (null = follow the DD gate).
-//   mandelPert(false); await mandelBench(9);  mandelPert(true); await mandelBench(9);  mandelPert(null)
 dev.mandelPert = (on = true) => {
-	renderer.setPert(on);
+	renderer.configure({ pert: on });
 	console.log("perturbation " + (on === null ? "AUTO (follows DD gate)" : on ? "forced ON" : "forced OFF"));
 	renderer.render(view);
 };
 
-// Toggle provisional CAPPED coloring for A/B — the developing paper→ink underlay vs the old
-// all-black first frame. Recolors instantly from the stored field (no re-iterate); pair with
-// mandelSharpen(false) to freeze an all-CAPPED frame and flip it. e.g. mandelProv(false)
-dev.mandelProv = (on = true) => { renderer.setProv(on); console.log("provisional coloring " + (on ? "ON" : "OFF")); };
+// Toggle provisional CAPPED coloring for A/B — the developing paper→ink underlay vs the
+// old all-black first frame. Recolors instantly from the stored field (no re-iterate).
+dev.mandelProv = (on = true) => { renderer.recolor({ prov: on }); console.log("provisional coloring " + (on ? "ON" : "OFF")); };
 
-// Custom-formula preview (the "Tierazon" repro): a Julia set of z ← (z²+c)·sin(z^(c·i)) with the seed
-// and window from tierazon-basic-repro.md, f64. Now SYNCS the UI controls to what it sets, so afterward
-// every control (formula / julia / filter / aspect / palette / blend / exposure) lines up and you can swap
-// modes freely on this config — and it becomes a full permalink (survives reload). 4:3 window. e.g. tierazon()
+// Custom-formula preview (the "Tierazon" repro): a Julia set of z ← (z²+c)·sin(z^(c·i))
+// with the seed and window from tierazon-basic-repro.md, f64. SYNCS the UI controls to
+// what it sets, so afterward every control lines up and you can swap modes freely — and it
+// becomes a full permalink (survives reload). 4:3 window. e.g. tierazon()
 dev.tierazon = (opts?: { rings?: boolean; dStrands?: number; dFactor?: number }) => {
 	const W = 640, H = 480;   // 4:3, matching the target window's aspect (square pixels, no stretch)
 	canvas.width = W; canvas.height = H;
@@ -195,11 +171,12 @@ dev.tierazon = (opts?: { rings?: boolean; dStrands?: number; dFactor?: number })
 	const FORMULA = "(z^2 + c) * sin(z^(c*i))", SX = 0.4206477290564087, SY = 0.5647650444593624;
 	const rings = !!(opts && opts.rings), dStrands = opts?.dStrands ?? 0.08, dFactor = opts?.dFactor ?? 4;
 	const ct = compileFormula(FORMULA);
-	if (ct.ok && ct.body) renderer.setCustomFormula(ct.body);
-	renderer.setSetType(true, SX, SY);   // Julia, the brief's seed
-	renderer.setFilter(rings ? 1 : 0, dStrands, dFactor);
+	if (ct.ok && ct.body) renderer.configure({ formula: { body: ct.body } });
+	renderer.configure({ setType: { julia: true, cx: SX, cy: SY } });   // Julia, the brief's seed
+	renderer.configure({ filter: { id: rings ? 1 : 0, dStrands, dFactor } });
 
-	// ---- Sync the UI controls + navigation state to the renderer, so the config is fully hand-controllable.
+	// ---- Sync the UI controls + navigation state to the renderer, so the config is fully
+	// hand-controllable.
 	if (formulaSelect) formulaSelect.value = "custom";
 	if (formulaInput) formulaInput.value = FORMULA;
 	if (aspectSelect) aspectSelect.value = "1.3333333";
@@ -219,44 +196,105 @@ dev.tierazon = (opts?: { rings?: boolean; dStrands?: number; dFactor?: number })
 	console.log("tierazon: Cthulu Julia" + (rings ? " + x-ray rings" : ", escape-time") + " — UI + URL synced; swap modes freely. reload to reset.");
 };
 
-// Tune the x-ray filter exposure by eye — instant recolor from the stored accumulators (no re-iterate).
-dev.tierazonExposure = (dFactor) => { renderer.setFilterExposure(dFactor); console.log("filter exposure dFactor=" + dFactor); };
+// Tune the x-ray filter exposure by eye — instant recolor from the stored accumulators.
+dev.tierazonExposure = (dFactor) => { renderer.recolor({ filterExposure: dFactor }); console.log("filter exposure dFactor=" + dFactor); };
 
-// z²+c JULIA seeded from the current view CENTER — tests the Julia path through Kernel 2. e.g. juliaHere()
+// z²+c JULIA seeded from the current view CENTER — tests the Julia path. e.g. juliaHere()
 dev.juliaHere = () => {
-	renderer.setFormula(FORMULA_MANDEL);
-	renderer.setSetType(true, view.cx, view.cy);   // Julia @ current center
-	renderer.setFilter(0);
+	renderer.configure({ formula: { id: FORMULA_MANDEL } });
+	renderer.configure({ setType: { julia: true, cx: view.cx, cy: view.cy } });   // Julia @ current center
+	renderer.configure({ filter: { id: 0, dStrands: 0.08, dFactor: 1 } });
 	const seed = view;
 	view = { cx: 0, cxLo: 0, cy: 0, cyLo: 0, spanX: 4, spanY: 4 / (canvas.width / canvas.height) };   // default z-window
 	renderer.render(view);
 	console.log("z²+c Julia @ c = " + seed.cx.toFixed(6) + " + " + seed.cy.toFixed(6) + "i · reload to reset");
 };
 
-// Apply the x-ray filter to the CURRENT fractal (default z²+c Mandelbrot) — tests filters on M-sets
-// (per-pixel trap limit = |c|). e.g. filterHere() or filterHere(6)
+// Apply the x-ray filter to the CURRENT fractal (default z²+c Mandelbrot) — tests filters
+// on M-sets (per-pixel trap limit = |c|). e.g. filterHere() or filterHere(6)
 dev.filterHere = (dFactor = 4) => {
-	renderer.setFilter(1, 0.08, dFactor);
+	renderer.configure({ filter: { id: 1, dStrands: 0.08, dFactor } });
 	renderer.render(view);
 	console.log("x-ray rings on the current fractal, dFactor=" + dFactor + " · tierazonExposure(n) to tune · reload to reset");
 };
 
-// Progressive readout (optional element): the current render phase plus the live undetermined-point
-// split — `working` (still being iterated) and `abandoned` (given up on once escalation stops).
-// The leading dot pulses while the workers are busy (any non-done phase) and turns green when
-// settled. Phase: first frame → refining → anti-aliasing → done.
+// ---- P0 golden-capture harness (refactor-p0.md, step 0). Deterministically re-render the
+// CURRENT state (initial frame ONLY — sharpening off, since the ladder's stage count depends
+// on wall-clock) and fingerprint the result: the exact iteration total + FNV-1a hashes of the
+// raw (mu, de) fields and the canvas pixels. Captured pre-refactor into goldens/*.json; the
+// ported build must reproduce every record bit-for-bit. V8-only (Math.* precision is per-
+// engine). The record also lands in dev.lastGolden so automation can poll a slow window's
+// result instead of awaiting. e.g.  await mandelDump()
+function fnv1a(bytes: Uint8Array | Uint8ClampedArray): string {
+	let h = 0x811c9dc5;
+	for (let i = 0; i < bytes.length; i++) { h ^= bytes[i]; h = Math.imul(h, 0x01000193); }
+	return (h >>> 0).toString(16).padStart(8, "0");
+}
+dev.mandelDump = async () => {
+	dev.lastGolden = undefined;
+	renderer.configure({ sharpen: false });   // initial frame only: deterministic pass count
+	const r = await renderer.renderAndWait(view);
+	renderer.configure({ sharpen: true });
+	const f = { muField: renderer.fields.mu, deField: renderer.fields.de };
+	const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+	// deField is hashed RAW since P3: the generated kernels define the de side-channel (0)
+	// on in-set returns, so the old scheduling-dependent stale entries — and the mask that
+	// worked around them — are gone.
+	const rec = {
+		url: location.search,
+		w: canvas.width, h: canvas.height,
+		maxIters: r.maxIters, iters: r.stats.iters,
+		esc: r.stats.esc, ins: r.stats.ins, per: r.stats.per, cap: r.stats.cap,
+		muHash: fnv1a(new Uint8Array(f.muField.buffer, f.muField.byteOffset, f.muField.byteLength)),
+		deHash: fnv1a(new Uint8Array(f.deField.buffer, f.deField.byteOffset, f.deField.byteLength)),
+		pixHash: fnv1a(img.data),
+	};
+	console.log("[golden] " + JSON.stringify(rec));
+	dev.lastGolden = rec;
+	return rec;
+};
+
+// .par round-trip (schema-driven; see config.ts). No argument: log + return the current
+// state as a Fractint-style parameter block. With text: parse it and apply the whole
+// state (same applier as a URL permalink), then render. e.g.
+//   const p = mandelPar()          // export
+//   mandelPar(p)                   // re-import
+dev.mandelPar = (text?: string) => {
+	if (text == null) {
+		const par = parFromState("mandeljs", view, currentState());
+		console.log(par);
+		return par;
+	}
+	applyFullState(stateFromPar(text));
+	return "par applied";
+};
+
+// URL round-trip test hook (pure, no rendering): parse a query string through the schema
+// and re-serialize. On an already-normalized permalink the output must be IDENTICAL —
+// the P1 byte-compatibility gate. e.g. mandelUrlRT(location.search) === location.search
+dev.mandelUrlRT = (qs: string) => {
+	const { state, rawView } = stateFromUrl(qs);
+	const v: View = rawView
+		? { cx: rawView.cx, cxLo: rawView.cxLo, cy: rawView.cy, cyLo: rawView.cyLo, spanX: rawView.span, spanY: 0 }
+		: view;
+	return urlFromState(v, state);
+};
+
+// Progressive readout (optional element): the current render phase plus the live
+// undetermined-point split — `working` (still being iterated) and `abandoned` (given up on
+// once escalation stops). Phase: first frame → refining → anti-aliasing → done.
 const sharpenStatus = document.querySelector(".sharpen-status") as HTMLElement | null;
 if (sharpenStatus) {
-	renderer.onProgress = ({ working, abandoned, done, phase, etaMs }) => {
+	renderer.events.on("progress", ({ working, abandoned, done, phase, etaMs }) => {
 		const parts = [phase];
-		// First-frame ETA (conservative estimate; the refinement/AA tail isn't estimated). Shown as a countdown.
+		// First-frame ETA (conservative estimate; the refinement/AA tail isn't estimated).
 		if (phase === "first frame" && etaMs !== undefined && etaMs > 250) parts.push("~" + fmtEta(etaMs) + " left");
 		if (working > 0) parts.push(working.toLocaleString() + " working");
 		if (abandoned > 0) parts.push(abandoned.toLocaleString() + " abandoned");
 		sharpenStatus.textContent = parts.join(" · ");
 		sharpenStatus.classList.toggle("is-active", !done);
 		sharpenStatus.classList.toggle("is-done", done);
-	};
+	});
 }
 
 // Humanize an ETA in ms: 8400 → "8s", 92000 → "1m 32s".
@@ -267,8 +305,8 @@ function fmtEta(ms: number): string {
 	return m + "m" + (rs ? " " + rs + "s" : "");
 }
 
-// Telemetry grid (optional element): a cell per stat, updated live as tiles land. Cells are keyed
-// by a data-k attribute so the markup and the updater stay decoupled.
+// Telemetry grid (optional element): a cell per stat, updated live as tiles land. Cells are
+// keyed by a data-k attribute so the markup and the updater stay decoupled.
 const telemetry = document.querySelector(".telemetry") as HTMLElement | null;
 const teleCells: Record<string, HTMLElement> = {};
 if (telemetry) {
@@ -276,11 +314,12 @@ if (telemetry) {
 		const k = el.dataset.k, v = el.querySelector<HTMLElement>(".tstat-v");
 		if (k && v) teleCells[k] = v;
 	});
-	renderer.onStats = (s) => updateTelemetry(s);
+	renderer.events.on("stats", (s) => updateTelemetry(s));
 }
 function setCell(k: string, text: string): void { const el = teleCells[k]; if (el) el.textContent = text; }
-// Set by updateContextualControls: a filter recolors by orbit-trap accumulation, so the escape-time
-// telemetry (composition = trapped/miss, deepest/dwell = meaningless) is relabelled/blanked (V7).
+// Set by updateContextualControls: a filter recolors by orbit-trap accumulation, so the
+// escape-time telemetry (composition = trapped/miss, deepest/dwell = meaningless) is
+// relabelled/blanked.
 const filterState = { active: false };
 
 function updateTelemetry(s: FrameStats): void {
@@ -293,9 +332,9 @@ function updateTelemetry(s: FrameStats): void {
 	setCell("thresholds", !filterState.active && s.p50 > 0 ? "p50 " + fmtCount(Math.round(s.p50)) + " · p90 " + fmtCount(Math.round(s.p90)) : "—");
 }
 
-// Composition — status partition of every pixel (sums to 100), one slice per line (the cell's value
-// uses white-space: pre-line). In filter mode the partition is trapped/miss (the orbit touched the trap
-// or not); in escape-time it's exterior/interior/unresolved. FrameStats carries trapped→escaped, miss→inSet.
+// Composition — status partition of every pixel (sums to 100), one slice per line. In
+// filter mode the partition is trapped/miss; in escape-time it's exterior/interior/
+// unresolved. FrameStats carries trapped→escaped, miss→inSet.
 function compText(s: FrameStats): string {
 	const t = s.escaped + s.inSet + s.capped;
 	if (t <= 0) return "—";
@@ -305,8 +344,7 @@ function compText(s: FrameStats): string {
 	return parts.join("\n");
 }
 
-// Method — compute-path partition of the EXTERIOR pixels only. Nonzero buckets, so a shallow window
-// reads "100% direct f64" and a deep one "99% perturbation · 1% exact DD".
+// Method — compute-path partition of the EXTERIOR pixels only.
 function methodText(s: FrameStats): string {
 	const t = s.xPert + s.xDD + s.xDirect;
 	if (t <= 0) return "—";
@@ -333,8 +371,8 @@ function fmtCount(n: number): string {
 	return String(n | 0);
 }
 
-// Magnification vs the default view: humanized (1.3M×, 1.8T×) through 10¹⁵, then scientific with a
-// superscript exponent for the truly deep dives where the friendly names run out.
+// Magnification vs the default view: humanized (1.3M×, 1.8T×) through 10¹⁵, then
+// scientific with a superscript exponent for the truly deep dives.
 const SUPS = "⁰¹²³⁴⁵⁶⁷⁸⁹";
 function fmtMag(z: number): string {
 	if (z < 1e3) return (z >= 100 ? String(Math.round(z)) : z.toFixed(1)) + "×";
@@ -346,7 +384,7 @@ function fmtMag(z: number): string {
 
 // Recolor on light/dark flip (matters for the theme-aware subtle palette).
 const themeMq = matchMedia("(prefers-color-scheme: dark)");
-if (themeMq.addEventListener) themeMq.addEventListener("change", () => renderer.recolor());
+if (themeMq.addEventListener) themeMq.addEventListener("change", () => renderer.recolor({ theme: true }));
 
 //---------------------------------------------------------------------------\\
 // Interactivity — a zoom selector you draw, nudge, and resize
@@ -439,15 +477,15 @@ class ZoomSelector {
 		const wasDraw = this.mode === "draw";
 		const moved = this.moved;
 		this.mode = "none";
-		// A click on empty space (draw, no drag) dismisses; a drag too small to matter is discarded.
-		// A press inside the box that didn't move keeps the selection.
+		// A click on empty space (draw, no drag) dismisses; a drag too small to matter is
+		// discarded. A press inside the box that didn't move keeps the selection.
 		if (wasDraw && (!moved || !this.rect || this.rect.h < SEL_MIN_H)) this.clear();
 		const p = this.local(ev);
 		this.overlay.style.cursor = this.inside(p) ? "move" : "crosshair";
 	};
 
-	// Scroll over the box → resize about its center, aspect locked. Over empty space (or with no
-	// box) we don't preventDefault, so the page scrolls as usual.
+	// Scroll over the box → resize about its center, aspect locked. Over empty space (or
+	// with no box) we don't preventDefault, so the page scrolls as usual.
 	private onWheel = (ev: WheelEvent): void => {
 		if (!this.rect || !this.inside(this.local(ev))) return;
 		ev.preventDefault();
@@ -457,8 +495,8 @@ class ZoomSelector {
 		this.setRect(this.clampSize({ x: cx - r.w * f / 2, y: cy - r.h * f / 2, w: r.w * f, h: r.h * f }, cx, cy));
 	};
 
-	// Aspect-locked rect from the fixed anchor to the cursor: size follows whichever axis was dragged
-	// further, direction follows the drag, so the box always encloses the cursor.
+	// Aspect-locked rect from the fixed anchor to the cursor: size follows whichever axis
+	// was dragged further, direction follows the drag, so the box always encloses the cursor.
 	private drawRect(p: [number, number]): SelRect {
 		const dx = p[0] - this.anchor[0], dy = p[1] - this.anchor[1];
 		const w = Math.max(Math.abs(dx), Math.abs(dy) * this.aspect);
@@ -466,8 +504,9 @@ class ZoomSelector {
 		return { x: dx >= 0 ? this.anchor[0] : this.anchor[0] - w, y: dy >= 0 ? this.anchor[1] : this.anchor[1] - h, w, h };
 	}
 
-	// Clamp a rect to the canvas: cap the size to the frame (aspect preserved), then keep it fully
-	// on-canvas. When re-centering (resize) the given center is held; otherwise the origin is nudged in.
+	// Clamp a rect to the canvas: cap the size to the frame (aspect preserved), then keep it
+	// fully on-canvas. When re-centering (resize) the given center is held; otherwise the
+	// origin is nudged in.
 	private clampSize(r: SelRect, cx?: number, cy?: number): SelRect {
 		const W = this.overlay.width, H = this.overlay.height;
 		let { w, h } = r;
@@ -511,7 +550,8 @@ class ZoomSelector {
 		c.strokeRect(r.x, r.y, r.w, r.h);
 	}
 
-	// The committed selection as [x, y, w, h], or undefined if none / too small to be intentional.
+	// The committed selection as [x, y, w, h], or undefined if none / too small to be
+	// intentional.
 	public getRect(): [number, number, number, number] | undefined {
 		const r = this.rect;
 		if (!r || r.h < SEL_MIN_H) return undefined;
@@ -522,10 +562,9 @@ class ZoomSelector {
 
 	public clear(): void { this.setRect(null); }
 
-	// Re-lock the box aspect after applyAspect() changes the frame ratio (a URL permalink or the aspect
-	// dropdown). Without this the selector keeps its construction-time ratio (the HTML canvas default,
-	// 2:1), so diving from a non-default-aspect view draws a mismatched box and lands squished. Drops
-	// any current selection, which was aspect-locked to the old ratio.
+	// Re-lock the box aspect after applyAspect() changes the frame ratio (a URL permalink or
+	// the aspect dropdown). Drops any current selection, which was aspect-locked to the old
+	// ratio.
 	public syncAspect(aspect: number): void {
 		this.aspect = aspect;
 		this.clear();
@@ -539,9 +578,9 @@ const backButton = document.querySelector(".back-button") as HTMLButtonElement |
 const outButton = document.querySelector(".out-button") as HTMLButtonElement | null;
 const resetButton = document.querySelector(".reset-button") as HTMLButtonElement;
 
-// View history for exact zoom-out. Each dive/out/reset pushes the outgoing view; back pops it.
-// Kept separate from the URL (which only mirrors the current view) so stepping back restores the
-// DD center lo-limbs bit-for-bit — no precision loss on the way out.
+// View history for exact zoom-out. Each dive/out/reset pushes the outgoing view; back pops
+// it. Kept separate from the URL (which only mirrors the current view) so stepping back
+// restores the DD center lo-limbs bit-for-bit — no precision loss on the way out.
 const viewHistory: View[] = [];
 function pushHistory(v: View): void {
 	viewHistory.push(v);
@@ -552,8 +591,8 @@ function pushHistory(v: View): void {
 function goTo(next: View): void {
 	view = next;
 	syncUrl();
-	// Show the new magnification immediately and blank the rest to a dash — the figures fill back in
-	// as the first tiles land, so the grid never lingers on the previous frame's numbers.
+	// Show the new magnification immediately and blank the rest to a dash — the figures
+	// fill back in as the first tiles land.
 	if (telemetry) {
 		setCell("zoom", fmtMag(DEFAULT_VIEW.spanX / next.spanX));
 		for (const k of ["deepest", "throughput", "composition", "method", "thresholds"]) setCell(k, "…");
@@ -562,9 +601,10 @@ function goTo(next: View): void {
 	selector.clear();
 }
 
-// ---- V6: Mandelbrot ↔ Julia toggle. The M-view (c-space) and J-view (z-space) are independent
-// coordinate systems, so we snapshot each mode's {view, history} and swap. The J bundle is keyed on its
-// seed: re-entering Julia from the SAME center restores your exploration; a moved center → fresh J. ----
+// ---- Mandelbrot ↔ Julia toggle. The M-view (c-space) and J-view (z-space) are independent
+// coordinate systems, so we snapshot each mode's {view, history} and swap. The J bundle is
+// keyed on its seed: re-entering Julia from the SAME center restores your exploration; a
+// moved center → fresh J. ----
 let mBundle: { view: View; history: View[] } | null = null;                  // saved Mandelbrot state while in Julia
 let jBundle: { seed: number; view: View; history: View[] } | null = null;    // cached Julia state (seed = f64 key)
 
@@ -578,22 +618,9 @@ function defaultJuliaView(): View {
 	return { cx: 0, cxLo: 0, cy: 0, cyLo: 0, spanX: 4, spanY: 4 / CANVAS_ASPECT };   // origin, |z| < 2, aspect-matched
 }
 
-// The formula dropdown, as data. Key = the <option> value. "0" is the standard z²+c (Kernel 1 fast path,
-// no compiled formula). "custom" is the editable field. Every other entry is a formula STRING compiled
-// through the same path as custom (compileFormula → setCustomFormula) — adding a preset is just a row.
-// Each may carry its own default window: `center` (else origin, or cx=-1 for the standard) and `spanX`.
-interface Preset { formula?: string; center?: { cx: number; cy: number }; spanX?: number; }
-const PRESETS: { [key: string]: Preset } = {
-	"0": {},                                                                   // z²+c → Kernel 1; classic cx=-1 framing
-	"cubic": { formula: "z^3 + c" },                                           // cubic Multibrot, origin
-	"ship": { formula: "(abs(re(z)) + abs(im(z))*i)^2 + c", center: { cx: -0.5, cy: -0.5 }, spanX: 3.4 },   // Burning Ship
-	"cosine": { formula: "c*cos(z)" },                                         // cosine map, origin
-	"custom": {},                                                              // editable; origin
-};
-
-// The default window for the current mode + formula (reset target; also where a formula switch lands).
-// Julia always centers on the origin. In Mandelbrot mode each preset supplies its own framing (PRESETS):
-// the standard z²+c keeps the classic cx=-1, everything else defaults to the origin unless it overrides.
+// The default window for the current mode + formula (reset target; also where a formula
+// switch lands). Julia always centers on the origin. In Mandelbrot mode each preset
+// supplies its own framing.
 function defaultViewFor(): View {
 	if (inJulia) return defaultJuliaView();
 	const key = formulaSelect ? formulaSelect.value : "0";
@@ -610,7 +637,7 @@ function enterJulia(): void {
 	const scx = view.cx + view.cxLo, scy = view.cy + view.cyLo;   // seed = DD center collapsed to f64
 	currentSeed = { cx: scx, cy: scy };
 	mBundle = { view, history: snapshotHistory() };
-	renderer.setSetType(true, scx, scy);
+	renderer.configure({ setType: { julia: true, cx: scx, cy: scy } });
 	const key = seedKey(scx, scy);
 	if (jBundle && jBundle.seed === key) { view = jBundle.view; setHistory(jBundle.history); }        // same seed → restore
 	else { view = defaultJuliaView(); setHistory([]); jBundle = { seed: key, view, history: [] }; }    // new seed → fresh
@@ -620,15 +647,16 @@ function enterJulia(): void {
 function exitJulia(): void {
 	if (jBundle) jBundle = { seed: jBundle.seed, view, history: snapshotHistory() };   // stash the J exploration
 	inJulia = false;
-	renderer.setSetType(false);
+	renderer.configure({ setType: { julia: false } });
 	if (mBundle) { view = mBundle.view; setHistory(mBundle.history); }
 	syncUrl();
 	renderer.render(view);
 }
 
-// ---- V5: aspect selector. Fixed width, derived height. applyAspect just resizes canvas + easel +
-// selector overlay and updates CANVAS_ASPECT (used by restoreFromUrl before the first render); setAspect
-// is the user handler — resize, re-derive spanY = spanX/aspect, re-sync, re-render. ----
+// ---- Aspect selector. Fixed width, derived height. applyAspect just resizes canvas +
+// easel + selector overlay and updates CANVAS_ASPECT (used by restoreFromUrl before the
+// first render); setAspect is the user handler — resize, re-derive spanY, re-sync,
+// re-render. ----
 function applyAspect(aspect: number): void {
 	const W = 640, H = Math.round(W / aspect);
 	canvas.width = W; canvas.height = H;
@@ -636,7 +664,7 @@ function applyAspect(aspect: number): void {
 	const overlay = easel.querySelectorAll("canvas")[1] as HTMLCanvasElement | undefined;
 	if (overlay) { overlay.width = W; overlay.height = H; }
 	CANVAS_ASPECT = W / H;                 // the REALIZED integer-pixel ratio, not the requested aspect — keeps
-	selector.syncAspect(CANVAS_ASPECT);    // pixels exactly square when H rounds, and the box lock in step (else dives squish)
+	selector.syncAspect(CANVAS_ASPECT);    // pixels exactly square when H rounds, and the box lock in step
 }
 function setAspect(aspect: number): void {
 	applyAspect(aspect);
@@ -652,8 +680,9 @@ zoomButton.addEventListener("click", () => {
 	const r = selector.getRect();
 	if (!r) return;
 	const W = canvas.width, H = canvas.height;
-	// Recenter in double-double: newCenter = oldCenter + boxOffset. In f64 the offset is lost once it
-	// drops below the center's ULP (~|c|·ε); ddAdd's twoSum keeps it, so the box lands where you drew it.
+	// Recenter in double-double: newCenter = oldCenter + boxOffset. In f64 the offset is
+	// lost once it drops below the center's ULP (~|c|·ε); ddAdd's twoSum keeps it, so the
+	// box lands where you drew it.
 	const offX = ((r[0] + r[2] / 2) / W - 0.5) * view.spanX;
 	const offY = (0.5 - (r[1] + r[3] / 2) / H) * view.spanY;   // Im up: match the render's flipped y-map so the box lands where drawn
 	ddAdd(view.cx, view.cxLo, offX, 0); const ncx = _dhi, ncxLo = _dlo;
@@ -677,7 +706,8 @@ if (backButton) {
 }
 
 if (outButton) {
-	// Step out past history: 2× the span about the current center (kept exactly — only span changes).
+	// Step out past history: 2× the span about the current center (kept exactly — only span
+	// changes).
 	outButton.addEventListener("click", () => {
 		pushHistory(view);
 		goTo({ ...view, spanX: view.spanX * 2, spanY: view.spanY * 2 });
@@ -689,31 +719,31 @@ resetButton.addEventListener("click", () => {
 	goTo(defaultViewFor());
 });
 
-// Coloring method (optional control) — one dropdown for all four paths: escape-time bands with the
-// linear / √ / log transforms, plus distance estimate. Each recolors instantly from the stored field.
+// Coloring method (optional control) — one dropdown for all four paths: escape-time bands
+// with the linear / √ / log transforms, plus distance estimate. Each recolors instantly.
 const coloringSelect = document.querySelector(".coloring-select") as HTMLSelectElement | null;
 function applyColoringFromControls(): void {
 	const v = coloringSelect ? coloringSelect.value : "log";
-	if (v === "distance") renderer.setColoring(1, 0);
-	else renderer.setColoring(0, v === "sqrt" ? 1 : v === "log" ? 2 : 0);
+	if (v === "distance") renderer.recolor({ coloring: { mode: 1, bandMap: 0 } });
+	else renderer.recolor({ coloring: { mode: 0, bandMap: v === "sqrt" ? 1 : v === "log" ? 2 : 0 } });
 }
 if (coloringSelect) {
 	coloringSelect.addEventListener("change", () => { applyColoringFromControls(); syncUrl(); });
 }
 
-// Palette instrument — palette picker + density slider. Wrap is no longer user-facing: each palette's
-// own default (cyclic) is used (setPalette resets it), so the colorful palettes band and subtle ramps.
+// Palette instrument — palette picker + density slider. Wrap is no longer user-facing:
+// each palette's own default (cyclic) is used (setPalette resets it).
 const densitySlider = document.querySelector(".density-slider") as HTMLInputElement | null;
 if (densitySlider) {
 	densitySlider.value = String(currentPalette.density);
-	densitySlider.addEventListener("input", () => { renderer.setDensity(Number(densitySlider.value)); syncUrl(); });
+	densitySlider.addEventListener("input", () => { renderer.recolor({ density: Number(densitySlider.value) }); syncUrl(); });
 }
 
 const paletteSelect = document.querySelector(".palette-select") as HTMLSelectElement | null;
 
-// ---- Custom palette: a small gradient editor (arbitrary color stops + in-set color), baked through the
-// SAME LUT as the built-in palettes. Applies to escape-time AND filters (mapping B). Live — every edit
-// rebuilds the Palette and recolors from the stored field (no re-iterate). ----
+// ---- Custom palette: a small gradient editor (arbitrary color stops + in-set color),
+// baked through the SAME LUT as the built-in palettes. Applies to escape-time AND filters.
+// Live — every edit rebuilds the Palette and recolors from the stored field. ----
 const paletteEditor = document.querySelector(".palette-editor") as HTMLElement | null;
 const palBar = document.querySelector(".pal-bar") as HTMLElement | null;
 const palStops = document.querySelector(".pal-stops") as HTMLElement | null;
@@ -721,7 +751,6 @@ const palInset = document.querySelector(".pal-inset") as HTMLInputElement | null
 const palCyclic = document.querySelector(".pal-cyclic") as HTMLInputElement | null;
 const palAdd = document.querySelector(".pal-add") as HTMLButtonElement | null;
 const palRemove = document.querySelector(".pal-remove") as HTMLButtonElement | null;
-const CUSTOM_DENSITY = 32;
 let customStops = ["#0d0221", "#3a0ca3", "#7209b7", "#f72585", "#ffd60a"];
 
 function updatePalBar(): void { if (palBar) palBar.style.background = "linear-gradient(90deg, " + customStops.join(", ") + ")"; }
@@ -729,12 +758,12 @@ function buildCustomPalette(): Palette {
 	return customPalette(customStops, palInset ? palInset.value : "#000000", palCyclic ? palCyclic.checked : true, CUSTOM_DENSITY);
 }
 function applyCustomPalette(): void {
-	renderer.setPalette(buildCustomPalette());
+	renderer.recolor({ palette: buildCustomPalette() });
 	if (densitySlider) densitySlider.value = String(CUSTOM_DENSITY);
 	updatePalBar();
 	syncUrl();
 }
-// (Re)build the stop swatches from customStops — one native color input each, wired to live edits.
+// (Re)build the stop swatches from customStops — one native color input each, wired live.
 function renderStops(): void {
 	if (!palStops) return;
 	palStops.textContent = "";
@@ -758,17 +787,33 @@ if (paletteSelect) {
 		if (isCustom) { renderStops(); applyCustomPalette(); return; }
 		const p = PALETTES[paletteSelect.value];
 		if (!p) return;
-		renderer.setPalette(p);   // resets effective wrap to the palette default (E7)
+		renderer.recolor({ palette: p });   // resets effective wrap/density to the palette defaults
 		if (densitySlider) densitySlider.value = String(p.density);
 		syncUrl();
 	});
 }
 
 //---------------------------------------------------------------------------\\
-// Render-settings controls (V3–V6): formula, Julia toggle + seed, filter + params, aspect. All
-// optional (absent on pages without them). Formula/set-type/filter/strands/aspect re-iterate; exposure
-// recolors instantly. Kernel selection is derived inside the renderer (deriveKernel).
+// Render-settings controls: formula, Julia toggle + seed, filter + params, aspect. All
+// optional (absent on pages without them). Formula/set-type/filter/strands/aspect
+// re-iterate; exposure recolors instantly. Kernel selection is derived inside the
+// renderer (deriveKernel).
 //---------------------------------------------------------------------------\\
+
+const filterSelectEl = document.querySelector(".filter-select") as HTMLSelectElement | null;
+// Filter options come from the registry (one FilterDef per filter) — adding a filter file
+// adds its dropdown entry; the HTML carries only the empty select.
+if (filterSelectEl) {
+	filterSelectEl.textContent = "";
+	const none = document.createElement("option");
+	none.value = "0"; none.textContent = "none";
+	filterSelectEl.appendChild(none);
+	for (const def of Object.values(FILTERS)) {
+		const o = document.createElement("option");
+		o.value = String(def.id); o.textContent = def.label;
+		filterSelectEl.appendChild(o);
+	}
+}
 
 const formulaSelect = document.querySelector(".formula-select") as HTMLSelectElement | null;
 const formulaCustom = document.querySelector(".formula-custom") as HTMLElement | null;
@@ -786,7 +831,7 @@ const itercapInput = document.querySelector(".itercap-input") as HTMLInputElemen
 // Reflect the current control state into the renderer + show/hide contextual controls.
 function currentFilterId(): number { return filterSelect ? Number(filterSelect.value) : 0; }
 function pushFilter(): void {
-	renderer.setFilter(currentFilterId(), strandsSlider ? Number(strandsSlider.value) : 0.08, exposureSlider ? Number(exposureSlider.value) : 4);
+	renderer.configure({ filter: { id: currentFilterId(), dStrands: strandsSlider ? Number(strandsSlider.value) : 0.08, dFactor: exposureSlider ? Number(exposureSlider.value) : 4 } });
 }
 function updateContextualControls(): void {
 	const filterOn = currentFilterId() !== 0;
@@ -795,18 +840,17 @@ function updateContextualControls(): void {
 	document.querySelectorAll<HTMLElement>(".filter-param").forEach((el) => el.classList.toggle("hidden", !filterOn));
 	formulaCustom?.classList.toggle("hidden", !customOn);   // the f(z,c)= text field appears only for "custom…"
 	if (!customOn && formulaError) formulaError.textContent = "";   // clear a stale error when leaving custom
-	// A filter reads through the palette (mapping B), so the palette + its editor stay live in filter mode;
-	// only the escape-time-specific controls (density, transfer mode) dim — they don't touch a trap readout.
+	// A filter reads through the palette, so the palette + its editor stay live in filter
+	// mode; only the escape-time-specific controls (density, transfer mode) dim.
 	document.querySelectorAll<HTMLElement>(".escape-only").forEach((el) => el.classList.toggle("is-dimmed", filterOn));
-	// Distance coloring needs Kernel 1's derivative; disable it on Kernel 2 (fall back to log if it was picked).
+	// Distance coloring needs Kernel 1's derivative; disable it on Kernel 2.
 	const distOpt = coloringSelect?.querySelector<HTMLOptionElement>('option[value="distance"]');
 	if (distOpt) distOpt.disabled = k2;
-	if (k2 && coloringSelect?.value === "distance") { coloringSelect.value = "log"; renderer.setColoring(0, 2); }
-	filterState.active = filterOn;   // telemetry relabels in filter mode (V7)
-	// Perturbation is a z²+c-only fast path — mirror deriveKernel(): disabled + off on Kernel 2 (custom /
-	// Julia / filter, which force it false), enabled + on (auto) on Kernel 1. Reflective only; the change
-	// handler drives the renderer. Runs on the same config changes that re-derive the kernel, so it never
-	// clobbers a mid-navigation user choice (those config changes reset the override anyway).
+	if (k2 && coloringSelect?.value === "distance") { coloringSelect.value = "log"; renderer.recolor({ coloring: { mode: 0, bandMap: 2 } }); }
+	filterState.active = filterOn;   // telemetry relabels in filter mode
+	// Perturbation is a z²+c-only fast path — mirror deriveKernel(): disabled + off on
+	// Kernel 2 (custom / Julia / filter), enabled + on (auto) on Kernel 1. Reflective only;
+	// the change handler drives the renderer.
 	if (pertToggle) {
 		pertToggle.disabled = k2;
 		pertToggle.checked = !k2;
@@ -817,29 +861,30 @@ function updateContextualControls(): void {
 // Show/clear a formula error; empty text hides the pill (see .formula-error:empty in CSS).
 function showFormulaError(msg: string): void { if (formulaError) formulaError.textContent = msg; }
 
-// Compile the text field and, if it's valid, install it as the custom formula + re-render. Returns
-// whether it compiled. `refsC === false` (a formula that ignores c) makes every Mandelbrot pixel
-// identical — surfaced as a non-blocking note rather than an error. The compiler is pure + cheap.
+// Compile the text field and, if it's valid, install it as the custom formula + re-render.
+// `refsC === false` (a formula that ignores c) makes every Mandelbrot pixel identical —
+// surfaced as a non-blocking note rather than an error.
 function applyCustomFormula(): boolean {
 	if (!formulaInput) return false;
 	const res = compileFormula(formulaInput.value);
 	if (!res.ok || !res.body) { showFormulaError(res.error || "invalid formula"); return false; }
 	showFormulaError(res.refsC === false && !juliaToggle?.checked ? "note: no c — every point is identical" : "");
-	renderer.setCustomFormula(res.body);
+	renderer.configure({ formula: { body: res.body } });
 	updateContextualControls();
 	goTo(view);   // render the current view (the dropdown handler resets it to the formula default first)
 	return true;
 }
 
-// Configure the renderer for the CURRENT formula-select value (+ optional custom expr) WITHOUT touching
-// the view or rendering. Shared by the change handler's non-custom branch and by restoreFromUrl.
+// Configure the renderer for the CURRENT formula-select value (+ optional custom expr)
+// WITHOUT touching the view or rendering. Shared by the change handler's non-custom branch
+// and by restoreFromUrl.
 function applyFormulaFromControls(expr?: string | null): void {
 	const key = formulaSelect ? formulaSelect.value : "0";
 	if (key === "custom") {
 		if (formulaInput && expr != null) formulaInput.value = expr;
 		if (formulaInput) {
 			const res = compileFormula(formulaInput.value);
-			if (res.ok && res.body) { renderer.setCustomFormula(res.body); showFormulaError(res.refsC === false && !juliaToggle?.checked ? "note: no c — every point is identical" : ""); }
+			if (res.ok && res.body) { renderer.configure({ formula: { body: res.body } }); showFormulaError(res.refsC === false && !juliaToggle?.checked ? "note: no c — every point is identical" : ""); }
 			else showFormulaError(res.error || "invalid formula");
 		}
 		return;
@@ -847,16 +892,16 @@ function applyFormulaFromControls(expr?: string | null): void {
 	const preset = PRESETS[key];
 	if (preset && preset.formula) {
 		const res = compileFormula(preset.formula);   // presets are known-valid, but guard anyway
-		if (res.ok && res.body) renderer.setCustomFormula(res.body);
+		if (res.ok && res.body) renderer.configure({ formula: { body: res.body } });
 	} else {
-		renderer.setFormula(FORMULA_MANDEL);          // "0" → standard z²+c (Kernel 1)
+		renderer.configure({ formula: { id: FORMULA_MANDEL } });   // "0" → standard z²+c (Kernel 1)
 	}
 }
 
 if (formulaSelect) {
 	formulaSelect.addEventListener("change", () => {
-		// A new formula is a new fractal: land on its default window (per-preset center) and drop the old
-		// zoom history. Julia keeps its own view/bundle (already origin-centered).
+		// A new formula is a new fractal: land on its default window (per-preset center) and
+		// drop the old zoom history. Julia keeps its own view/bundle.
 		if (!inJulia) { view = defaultViewFor(); setHistory([]); }
 		if (formulaSelect.value === "custom") {
 			updateContextualControls();   // reveal the text field
@@ -885,104 +930,111 @@ if (strandsSlider) {   // trap band half-width — re-iterates, so 'change' (on 
 	strandsSlider.addEventListener("change", () => { pushFilter(); syncUrl(); renderer.render(view); });
 }
 if (exposureSlider) {   // exposure — instant recolor from the stored accumulators, so live 'input'
-	exposureSlider.addEventListener("input", () => { renderer.setFilterExposure(Number(exposureSlider.value)); syncUrl(); });
+	exposureSlider.addEventListener("input", () => { renderer.recolor({ filterExposure: Number(exposureSlider.value) }); syncUrl(); });
 }
 if (blendSelect) {   // A/B color-mapping method (experimental) — instant recolor
-	blendSelect.addEventListener("change", () => { renderer.setFilterBlend(Number(blendSelect.value)); syncUrl(); });
+	blendSelect.addEventListener("change", () => { renderer.recolor({ filterBlend: Number(blendSelect.value) }); syncUrl(); });
 }
 if (aspectSelect) {
 	aspectSelect.addEventListener("change", () => setAspect(Number(aspectSelect.value)));
 }
 if (pertToggle) {
-	// Perturbation is a pure performance path (identical image to the double-double engine), so it carries
-	// no view state / URL — just flip the override and re-iterate. Only visibly differs on deep z²+c views
-	// (telemetry method flips perturbation ↔ double-double). checked = auto (pert where DD engages); unchecked = force DD.
-	pertToggle.addEventListener("change", () => { renderer.setPert(pertToggle.checked ? null : false); renderer.render(view); });
+	// Perturbation is a pure performance path (identical image to the double-double
+	// engine), so it carries no view state / URL — just flip the override and re-iterate.
+	// checked = auto (pert where DD engages); unchecked = force DD.
+	pertToggle.addEventListener("change", () => { renderer.configure({ pert: pertToggle.checked ? null : false }); renderer.render(view); });
 }
-// Forced iteration cap (advanced): blank/0 = adaptive, a positive integer = a hard maxiter. It changes the
-// image (pixels still capped become interior), so it re-iterates AND is view state (URL). See setIterCap.
+// Forced iteration cap (advanced): blank/0 = adaptive, a positive integer = a hard
+// maxiter. It changes the image (pixels still capped become interior), so it re-iterates
+// AND is view state (URL). See setIterCap.
 function currentIterCap(): number | null {
 	if (!itercapInput || itercapInput.value.trim() === "") return null;
 	const n = Math.round(Number(itercapInput.value));
 	return isFinite(n) && n > 0 ? n : null;
 }
 if (itercapInput) {
-	itercapInput.addEventListener("change", () => { renderer.setIterCap(currentIterCap()); syncUrl(); renderer.render(view); });
+	itercapInput.addEventListener("change", () => { renderer.configure({ iterCap: currentIterCap() }); syncUrl(); renderer.render(view); });
 }
 if (juliaToggle) {
 	juliaToggle.addEventListener("change", () => { if (juliaToggle.checked) enterJulia(); else exitJulia(); });
 }
 updateContextualControls();   // initial state: filter params hidden (filter = none by default)
 
-// ---- Permalink restore + first render. Runs LAST (all controls + renderer methods exist). Reads the
-// full state from the URL, applies it directly to the controls + renderer (no change events → no
-// premature renders/syncs), then does the single first render. Missing/invalid params fall back to
-// defaults, so a bare URL and old ?cx&cy&span links still load. ----
+// ---- Permalink restore + first render. Runs LAST (all controls + renderer methods
+// exist). The schema (config.ts) parses the URL into an AppState; applyFullState pushes
+// it into the controls + renderer (no change events → no premature renders/syncs), then
+// does the single first render. Missing/invalid params fall back to defaults, so a bare
+// URL and old ?cx&cy&span links still load. The same applier serves .par import. ----
 function restoreFromUrl(): void {
-	const p = new URLSearchParams(location.search);
+	applyFullState(stateFromUrl(location.search));
+}
 
-	// Aspect first — it resizes the canvas and sets CANVAS_ASPECT, which the view's spanY derives from.
-	const ar = p.get("ar");
-	if (ar && aspectSelect && isFinite(Number(ar)) && Number(ar) > 0) { aspectSelect.value = ar; applyAspect(Number(ar)); }
+// Apply a parsed {state, rawView} to the controls + renderer + navigation, then render
+// once. Application ORDER matters and mirrors the old restore: aspect first (it resizes
+// the canvas, and spanY derives from CANVAS_ASPECT), then formula, filter, coloring, cap,
+// and finally the view + set type.
+function applyFullState({ state: s, rawView }: { state: AppState; rawView: RawView | null }): void {
+	// Aspect first.
+	if (aspectSelect) aspectSelect.value = s.aspect;
+	applyAspect(Number(s.aspect));
 
-	// Formula (+ custom text). Unknown key → standard z²+c.
-	const fKey = p.get("f") || "0";
-	if (formulaSelect) formulaSelect.value = PRESETS[fKey] ? fKey : "0";
-	applyFormulaFromControls(p.get("expr"));
+	// Formula (+ custom text).
+	if (formulaSelect) formulaSelect.value = s.formulaKey;
+	applyFormulaFromControls(s.formulaKey === "custom" ? s.expr : null);
 
-	// Filter + params.
-	const filt = p.get("filt");
-	if (filt && filterSelect) filterSelect.value = filt;
-	const str = p.get("str"); if (str && strandsSlider) strandsSlider.value = str;
-	const exp = p.get("exp"); if (exp && exposureSlider) exposureSlider.value = exp;
-	const fb = p.get("fb"); if (fb && blendSelect) blendSelect.value = fb;
+	// Filter + params. Control values come from the state; pushFilter reads the controls,
+	// preserving the old select-rejects-unknown-value semantics.
+	if (filterSelect) filterSelect.value = s.filterId;
+	if (strandsSlider) strandsSlider.value = s.strands;
+	if (exposureSlider) exposureSlider.value = s.exposure;
+	if (blendSelect) blendSelect.value = s.blend;
 	pushFilter();
-	if (blendSelect) renderer.setFilterBlend(Number(blendSelect.value));
+	if (blendSelect) renderer.recolor({ filterBlend: Number(blendSelect.value) });
 
 	// Coloring: palette (resets density to its default) → density override → transfer mode.
-	const pal = p.get("pal");
-	if (pal === "custom") {   // rebuild the custom gradient from stops/inset/cyc, reveal the editor
+	if (s.paletteKey === "custom") {
 		if (paletteSelect) paletteSelect.value = "custom";
-		const stopsParam = p.get("stops");
-		if (stopsParam) {
-			const parsed = stopsParam.split("-").map((h) => "#" + h).filter((h) => /^#[0-9a-fA-F]{6}$/.test(h));
-			if (parsed.length >= 2) customStops = parsed;
-		}
-		if (palInset && /^[0-9a-fA-F]{6}$/.test(p.get("inset") || "")) palInset.value = "#" + p.get("inset");
-		if (palCyclic) palCyclic.checked = p.get("cyc") !== "0";
+		customStops = s.stops.slice();
+		if (palInset) palInset.value = s.inset;
+		if (palCyclic) palCyclic.checked = s.cyclic;
 		paletteEditor?.classList.remove("hidden");
 		renderStops();
-		renderer.setPalette(buildCustomPalette());
+		renderer.recolor({ palette: buildCustomPalette() });
 		updatePalBar();
 		if (densitySlider) densitySlider.value = String(CUSTOM_DENSITY);
-	} else if (pal && paletteSelect && PALETTES[pal]) {
-		paletteSelect.value = pal; renderer.setPalette(PALETTES[pal]); if (densitySlider) densitySlider.value = String(PALETTES[pal].density);
+	} else if (s.paletteKey !== "escape" && paletteSelect && PALETTES[s.paletteKey]) {
+		paletteSelect.value = s.paletteKey;
+		renderer.recolor({ palette: PALETTES[s.paletteKey] });
+		if (densitySlider) densitySlider.value = String(PALETTES[s.paletteKey].density);
 	}
-	const dens = p.get("dens");
-	if (dens && densitySlider) { densitySlider.value = dens; renderer.setDensity(Number(dens)); }
-	const col = p.get("col");
-	if (col && coloringSelect) coloringSelect.value = col;
+	const palDefault = s.paletteKey === "custom" ? CUSTOM_DENSITY : (PALETTES[s.paletteKey] ? PALETTES[s.paletteKey].density : -1);
+	if (Number(s.density) !== palDefault && densitySlider) {
+		densitySlider.value = s.density;
+		renderer.recolor({ density: Number(s.density) });
+	}
+	if (coloringSelect) coloringSelect.value = s.coloring;
 	applyColoringFromControls();
 
-	// Forced iteration cap (advanced) — a hard maxiter (blank = adaptive), applied before the first render.
-	const capParam = p.get("cap");
-	if (capParam && itercapInput) itercapInput.value = capParam;
-	renderer.setIterCap(currentIterCap());
+	// Forced iteration cap — applied before the first render.
+	if (itercapInput) itercapInput.value = s.cap != null ? String(s.cap) : "";
+	renderer.configure({ iterCap: currentIterCap() });
 
-	// View + set type. urlView uses the now-correct CANVAS_ASPECT for spanY.
-	const urlView = viewFromUrl();
-	if (p.get("j") === "1") {
-		const jx = parseFloat(p.get("jx") || ""), jy = parseFloat(p.get("jy") || "");
-		const sx = isFinite(jx) ? jx : 0, sy = isFinite(jy) ? jy : 0;
+	// View + set type. The raw view uses the now-correct CANVAS_ASPECT for spanY.
+	const urlView: View | null = rawView
+		? { cx: rawView.cx, cxLo: rawView.cxLo, cy: rawView.cy, cyLo: rawView.cyLo, spanX: rawView.span, spanY: rawView.span / CANVAS_ASPECT }
+		: null;
+	if (s.juliaOn) {
 		mBundle = { view: defaultViewFor(), history: [] };   // inJulia still false → a sensible M-view for a later exit
 		inJulia = true;
 		if (juliaToggle) juliaToggle.checked = true;
-		currentSeed = { cx: sx, cy: sy };
-		renderer.setSetType(true, sx, sy);
+		currentSeed = { cx: s.juliaX, cy: s.juliaY };
+		renderer.configure({ setType: { julia: true, cx: s.juliaX, cy: s.juliaY } });
 		view = urlView || defaultJuliaView();
-		jBundle = { seed: seedKey(sx, sy), view, history: [] };
+		jBundle = { seed: seedKey(s.juliaX, s.juliaY), view, history: [] };
 	} else {
 		inJulia = false;
+		if (juliaToggle) juliaToggle.checked = false;
+		renderer.configure({ setType: { julia: false } });
 		view = urlView || defaultViewFor();
 	}
 

@@ -1,14 +1,15 @@
 // formula.ts — a tiny compiler for user-entered iteration formulas f(z, c). Text in, a JS
-// straight-line body out, which the renderer splices into the worker's `stepFormula` and (via
-// `new Function`) into the main thread's copy. Pure and self-contained: no DOM, no kernel refs —
-// the only output is a string. See kernel.ts (the FORMULA_CUSTOM seam) + renderer.setCustomFormula.
+// straight-line body out, which the kernel assembler (kernel/assemble.ts) splices INLINE
+// into the generated escape loop on both threads. Pure and self-contained: no DOM, no
+// kernel refs — the only output is a string.
 //
-// Design: parse → validate against a whitelist → CODEGEN (not interpret). The hot loop runs the
-// formula millions of times per frame; a tree-walking interpreter would allocate complex
-// intermediates and defeat the JIT, so we emit flat f64 arithmetic on (re, im) pairs — the same
-// shape the z²+c step has, hand-inlined, in escapeCustom. The user's TEXT never becomes code: only
-// whitelisted operations are ever emitted, so there is no eval of user input (the whitelist is the
-// entire security gate). Output writes the result to the kernel's (_cre, _cim) scratch (see kernel.ts).
+// Design: parse → validate against a whitelist → CODEGEN (not interpret). The hot loop runs
+// the formula millions of times per frame; a tree-walking interpreter would allocate complex
+// intermediates and defeat the JIT, so we emit flat f64 arithmetic on (re, im) pairs — the
+// same shape the assembler's inlined z²+c step has. The user's TEXT never becomes code:
+// only whitelisted operations are ever emitted, so there is no eval of user input (the
+// whitelist is the entire security gate). The emitted body assigns its result to
+// `_cre`/`_cim` — locals declared by the generated loop, which folds them back into z.
 //
 // Surface (v1):
 //   variables   z, c
@@ -36,11 +37,11 @@ type FNode =
 	| { t: "bin"; op: string; a: FNode; b: FNode }
 	| { t: "call"; name: string; a: FNode };
 
-interface FCompileResult { ok: boolean; error?: string; body?: string; refsZ?: boolean; refsC?: boolean; }
+export interface FCompileResult { ok: boolean; error?: string; body?: string; refsZ?: boolean; refsC?: boolean; }
 interface FTok { k: string; v: string; pos: number; }
 
-// Parser/codegen scratch — module globals, safe because a compile runs start-to-finish synchronously
-// on one thread (no reentrancy). Prefixed F_/f to avoid colliding with the other concatenated files.
+// Parser/codegen scratch — module globals, safe because a compile runs start-to-finish
+// synchronously on one thread (no reentrancy).
 let F_TS: FTok[] = [];
 let F_I = 0;
 let F_OUT: string[] = [];   // emitted `const …;` lines
@@ -276,11 +277,11 @@ function fGenPow(aNode: FNode, bNode: FNode): FPair {
 
 //---- public entry ----------------------------------------------------------\\
 
-// Compile formula text to a stepFormula BODY: a sequence of `const …;` lines ending with
-// `_cre = <re>; _cim = <im>;`. The renderer wraps it as `function stepFormula(zx,zy,cx,cy){ … }`
-// (worker) and `new Function("zx","zy","cx","cy", body)` (main thread). On any error returns
+// Compile formula text to a step BODY: a sequence of `const …;` lines ending with
+// `_cre = <re>; _cim = <im>;`. The kernel assembler splices it inline into the generated
+// K2 loop (and the one-step seed probe) on both threads. On any error returns
 // { ok:false, error } with a human-readable message (and 1-based position where known).
-function compileFormula(src: string): FCompileResult {
+export function compileFormula(src: string): FCompileResult {
 	const s = (src || "").trim();
 	if (!s) return { ok: false, error: "empty formula" };
 	if (s.length > 256) return { ok: false, error: "formula too long (max 256 characters)" };

@@ -1,11 +1,13 @@
 {
 	"compilerOptions": {
-		"target": "es2017",
-		"module": "none",
-		"outFile": "index.js",
-		"lib": ["dom", "es2017"],
+		"target": "es2020",
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"lib": ["dom", "es2020"],
 		"strict": true,
-		"noImplicitReturns": true
+		"noImplicitReturns": true,
+		"isolatedModules": true,
+		"noEmit": true
 	},
-	"files": ["kernel.ts", "formula.ts", "palette.ts", "renderer.ts", "index.ts"]
+	"include": ["src"]
 }

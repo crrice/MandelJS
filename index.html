@@ -86,10 +86,7 @@
 				<span class="formula-error" role="alert"></span>
 				<label class="field checkbox"><input class="julia-toggle" type="checkbox" /> julia</label>
 				<label class="field">filter
-					<select class="filter-select">
-						<option value="0">none</option>
-						<option value="1">x-ray rings</option>
-					</select>
+					<select class="filter-select"></select><!-- options generated from the filter registry -->
 				</label>
 				<label class="field filter-param">strands
 					<input class="strands-slider" type="range" min="0.002" max="0.3" step="0.002" value="0.08" />
@@ -138,6 +135,6 @@
 		</div>
 	</main>
 
-	<script src="index.js"></script>
+	<script type="module" src="main.js"></script>
 </body>
 </html>

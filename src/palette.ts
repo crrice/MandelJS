@@ -1,10 +1,11 @@
 //---------------------------------------------------------------------------\\
-// Coloring — a small pluggable palette system, baked into a LUT per render.
+// palette.ts — a small pluggable palette system, baked into a LUT per render.
+// Main-thread only (themeColors reads the DOM); workers receive baked LUTs by message.
 //---------------------------------------------------------------------------\\
 
-type RGB = [number, number, number];
+export type RGB = [number, number, number];
 
-interface Palette {
+export interface Palette {
 	cyclic: boolean;  // DEFAULT wrap (bands) vs clamp (single ramp); user-overridable
 	density: number;  // DEFAULT iterations per gradient cycle / ramp; user-overridable
 	// Build a 1D lookup table (+ in-set color) for the theme and the *effective*
@@ -65,11 +66,12 @@ function stopsPalette(hexes: string[], cyclic: boolean, density: number): Palett
 	};
 }
 
-// A USER-authored palette: arbitrary hex color stops + an explicit in-set color (the interior for
-// escape-time, and the background/miss color for a filter — see filterColor's mapping B). Same bake as
-// stopsPalette, but the interior is user-chosen rather than forced black. buildStopsLut needs ≥2 stops,
-// so a single stop is duplicated into a flat gradient. index.ts rebuilds one of these on every edit.
-function customPalette(hexes: string[], insetHex: string, cyclic: boolean, density: number): Palette {
+// A USER-authored palette: arbitrary hex color stops + an explicit in-set color (the
+// interior for escape-time, and the background/miss color for a filter). Same bake as
+// stopsPalette, but the interior is user-chosen rather than forced black. buildStopsLut
+// needs ≥2 stops, so a single stop is duplicated into a flat gradient. main.ts rebuilds
+// one of these on every edit.
+export function customPalette(hexes: string[], insetHex: string, cyclic: boolean, density: number): Palette {
 	let stops = hexes.map((h) => hexToRgb(h, [0, 0, 0]));
 	if (stops.length === 0) stops = [[0, 0, 0]];
 	if (stops.length === 1) stops = [stops[0], stops[0]];
@@ -83,7 +85,7 @@ function customPalette(hexes: string[], insetHex: string, cyclic: boolean, densi
 	};
 }
 
-const PALETTES: Record<string, Palette> = {
+export const PALETTES: Record<string, Palette> = {
 	// Colorful escape-time bands — the default for the explorer.
 	escape: {
 		cyclic: true,
@@ -139,7 +141,7 @@ const PALETTES: Record<string, Palette> = {
 		["#140a24", "#45206b", "#8a3a8f", "#d05a86", "#f6c9a8"], true, 40),
 };
 
-let currentPalette: Palette = PALETTES.escape;
+export let currentPalette: Palette = PALETTES.escape;
 
 // Read the site's theme colors (falls back to the standalone dark palette when
 // the CSS variables aren't defined).
@@ -151,7 +153,7 @@ function hexToRgb(hex: string, fallback: RGB): RGB {
 	const n = parseInt(h, 16);
 	return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
-function themeColors(): { ink: RGB; paper: RGB } {
+export function themeColors(): { ink: RGB; paper: RGB } {
 	const cs = getComputedStyle(document.documentElement);
 	return {
 		ink: hexToRgb(cs.getPropertyValue("--ink"), [231, 231, 226]),
