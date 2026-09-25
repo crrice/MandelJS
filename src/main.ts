@@ -105,6 +105,7 @@ const dev = window as unknown as {
 	lastGolden?: unknown;
 	mandelPar: (text?: string) => unknown;
 	mandelUrlRT: (qs: string) => string;
+	mandelExport: (width?: number, opts?: { test?: boolean; refine?: boolean }) => Promise<Blob | null>;
 };
 
 dev.mandelBench = async (n = 9) => {
@@ -742,6 +743,7 @@ function applyLayout(): void {
 	const g = computeGeometry(container, VIEW_ASPECT, getResolution());
 	applyGeometry(canvas, easel, g);
 	selector.syncGeometry(g.cssW, g.cssH, VIEW_ASPECT);
+	updateExportDims();   // export heights derive from the aspect; "screen" from the buffer
 }
 function setAspect(_aspect: number): void {
 	applyLayout();
@@ -852,7 +854,7 @@ function renderStops(): void {
 }
 
 if (palAdd) palAdd.addEventListener("click", () => { customStops.push(customStops[customStops.length - 1] || "#ffffff"); renderStops(); applyCustomPalette(); });
-if (palRemove) palRemove.addEventListener("click", () => { if (customStops.length > 2) { customStops.pop(); renderStops(); applyCustomPalette(); } });
+if (palRemove) palRemove.addEventListener("click", () => { if (customStops.length > 1) { customStops.pop(); renderStops(); applyCustomPalette(); } });   // floor 1: single stop = flat color + in-set
 if (palInset) palInset.addEventListener("input", () => applyCustomPalette());
 if (palCyclic) palCyclic.addEventListener("change", () => applyCustomPalette());
 
@@ -1011,7 +1013,25 @@ if (exposureSlider) {   // exposure — instant recolor from the stored accumula
 if (blendSelect) {   // A/B color-mapping method (experimental) — instant recolor
 	blendSelect.addEventListener("change", () => { renderer.recolor({ filterBlend: Number(blendSelect.value) }); syncUrl(); });
 }
+// The monitor's own ratio, snapped to a named preset when it's within rounding noise
+// (screen.width/height are independently-rounded CSS px — a 2560×1600 panel reads
+// 1707/1067 = 1.5998, which IS 16:10). Ratio is dpr-invariant so CSS px are fine.
+const ASPECT_LABELS: [number, string][] = [[2, "2:1"], [1.7777778, "16:9"], [1.6, "16:10"], [1.5, "3:2"], [1.3333333, "4:3"], [1, "1:1"], [2.3333333, "21:9"], [3.5555556, "32:9"]];
+function displayAspect(): { value: string; label: string } {
+	const q = screen.width / screen.height;
+	for (const [v, name] of ASPECT_LABELS) if (Math.abs(q - v) / v < 0.006) return { value: String(v), label: name };
+	return { value: String(Math.round(q * 1e7) / 1e7), label: "≈" + q.toFixed(2) + ":1" };
+}
 if (aspectSelect) {
+	// "display (16:10)" — the monitor's ratio as a first-class aspect choice. The option
+	// VALUE is the concrete number (never a "screen" keyword), so the permalink stays
+	// device-independent; a duplicate of an existing preset value is fine (same ar either
+	// way — restore just highlights the preset row).
+	const d = displayAspect();
+	const o = document.createElement("option");
+	o.value = d.value;
+	o.textContent = "display (" + d.label + ")";
+	aspectSelect.appendChild(o);
 	aspectSelect.addEventListener("change", () => setAspect(Number(aspectSelect.value)));
 }
 // Resolution: how many pixels get computed on THIS device. A device-local preference
@@ -1064,6 +1084,146 @@ if (juliaToggle) {
 }
 updateContextualControls();   // initial state: filter params hidden (filter = none by default)
 
+//---------------------------------------------------------------------------\\
+// Hi-res PNG export: the CURRENT view rendered off-screen at a chosen width via a SECOND
+// RenderPipeline (OffscreenCanvas sink), configured through the same applyEngineState the
+// URL restore uses, run to the SETTLED frame (sharpening + edge AA complete), encoded,
+// downloaded, disposed. State + view are SNAPSHOTTED at click — panning or recoloring
+// mid-export doesn't shift the export. Cancel = destroy the pipeline mid-flight.
+//---------------------------------------------------------------------------\\
+
+const EXPORT_WIDTHS = [1920, 2560, 3840];   // 3840 is the v1 ceiling (~66MB of fields at 2:1)
+let exportPipe: RenderPipeline | null = null;
+
+function setExportStatus(msg: string): void {
+	const el = document.querySelector(".export-status") as HTMLElement | null;
+	if (el) el.textContent = msg;
+}
+
+// (Re)build the dims options: widths at the CURRENT aspect (height = w / VIEW_ASPECT) plus
+// "screen" (the live buffer). DOM-queried per call — applyLayout invokes this and may run
+// before this section's listeners are wired.
+function updateExportDims(): void {
+	const sel = document.querySelector(".export-size") as HTMLSelectElement | null;
+	if (!sel) return;
+	const keep = sel.value;
+	sel.textContent = "";
+	// When the view aspect matches the monitor's, the row at the monitor's width IS its
+	// native resolution — tag it "· display" so the wallpaper choice is self-evident.
+	const dw0 = Math.round(screen.width * devicePixelRatio);
+	const da = Number(displayAspect().value);
+	const aspectMatches = Math.abs(VIEW_ASPECT - da) / da < 0.006;
+	for (const w of EXPORT_WIDTHS) {
+		const o = document.createElement("option");
+		o.value = String(w);
+		o.textContent = w + " × " + Math.round(w / VIEW_ASPECT) + (aspectMatches && Math.abs(w - dw0) <= 8 ? " · display" : "");
+		sel.appendChild(o);
+	}
+	// The device display's PHYSICAL width (CSS px × dpr; exact at 100% browser zoom) at the
+	// current aspect — the "wallpaper for THIS monitor" row. Height still derives from the
+	// view aspect (v1 never reframes), so it fills the display exactly only when the aspect
+	// matches the display's (e.g. 16:10 view on a 2560×1600 panel). Skipped when a fixed
+	// width already covers it — within a few px, because CSS-px × dpr lands off-by-one on
+	// fractional dpr (1707 × 1.5 = 2560.5).
+	if (!EXPORT_WIDTHS.some((w) => Math.abs(w - dw0) <= 8)) {
+		const d = document.createElement("option");
+		d.value = "display";
+		d.textContent = "display (" + dw0 + " × " + Math.round(dw0 / VIEW_ASPECT) + ")";
+		sel.appendChild(d);
+	}
+	const s = document.createElement("option");
+	s.value = "screen";
+	s.textContent = "screen (" + canvas.width + " × " + canvas.height + ")";
+	sel.appendChild(s);
+	sel.value = keep;
+	if (sel.selectedIndex < 0) sel.value = String(EXPORT_WIDTHS[0]);
+}
+
+// Filename = the full permalink, mapped INJECTIVELY to filesystem-safe chars: drop the
+// leading '?', map '*' → '~' — the only Windows-forbidden char URLSearchParams leaves
+// unencoded, while raw '~' never occurs (it %-encodes to %7E). '&'/'=' are legal filename
+// chars and pass through. Recover the URL: prepend '?', map '~' back to '*'. Truncated to
+// a safe length — cx/cy/span lead the schema's emit order, so they always survive.
+function exportFilename(v: View, s: AppState, w: number, h: number): string {
+	const qs = urlFromState(v, s).slice(1).replace(/\*/g, "~");
+	return "fractal_" + qs.slice(0, 150) + "_" + w + "x" + h + ".png";
+}
+
+async function runExport(width: number, test = false, refine = true): Promise<Blob | null> {
+	if (exportPipe) { setExportStatus("an export is already running"); return null; }
+	if (typeof OffscreenCanvas === "undefined") { setExportStatus("not supported in this browser"); return null; }
+	const snapView: View = { ...view };
+	const snapState = currentState();   // a fresh object every call — a true snapshot
+	const w = Math.max(16, Math.round(width));
+	const h = Math.max(16, Math.round(w / VIEW_ASPECT));
+	const exportButton = document.querySelector(".export-button") as HTMLButtonElement | null;
+	const exportCancel = document.querySelector(".export-cancel") as HTMLButtonElement | null;
+	const off = new OffscreenCanvas(w, h);
+	const pipe = new RenderPipeline(new CanvasSink(off), currentPalette);
+	exportPipe = pipe;
+	if (exportButton) exportButton.disabled = true;
+	exportCancel?.classList.remove("hidden");
+	// The export pipeline's own telemetry feeds the status line; phase TRANSITIONS are
+	// surfaced so a long deep-window tail reads as progress, not a hang.
+	pipe.events.on("progress", (p) => {
+		if (p.done) return;
+		if (p.phase === "first frame") setExportStatus("rendering " + w + "×" + h + (p.etaMs ? " · ~" + Math.ceil(p.etaMs / 1000) + "s left" : "…"));
+		else if (p.sharpening) setExportStatus("refining · " + p.working.toLocaleString() + " px left");
+		else setExportStatus(p.phase + "…");
+	});
+	try {
+		applyEngineState(pipe, snapState);
+		// Refinement off = skip the sharpening ladder (the deep-pixel passes that dominate
+		// heavy exports); the AA pass still runs and the frame still settles to done.
+		if (!refine) pipe.configure({ sharpen: false });
+		await pipe.renderSettled(snapView);
+		setExportStatus("encoding…");
+		const blob = await off.convertToBlob({ type: "image/png" });
+		if (!test) {
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement("a");
+			a.href = url;
+			a.download = exportFilename(snapView, snapState, w, h);
+			a.click();
+			setTimeout(() => URL.revokeObjectURL(url), 10_000);
+		}
+		setExportStatus("saved " + w + "×" + h + " (" + (blob.size / (1024 * 1024)).toFixed(1) + " MB)");
+		return blob;
+	} catch {
+		setExportStatus("cancelled");
+		return null;
+	} finally {
+		pipe.destroy();
+		exportPipe = null;
+		if (exportButton) exportButton.disabled = false;
+		exportCancel?.classList.add("hidden");
+	}
+}
+
+{
+	const exportButton = document.querySelector(".export-button") as HTMLButtonElement | null;
+	const exportCancel = document.querySelector(".export-cancel") as HTMLButtonElement | null;
+	const exportSize = document.querySelector(".export-size") as HTMLSelectElement | null;
+	if (exportButton) {
+		updateExportDims();
+		exportButton.addEventListener("click", () => {
+			const v = exportSize ? exportSize.value : "1920";
+			const w = v === "screen" ? canvas.width : v === "display" ? Math.round(screen.width * devicePixelRatio) : Number(v);
+			const refineBox = document.querySelector(".export-refine") as HTMLInputElement | null;
+			void runExport(w, false, refineBox ? refineBox.checked : true);
+		});
+	}
+	if (exportCancel) {
+		exportCancel.classList.add("hidden");
+		exportCancel.addEventListener("click", () => exportPipe?.destroy());
+	}
+}
+
+// Console hook: await mandelExport(800, {test:true}) returns the PNG blob without the
+// download click — the automation gate decodes + dimension-checks it. {refine:false}
+// skips the sharpening ladder (AA still runs).
+dev.mandelExport = (width = 1920, opts) => runExport(width, !!(opts && opts.test), !(opts && opts.refine === false));
+
 // ---- Permalink restore + first render. Runs LAST (all controls + renderer methods
 // exist). The schema (config.ts) parses the URL into an AppState; applyFullState pushes
 // it into the controls + renderer (no change events → no premature renders/syncs), then
@@ -1073,29 +1233,69 @@ function restoreFromUrl(): void {
 	applyFullState(stateFromUrl(location.search));
 }
 
+// The ONE state→engine mapping: push a parsed AppState into a RenderPipeline — configure
+// + recolor calls only, no DOM, no navigation. Parameterized by target so the URL restore,
+// .par import, AND the hi-res exporter share it: a fresh pipeline configured from the same
+// state renders the same image. Call ORDER mirrors the old restore exactly: formula →
+// filter → blend → palette → density override → coloring → cap → set type.
+function applyEngineState(target: RenderPipeline, s: AppState): void {
+	// Formula: custom text or preset, both through the same compile path.
+	if (s.formulaKey === "custom") {
+		const res = compileFormula(s.expr);
+		if (res.ok && res.body) target.configure({ formula: { body: res.body } });
+	} else {
+		const preset = PRESETS[s.formulaKey];
+		if (preset && preset.formula) {
+			const res = compileFormula(preset.formula);   // presets are known-valid, but guard anyway
+			if (res.ok && res.body) target.configure({ formula: { body: res.body } });
+		} else {
+			target.configure({ formula: { id: FORMULA_MANDEL } });   // "0" → standard z²+c (Kernel 1)
+		}
+	}
+	// Filter + params, then the A/B blend method.
+	target.configure({ filter: { id: Number(s.filterId) || 0, dStrands: Number(s.strands), dFactor: Number(s.exposure) } });
+	target.recolor({ filterBlend: Number(s.blend) });
+	// Coloring: palette (resets density to its default) → density override → transfer mode.
+	if (s.paletteKey === "custom") {
+		target.recolor({ palette: customPalette(s.stops, s.inset, s.cyclic, CUSTOM_DENSITY) });
+	} else if (s.paletteKey !== "escape" && PALETTES[s.paletteKey]) {
+		target.recolor({ palette: PALETTES[s.paletteKey] });
+	}
+	const palDefault = s.paletteKey === "custom" ? CUSTOM_DENSITY : (PALETTES[s.paletteKey] ? PALETTES[s.paletteKey].density : -1);
+	if (Number(s.density) !== palDefault) target.recolor({ density: Number(s.density) });
+	if (s.coloring === "distance") target.recolor({ coloring: { mode: 1, bandMap: 0 } });
+	else target.recolor({ coloring: { mode: 0, bandMap: s.coloring === "sqrt" ? 1 : s.coloring === "log" ? 2 : 0 } });
+	// Forced iteration cap — applied before the first render.
+	target.configure({ iterCap: s.cap });
+	// Set type + seed.
+	target.configure({ setType: s.juliaOn ? { julia: true, cx: s.juliaX, cy: s.juliaY } : { julia: false } });
+}
+
 // Apply a parsed {state, rawView} to the controls + renderer + navigation, then render
-// once. Application ORDER matters and mirrors the old restore: aspect first (it resizes
-// the canvas, and spanY derives from CANVAS_ASPECT), then formula, filter, coloring, cap,
-// and finally the view + set type.
+// once. Aspect first (it resizes the canvas, and spanY derives from VIEW_ASPECT); controls
+// are written without change events (no premature renders/syncs); the engine half is ONE
+// applyEngineState call — shared with .par import and the exporter.
 function applyFullState({ state: s, rawView }: { state: AppState; rawView: RawView | null }): void {
-	// Aspect first (it sets VIEW_ASPECT, which the view's spanY derives from).
+	// Aspect first (it sets VIEW_ASPECT, which the view's spanY derives from). An ar value
+	// with no matching option (a display-ratio permalink from another device, or a
+	// hand-edited URL) gets one materialized — otherwise the select rejects the assignment
+	// and the view silently reframes to the previous aspect, breaking the permalink.
+	if (aspectSelect && s.aspect !== "2" && !Array.from(aspectSelect.options).some((o) => o.value === s.aspect)) {
+		const o = document.createElement("option");
+		o.value = s.aspect;
+		o.textContent = "custom (" + Number(s.aspect).toFixed(2) + ":1)";
+		aspectSelect.appendChild(o);
+	}
 	if (aspectSelect) aspectSelect.value = s.aspect;
 	applyLayout();
 
-	// Formula (+ custom text).
+	// Controls reflect the state.
 	if (formulaSelect) formulaSelect.value = s.formulaKey;
-	applyFormulaFromControls(s.formulaKey === "custom" ? s.expr : null);
-
-	// Filter + params. Control values come from the state; pushFilter reads the controls,
-	// preserving the old select-rejects-unknown-value semantics.
+	if (s.formulaKey === "custom" && formulaInput) formulaInput.value = s.expr;
 	if (filterSelect) filterSelect.value = s.filterId;
 	if (strandsSlider) strandsSlider.value = s.strands;
 	if (exposureSlider) exposureSlider.value = s.exposure;
 	if (blendSelect) blendSelect.value = s.blend;
-	pushFilter();
-	if (blendSelect) renderer.recolor({ filterBlend: Number(blendSelect.value) });
-
-	// Coloring: palette (resets density to its default) → density override → transfer mode.
 	if (s.paletteKey === "custom") {
 		if (paletteSelect) paletteSelect.value = "custom";
 		customStops = s.stops.slice();
@@ -1103,25 +1303,23 @@ function applyFullState({ state: s, rawView }: { state: AppState; rawView: RawVi
 		if (palCyclic) palCyclic.checked = s.cyclic;
 		paletteEditor?.classList.remove("hidden");
 		renderStops();
-		renderer.recolor({ palette: buildCustomPalette() });
 		updatePalBar();
 		if (densitySlider) densitySlider.value = String(CUSTOM_DENSITY);
 	} else if (s.paletteKey !== "escape" && paletteSelect && PALETTES[s.paletteKey]) {
 		paletteSelect.value = s.paletteKey;
-		renderer.recolor({ palette: PALETTES[s.paletteKey] });
 		if (densitySlider) densitySlider.value = String(PALETTES[s.paletteKey].density);
 	}
 	const palDefault = s.paletteKey === "custom" ? CUSTOM_DENSITY : (PALETTES[s.paletteKey] ? PALETTES[s.paletteKey].density : -1);
-	if (Number(s.density) !== palDefault && densitySlider) {
-		densitySlider.value = s.density;
-		renderer.recolor({ density: Number(s.density) });
-	}
+	if (Number(s.density) !== palDefault && densitySlider) densitySlider.value = s.density;
 	if (coloringSelect) coloringSelect.value = s.coloring;
-	applyColoringFromControls();
-
-	// Forced iteration cap — applied before the first render.
 	if (itercapInput) itercapInput.value = s.cap != null ? String(s.cap) : "";
-	renderer.configure({ iterCap: currentIterCap() });
+	// Formula error/note pill (the engine install happens in applyEngineState).
+	if (s.formulaKey === "custom") {
+		const res = compileFormula(s.expr);
+		showFormulaError(!res.ok ? res.error || "invalid formula" : res.refsC === false && !s.juliaOn ? "note: no c — every point is identical" : "");
+	}
+
+	applyEngineState(renderer, s);
 
 	// View + set type. spanY derives from the REQUESTED aspect — the same window on
 	// every device regardless of the buffer's pixel count.
@@ -1133,13 +1331,11 @@ function applyFullState({ state: s, rawView }: { state: AppState; rawView: RawVi
 		inJulia = true;
 		if (juliaToggle) juliaToggle.checked = true;
 		currentSeed = { cx: s.juliaX, cy: s.juliaY };
-		renderer.configure({ setType: { julia: true, cx: s.juliaX, cy: s.juliaY } });
 		view = urlView || defaultJuliaView();
 		jBundle = { seed: seedKey(s.juliaX, s.juliaY), view, history: [] };
 	} else {
 		inJulia = false;
 		if (juliaToggle) juliaToggle.checked = false;
-		renderer.configure({ setType: { julia: false } });
 		view = urlView || defaultViewFor();
 	}
 

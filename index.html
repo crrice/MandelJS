@@ -106,6 +106,7 @@
 						<option value="1.5">3:2</option>
 						<option value="1.3333333">4:3</option>
 						<option value="1.7777778">16:9</option>
+						<option value="1.6">16:10</option>
 						<option value="1">1:1</option>
 					</select>
 				</label>
@@ -129,6 +130,23 @@
 						<option value="native2x">native ×2</option>
 					</select>
 				</label>
+			</div>
+		</details>
+
+		<details class="ctrl-section">
+			<summary>export</summary>
+			<div class="ctrl-body">
+				<label class="field" title="Render the current view off-screen at this resolution and download it as a PNG. The export waits for the fully refined, anti-aliased frame — deep views can take minutes at 4K; the status line tracks progress. The filename encodes the permalink.">size
+					<select class="export-size"></select><!-- options derived from the current aspect -->
+				</label>
+				<label class="field checkbox" title="Checked: the export waits for the fully sharpened frame (deep pixels resolved — can take minutes on heavy views). Unchecked: skip that refinement — first pass + anti-aliasing only, much faster; any unresolved deep pixels keep their provisional look.">
+					<input class="export-refine" type="checkbox" checked /> full refine
+				</label>
+				<div class="export-row">
+					<button class="btn export-button" type="button">export PNG</button>
+					<button class="btn export-cancel hidden" type="button">cancel</button>
+				</div>
+				<span class="export-status" aria-live="polite"></span>
 			</div>
 		</details>
 

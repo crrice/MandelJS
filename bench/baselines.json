@@ -1,0 +1,45 @@
+{
+	"expect": {
+		"f64": {
+			"iters": 308142945,
+			"esc": 12709,
+			"ins": 0,
+			"per": 28147,
+			"cap": 10344
+		},
+		"dd": {
+			"iters": 30101259,
+			"esc": 4148,
+			"ins": 0,
+			"per": 61,
+			"cap": 399
+		},
+		"pert": {
+			"iters": 211784763,
+			"esc": 26144,
+			"ins": 0,
+			"per": 386,
+			"cap": 2270
+		},
+		"k2-formula": {
+			"iters": 15650586,
+			"esc": 10617,
+			"ins": 0,
+			"per": 0,
+			"cap": 183
+		}
+	},
+	"machines": {
+		"Jupiter": {
+			"cpu": "12th Gen Intel(R) Core(TM) i7-12700H",
+			"node": "v22.14.0",
+			"captured": "2026-07-29",
+			"ms": {
+				"f64": 1282.1,
+				"dd": 930,
+				"pert": 1562.3,
+				"k2-formula": 2246.3
+			}
+		}
+	}
+}

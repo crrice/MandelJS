@@ -8,6 +8,7 @@
 		"watch": "node build.mjs --watch",
 		"typecheck": "tsc --noEmit",
 		"golden": "node build.mjs && node bench/golden.mjs",
+		"bench": "node build.mjs && node bench/perf.mjs",
 		"test": "node build.mjs && node --test \"tests/*.test.mjs\"",
 		"serve": "http-server dist -c-1 -p 8080"
 	},

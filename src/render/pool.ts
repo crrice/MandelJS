@@ -67,6 +67,17 @@ export class WorkerPool {
 		for (let i = 0; i < this.workers.length; i++) { this.workers[i].terminate(); this.spawn(i); }
 	}
 
+	// Terminate every worker PERMANENTLY — no respawn, no further callbacks. For
+	// short-lived pipelines (the hi-res exporter): their workers exist only for the
+	// export's lifetime, and terminating mid-flight IS the cancel mechanism.
+	public destroyAll(): void {
+		for (const w of this.workers) w.terminate();
+		this.workers = [];
+		this.idle = [];
+		this.queue = [];
+		this.makeMsg = null;
+	}
+
 	// Free workers still busy on a superseded frame's discarded tiles (no-op when idle).
 	public supersede(): void {
 		for (let i = 0; i < this.workers.length; i++) {

@@ -19,6 +19,9 @@ Zero runtime dependencies — esbuild bundles `src/` into a static page (`dist/`
     npm run typecheck # tsc --noEmit over src/
     npm run test      # node:test component suites (phase machine, field scans, config)
     npm run golden    # bit-exact field regression against goldens/p0-goldens.json
+    npm run bench     # standing perf gate: deterministic kernel workloads, min-of-7,
+                      # machine-keyed baselines (bench/baselines.json); iteration counts
+                      # asserted exactly. Record a machine: node bench/perf.mjs --update
 
 ## Layout
 

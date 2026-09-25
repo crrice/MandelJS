@@ -147,7 +147,9 @@ const ROWS: ParamRow[] = [
 				const stopsParam = p.get("stops");
 				if (stopsParam) {
 					const parsed = stopsParam.split("-").map((h) => "#" + h).filter((h) => /^#[0-9a-fA-F]{6}$/.test(h));
-					if (parsed.length >= 2) s.stops = parsed;
+					// ≥1: a single stop is legal (customPalette flattens it into a constant
+					// gradient — one color + the in-set color = a two-tone palette).
+					if (parsed.length >= 1) s.stops = parsed;
 				}
 				if (/^[0-9a-fA-F]{6}$/.test(p.get("inset") || "")) s.inset = "#" + p.get("inset");
 				s.cyclic = p.get("cyc") !== "0";

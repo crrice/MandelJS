@@ -5,6 +5,7 @@ export * from "./kernel/kernel";
 export * from "./kernel/assemble";
 export * from "./math/dd";
 export { FILTERS } from "./filters/index";
+export { customPalette, PALETTES } from "./palette";   // DOM-free bakes (themeColors is NOT re-exported)
 export * from "./config";
 export { compileFormula } from "./formula";
 export { FieldStore } from "./render/field";

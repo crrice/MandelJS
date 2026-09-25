@@ -204,6 +204,8 @@ export class RenderPipeline {
 	private lastMs = 0;
 	private ffEstIters = 0;
 	private onComplete: (() => void) | null = null;
+	private settledCb: { resolve: () => void; reject: (e: Error) => void } | null = null;
+	private destroyed = false;
 
 	private kernelKey = "";
 
@@ -469,6 +471,31 @@ export class RenderPipeline {
 		});
 	}
 
+	// Resolve at the SETTLED frame — the phase machine's "done" (sharpening + edge AA
+	// complete), not renderAndWait's first-generation completion. The exporter's wait.
+	// Rejects on destroy() so a cancelled export never hangs on a dead pipeline.
+	public renderSettled(view: View): Promise<void> {
+		return new Promise((resolve, reject) => {
+			if (this.destroyed || this.pool.size === 0) { reject(new Error("pipeline unavailable")); return; }
+			this.settledCb = { resolve, reject };
+			this.render(view);
+		});
+	}
+
+	// Tear down permanently: terminate the workers (mid-flight termination IS the cancel
+	// mechanism — no more messages, no more phase advances) and fail any pending settle.
+	public destroy(): void {
+		this.destroyed = true;
+		this.pool.destroyAll();
+		const cb = this.settledCb; this.settledCb = null;
+		if (cb) cb.reject(new Error("cancelled"));
+	}
+
+	private notifyDone(): void {
+		const cb = this.settledCb; this.settledCb = null;
+		if (cb) cb.resolve();
+	}
+
 	private beginGeneration(maxIters: number, tiles: TileJob[]): void {
 		this.maxIters = maxIters;
 		this.telemetry.maxIters = maxIters;
@@ -586,9 +613,20 @@ export class RenderPipeline {
 			this.phase = { kind: "done" };
 			this.telemetry.progress({ working: 0, abandoned: this.undetermined, sharpening: false, done: true, phase: "done" });
 			this.telemetry.emitStats(true);
+			this.notifyDone();
 			return;
 		}
-		if (!this.sharpenOn) return;   // bench mode: freeze at the initial frame
+		if (!this.sharpenOn) {
+			// Bench/dump (renderAndWait) FREEZE at the initial frame — the golden protocol.
+			// A settled-frame wait (export with refinement off) still finishes: skip the
+			// ladder, run the AA pass, reach done so the promise resolves. Capped pixels
+			// stay unresolved — the honest initial-frame look at the export's resolution.
+			if (!this.settledCb) return;
+			this.undetermined = this.field.scanCapped(TILE_W, TILE_H).count;
+			this.telemetry.emitStats(true);
+			this.startSSAAOrSettle();
+			return;
+		}
 		// Forced cap: no sharpening ladder — still-capped pixels ARE the interior; jump to AA.
 		if (this.iterCapForced != null) {
 			this.undetermined = this.field.scanCapped(TILE_W, TILE_H).count;
@@ -624,6 +662,7 @@ export class RenderPipeline {
 		const settle = (): void => {
 			this.phase = { kind: "done" };
 			this.telemetry.progress({ working: 0, abandoned: this.undetermined, sharpening: false, done: true, phase: "done" });
+			this.notifyDone();
 		};
 		if (!this.ssaaRefine || this.phase.kind === "ssaa") { settle(); return; }
 		this.pushColorState();

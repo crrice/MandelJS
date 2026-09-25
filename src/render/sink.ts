@@ -14,12 +14,14 @@ export interface RenderSink {
 	editFrame(): { data32: Uint32Array; commit(): void };
 }
 
-// The on-screen canvas sink. Dimensions are live reads, so a canvas resize (aspect
-// selector, tierazon) is picked up by the next render without any resize protocol.
+// The canvas sink — on-screen (HTMLCanvasElement) or off-screen (OffscreenCanvas, the
+// hi-res exporter): the 2d-context surface this uses is identical on both. Dimensions
+// are live reads, so a canvas resize (aspect selector, tierazon) is picked up by the
+// next render without any resize protocol.
 export class CanvasSink implements RenderSink {
-	private ctx: CanvasRenderingContext2D;
-	public constructor(private canvas: HTMLCanvasElement) {
-		this.ctx = canvas.getContext("2d")!;
+	private ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+	public constructor(private canvas: HTMLCanvasElement | OffscreenCanvas) {
+		this.ctx = (canvas as HTMLCanvasElement).getContext("2d")!;
 	}
 	public get width(): number { return this.canvas.width; }
 	public get height(): number { return this.canvas.height; }
