@@ -923,7 +923,7 @@ Causes of the remaining mismatch:
 
 **Mandel family and escape-time options**
 - params ≠ 0: z0 = c + p. [SRC]
-- type=julia: z0 = pixel and c = params. StandardFractal starts coloriter at −1: P00/calcfrac.c#L1703-1704 `if(fractype==JULIAFP || fractype==JULIA)` / `coloriter = -1;`. The count convention therefore differs by one from mandel. [SRC; verify before implementing]
+- type=julia: z0 = pixel and c = params. StandardFractal starts coloriter at −1: P00/calcfrac.c#L1703-1704 `if(fractype==JULIAFP || fractype==JULIA)` / `coloriter = -1;`. The count convention therefore differs by one from mandel. calcmandfp agrees (calmanp5.asm dojulia_p5: ecx = maxit with no `dec`, z1 computed before the loop, count = maxit − ecx with the zero-fix to 1): an escape at step k counts max(1, k − 1), and z_maxit is still tested. [SRC; implemented in the Kernel 2 Fractint shape for z²+c Julia]
 - float=n, the DOS default after reset: 32-bit fixed-point iteration (calcmand) with an automatic int→float switch governed by mathtolerance[0]. MandelJS should render in float and warn. [SRC] cmdfiles.c#L727-728
 - `bailout=N`: rqlim = N, compared against |z|² (not |z|). Precedence: potential param[2] > bailout= > biomorph (100) > type default (4). Integer types clamp rqlim to ≤127. [SRC] fracsubr.c#L268-278
 - bailoutest=real/imag/or/and/manh/manr tests, respectively, x² ≥ r; y² ≥ r; x² or y² ≥ r; x² and y² ≥ r; (|x|+|y|)² ≥ r; (x+y)² ≥ r. Any test other than mod forces StandardFractal. [SRC] P04/fractals.c#L184-257

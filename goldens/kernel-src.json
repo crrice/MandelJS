@@ -502,5 +502,33 @@
 		"k1pert": "1adba27a",
 		"k2": "125983a8",
 		"probeStep": "46cf80f1"
+	},
+	"p1|mandel|t0|j1|b2": {
+		"k1f64": "7fe0ea68",
+		"k1dd": "a2b82686",
+		"k1pert": "c3caae19",
+		"k2": "46369396",
+		"probeStep": "b7167373"
+	},
+	"p1|tierazon|t0|j1|b2": {
+		"k1f64": "7fe0ea68",
+		"k1dd": "a2b82686",
+		"k1pert": "c3caae19",
+		"k2": "9d567c42",
+		"probeStep": "46cf80f1"
+	},
+	"p0|mandel|t0|j1|b2": {
+		"k1f64": "966048d0",
+		"k1dd": "3397128c",
+		"k1pert": "c59067b4",
+		"k2": "c1647c93",
+		"probeStep": "b7167373"
+	},
+	"p0|tierazon|t0|j1|b2": {
+		"k1f64": "966048d0",
+		"k1dd": "3397128c",
+		"k1pert": "c59067b4",
+		"k2": "095c6adf",
+		"probeStep": "46cf80f1"
 	}
 }

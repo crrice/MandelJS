@@ -260,6 +260,12 @@ export function urlFromState(view: View, s: AppState): string {
 	return "?" + p.toString();
 }
 
+// A usable skew lies strictly inside ±90° (tan(skew) scales the frame's second axis;
+// Fractint's own range is about ±89).
+export function validSkew(skew: number): boolean {
+	return skew > -90 && skew < 90;
+}
+
 // Parse a query string into a fresh state (+ the raw view, null when absent/invalid).
 // Validation rules mirror the old restoreFromUrl exactly; missing params keep defaults, so
 // bare and legacy ?cx&cy&span links load unchanged.
@@ -273,7 +279,7 @@ export function stateFromUrl(qs: string): { state: AppState; rawView: RawView | 
 	const rawView = (isFinite(cx) && isFinite(cy) && isFinite(span) && span > 0)
 		? {
 			cx, cxLo: isFinite(cxLo) ? cxLo : 0, cy, cyLo: isFinite(cyLo) ? cyLo : 0, span,
-			rot: isFinite(rot) ? rot : 0, skew: isFinite(skew) ? skew : 0, xmag: isFinite(xmag) && xmag !== 0 ? xmag : 1,
+			rot: isFinite(rot) ? rot : 0, skew: validSkew(skew) ? skew : 0, xmag: isFinite(xmag) && xmag !== 0 ? xmag : 1,
 		}
 		: null;
 	return { state, rawView };

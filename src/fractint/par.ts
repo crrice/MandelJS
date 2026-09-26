@@ -54,11 +54,17 @@ export function parseParFile(text: string): ParFile {
 		}
 		i++;
 		if (!closed) out.errors.push("\"" + name + "\": missing closing }");
+		// A name ends at '(' or whitespace, as Fractint's entry scan does: `frm:Name(XAXIS) {`
+		// carries a symmetry suffix that is not part of the name.
 		const colon = name.indexOf(":");
-		if (colon >= 0) out.blocks.push({ kind: name.slice(0, colon).toLowerCase(), name: name.slice(colon + 1).trim(), body: raw.join("\n") });
-		else out.entries.push(entryFromBody(name, raw));
+		if (colon >= 0) out.blocks.push({ kind: name.slice(0, colon).toLowerCase(), name: entryName(name.slice(colon + 1)), body: raw.join("\n") });
+		else out.entries.push(entryFromBody(entryName(name), raw));
 	}
 	return out;
+}
+
+function entryName(s: string): string {
+	return s.trim().split(/[\s(]/)[0];
 }
 
 function entryFromBody(name: string, raw: string[]): ParEntry {

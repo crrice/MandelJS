@@ -70,6 +70,17 @@ function snapshot() {
 			}
 		}
 	}
+	// Fractint counting on a Julia (type=julia's count for z²+c, C8): NEW labels only.
+	for (const usePeriod of [true, false]) {
+		for (const name of ["mandel", "tierazon"]) {
+			const formulaBody = FORMULAS[name] != null ? compileFormula(FORMULAS[name]).body : null;
+			const label = "p" + (usePeriod ? 1 : 0) + "|" + name + "|t0|j1|b2";
+			const { srcs } = assembleAll({ usePeriod, formulaBody, filterId: 0, juliaMode: true, bailR: 2 });
+			const row = {};
+			for (const k of Object.keys(srcs)) row[k] = djb2(srcs[k]);
+			out[label] = row;
+		}
+	}
 	return out;
 }
 

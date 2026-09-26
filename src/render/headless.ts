@@ -54,8 +54,9 @@ export function setupHeadless(state: AppState, rawView: RawView | null, W: numbe
 	const filterId = Number(state.filterId) || 0;
 	const usePeriod = !opts.noperiod;
 	const z0 = state.z0 === "" || compileZ0(state.z0).ok ? state.z0 : "";
-	const k2 = formulaBody != null || state.juliaOn || filterId !== 0 || z0NeedsK2(z0);
-	installKernels(assembleAll({ usePeriod, formulaBody, filterId, juliaMode: state.juliaOn, ...escapeSpec(z0, state.bail, k2, state.juliaOn) }).srcs);
+	const k2 = formulaBody != null || state.juliaOn || filterId !== 0 || z0NeedsK2(z0, state.bail);
+	const counts = (state.discrete || state.logmap !== 0) && filterId === 0;
+	installKernels(assembleAll({ usePeriod, formulaBody, filterId, juliaMode: state.juliaOn, ...escapeSpec(z0, state.bail, k2, state.juliaOn, counts) }).srcs);
 
 	const useDD = k2 ? false : useDDFor(view, W);
 	const usePert = useDD;

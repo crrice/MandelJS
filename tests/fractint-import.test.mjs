@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
 	stateFromPar, compileFormula, compileZ0, logmapTable, colorWrap, viewFrame, ddFromDecimal, ddToDecimal,
+	parFromState, parseParFile, parGet, parBlock, stateFromUrl, z0NeedsK2, escapeSpec,
 } from "../dist/node-lib.js";
 
 const read = (name) => readFileSync(new URL("../par/" + name, import.meta.url), "utf8");
@@ -36,6 +37,7 @@ test("midgetbrot.par: mandel, rotated, map palette, Fractint counting", () => {
 	assert.equal(s.logmap, 0);
 	assert.equal(s.discrete, true);
 	assert.equal(s.palBlend, false);
+	assert.equal(s.coloring, "linear");
 	assert.equal(s.aa, true);
 	const keys = report.map((r) => r.key + ":" + r.level);
 	assert.ok(keys.includes("periodicity:ignored"));
@@ -113,12 +115,22 @@ test("mandel params / bailout, julia, inside=maxiter through logmap", () => {
 	const j = stateFromPar("J { reset=2004 type=julia params=-0.8/0.156 center-mag=0/0/0.6667 }");
 	assert.equal(j.state.juliaOn, true);
 	assert.deepEqual([j.state.juliaX, j.state.juliaY, j.state.bail, j.state.z0, j.state.cap], [-0.8, 0.156, 2, "", 150]);
-	assert.ok(j.report.some((r) => r.key === "type" && r.level === "approximated"));
+	assert.ok(j.report.some((r) => r.key === "type" && r.level === "applied" && /julia convention/.test(r.msg)));
 	const map = "000zzz<253>000";
 	const lm = stateFromPar("L { reset=2004 type=mandel maxiter=1000 inside=maxiter logmap=538 colors=" + map + " }").state;
 	assert.equal(lm.mapInside, logmapTable(538, 1000)[1000]);
 	assert.equal(stateFromPar("N { reset=2004 type=mandel maxiter=1000 inside=maxiter colors=" + map + " }").state.mapInside, colorWrap(1000));
 	assert.equal(stateFromPar("I { reset=2004 type=mandel inside=7 colors=" + map + " }").state.mapInside, 7);
+	// A numeric inside ≥ 256 wraps onto 1..255 as plot_pixel does (C5.8).
+	assert.equal(stateFromPar("I { reset=2004 type=mandel inside=300 colors=" + map + " }").state.mapInside, 45);
+	assert.equal(stateFromPar("I { reset=2004 type=mandel inside=256 colors=" + map + " }").state.mapInside, 1);
+	// bailout= is an integer rqlim (fractional parts truncated), at least 1.
+	assert.equal(stateFromPar("R { reset=2004 type=mandel bailout=4.5 }").state.bail, 2);
+	assert.match(stateFromPar("R { reset=2004 type=mandel bailout=0.5 }").error, /at least 1/);
+	// A skew outside ±90° cannot frame a window: reported, read as 0.
+	const sk = stateFromPar("K { reset=2004 type=mandel center-mag=0/0/1/1/0/90 }");
+	assert.equal(sk.rawView.skew, 0);
+	assert.ok(sk.report.some((r) => r.key === "center-mag" && r.level === "unsupported"));
 	const bof = stateFromPar("B { reset=2004 type=mandel inside=bof60 outside=real potential=255/2000/0 }").report;
 	assert.deepEqual(bof.filter((r) => r.level === "unsupported").map((r) => r.key), ["inside", "outside", "potential"]);
 });
@@ -135,6 +147,10 @@ test("refusals and warnings: unsupported type, missing frm block, missing reset=
 	assert.equal(ok.state.z0, "c");
 	assert.equal(ok.state.bail, 2);
 	assert.ok(ok.report.some((r) => r.key === "reset" && r.level === "approximated"));
+	// A symmetry suffix on the block header is not part of its name; comments may hold braces.
+	const sym = stateFromPar("F { type=formula formulaname=Sq }\nfrm:Sq(XAXIS) { ; note {x}\n z=pixel: z=sqr(z)+pixel, |z|<4 }");
+	assert.equal(sym.error, undefined);
+	assert.equal(sym.state.expr, "z^2 + c");
 	const bad = stateFromPar("F { reset=2004 type=formula formulaname=If }\nfrm:If { z=0: if(z<1) z=z*z+pixel endif, |z|<4 }");
 	assert.match(bad.error, /cannot be translated/);
 	assert.ok(bad.report.some((r) => r.level === "unsupported"));
@@ -148,4 +164,42 @@ test("multi-entry files: pick an entry by name; the ; mandeljs: line wins over t
 	assert.equal(both.state.cap, 77);
 	assert.equal(both.state.discrete, false);
 	assert.deepEqual(both.report, []);
+});
+
+test("export: Fractint-safe names, the engine's escape radius, the heuristic seed", () => {
+	const par = (qs, name = "t", seedAtC = false) => {
+		const { state, rawView } = stateFromUrl(qs);
+		const view = { cx: rawView.cx, cxLo: rawView.cxLo, cy: rawView.cy, cyLo: rawView.cyLo, spanX: rawView.span, spanY: 0 };
+		return parseParFile(parFromState(name, view, state, seedAtC));
+	};
+	// Names: [A-Za-z0-9_.-] only, at most 18 characters (ITEMNAMELEN), entry and formula alike.
+	const named = par("?cx=0&cy=0&span=4&f=cubic", "A long (name); {x}");
+	assert.equal(named.entries[0].name, "A_long__name____x_");
+	assert.equal(parGet(named.entries[0], "formulaname"), "A_long__name____x_");
+	assert.ok(parBlock(named, "frm", "A_long__name____x_"));
+	assert.equal(par("?cx=0&cy=0&span=4", "A_long_descriptive_name").entries[0].name, "A_long_descriptive");
+	// The radius the engine escapes at: 16 on Kernel 1, 2 on Kernel 2, else the bailout.
+	const rq = (qs) => parGet(par(qs).entries[0], "bailout");
+	assert.equal(rq("?cx=0&cy=0&span=4"), "256");
+	assert.equal(rq("?cx=0&cy=0&span=4&z0=c"), "256");
+	assert.equal(rq("?cx=0&cy=0&span=4&z0=c&bail=2"), null);
+	assert.equal(rq("?cx=0&cy=0&span=4&j=1&jx=-0.8&jy=0.156"), null);
+	assert.equal(rq("?cx=0&cy=0&span=4&bail=3"), "9");
+	assert.match(par("?cx=0&cy=0&span=4&z0=0").blocks[0].body, /\|z\| < 256/);
+	assert.match(par("?cx=0&cy=0&span=4&f=cubic").blocks[0].body, /\|z\| < 4/);
+	// A blank z₀ writes the seed the renderer used (z₀ = c for a formula singular at 0).
+	const inv = "?cx=0&cy=0&span=4&f=custom&expr=1%2Fz+%2B+c";
+	assert.match(par(inv).blocks[0].body, /^z=0:/m);
+	assert.match(par(inv, "t", true).blocks[0].body, /^z=pixel:/m);
+});
+
+test("z₀ = c under a radius below 2 runs on Kernel 2; skew stays inside ±90°", () => {
+	assert.equal(z0NeedsK2("c"), false);
+	assert.equal(z0NeedsK2("c", 2), false);
+	assert.equal(z0NeedsK2("c", 1), true);
+	assert.equal(z0NeedsK2("0", 1), false);
+	assert.deepEqual(escapeSpec("c", 1, true, false), { bailR: 1, z0Body: compileZ0("c").body });
+	assert.equal(stateFromUrl("?cx=0&cy=0&span=4&skew=90").rawView.skew, 0);
+	assert.equal(stateFromUrl("?cx=0&cy=0&span=4&skew=-1e300").rawView.skew, 0);
+	assert.equal(stateFromUrl("?cx=0&cy=0&span=4&skew=89.5").rawView.skew, 89.5);
 });

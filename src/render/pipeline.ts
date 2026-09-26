@@ -95,19 +95,24 @@ export function z0Key(z0: string): string {
 }
 
 // Kernel 1 serves z₀ "0" and "c" (the z²+c fast path with DD/perturbation); any other z₀
-// needs Kernel 2's baked expression.
-export function z0NeedsK2(z0: string): boolean {
+// needs Kernel 2's baked expression. So does "c" under a radius below 2: Kernel 1 runs that
+// orbit from 0 and so also tests z₀ = c itself, which Fractint never does (it only agrees
+// while |c| ≥ R implies |c² + c| ≥ R, i.e. R ≥ 2).
+export function z0NeedsK2(z0: string, bail: number | null = null): boolean {
 	const k = z0Key(z0);
-	return k !== "" && k !== "0" && k !== "c";
+	return k !== "" && k !== "0" && (k !== "c" || (bail != null && bail < 2));
 }
 
 // The escape settings → the KernelSpec fields. z₀ "" with bail null is today's semantics:
 // no fields, so the default kernels stay byte-identical. Anything set → Fractint's (C3.2/
 // C4.4), with R = bail or today's radius for the kernel in use (16 on Kernel 1, 2 on Kernel
 // 2). Kernel 2 bakes the compiled z₀ for Mandelbrot only — a Julia z₀ is the pixel.
-export function escapeSpec(z0: string, bail: number | null, k2: boolean, julia: boolean): Pick<KernelSpec, "bailR" | "seedC" | "z0Body"> {
+// counts (discrete or logmap coloring) needs the integer escape count, which only Fractint
+// counting carries (floor(mu) of the smooth value is not the count, C3.5): it switches the
+// counting on at today's radius.
+export function escapeSpec(z0: string, bail: number | null, k2: boolean, julia: boolean, counts = false): Pick<KernelSpec, "bailR" | "seedC" | "z0Body"> {
 	const k = z0Key(z0);
-	if (k === "" && bail == null) return {};
+	if (k === "" && bail == null && !counts) return {};
 	const out: Pick<KernelSpec, "bailR" | "seedC" | "z0Body"> = { bailR: bail ?? (k2 ? 2 : 16) };
 	if (!k2 && k === "c") out.seedC = true;
 	if (k2 && !julia && k !== "") {
@@ -259,18 +264,22 @@ export class RenderPipeline {
 		this.ensureKernels();   // assemble + install the default kernel set (main + workers)
 	}
 
-	// (Re)assemble the generated kernels for the current spec. Cached by assembly key:
-	// unchanged config → the SAME hot function objects keep running (JIT warmth); a config
-	// change installs locally and broadcasts the sources to the pool.
-	private ensureKernels(): void {
-		const spec: KernelSpec = {
+	// The kernel spec of the current config.
+	private kernelSpec(): KernelSpec {
+		return {
 			usePeriod: this.usePeriod,
 			formulaBody: this.formulaId === FORMULA_CUSTOM ? this.customStepBody : null,
 			filterId: this.filterId,
 			juliaMode: this.juliaMode,
-			...escapeSpec(this.z0, this.bail, this.fractalMode === 1, this.juliaMode),
+			...escapeSpec(this.z0, this.bail, this.fractalMode === 1, this.juliaMode, this.colorizer.indexed && this.filterId === 0),
 		};
-		const asm = assembleAll(spec);
+	}
+
+	// (Re)assemble the generated kernels for the current spec. Cached by assembly key:
+	// unchanged config → the SAME hot function objects keep running (JIT warmth); a config
+	// change installs locally and broadcasts the sources to the pool.
+	private ensureKernels(): void {
+		const asm = assembleAll(this.kernelSpec());
 		if (asm.key === this.kernelKey) return;
 		this.kernelKey = asm.key;
 		installKernels(asm.srcs);
@@ -278,6 +287,9 @@ export class RenderPipeline {
 	}
 
 	public get events(): Emitter<RendererEvents> { return this.telemetry.events; }
+
+	// The last render's heuristic seed (z₀ = c for a blank z₀; the .par export writes it).
+	public get seedAtC(): boolean { return this.mSeedAtC; }
 
 	// Read-only field access (mandelDump and friends — no more private-field casts).
 	public get fields(): { mu: Float32Array; de: Float32Array } {
@@ -288,8 +300,10 @@ export class RenderPipeline {
 	// Config intake, split by cost class.
 	//------------------------------------------------------------------------\\
 
-	// Recolor-class changes: apply, then ONE instant repaint from the stored field.
-	public recolor(p: RecolorPatch): void {
+	// Recolor-class changes: apply, then ONE instant repaint from the stored field. True when
+	// the change also needs a re-render (the CALLER renders): discrete / logmap coloring
+	// switches the kernels to integer escape counts when no z₀ / bailout does (escapeSpec).
+	public recolor(p: RecolorPatch): boolean {
 		if (p.theme) {
 			this.colorizer.rebuild(this.filterId);
 			this.pool.setPalette(this.colorizer.paletteMsg());
@@ -308,14 +322,17 @@ export class RenderPipeline {
 			if (p.prov) this.provLevels = this.field.computeProvLevels();
 		}
 		// Index coloring + blending live in the workers' palette state too → resend.
+		let reiterate = false;
 		if (p.discrete !== undefined || p.palBlend !== undefined || p.logmap !== undefined) {
 			if (p.discrete !== undefined) this.colorizer.discrete = p.discrete;
 			if (p.logmap !== undefined) this.colorizer.setLogmap(p.logmap);
 			if (p.palBlend !== undefined) { this.colorizer.blend = p.palBlend; this.colorizer.rebuild(this.filterId); }
 			this.pool.setPalette(this.colorizer.paletteMsg());
+			reiterate = assembleAll(this.kernelSpec()).key !== this.kernelKey;
 		}
 		this.colorizer.densityMul = this.colorizer.densityMulFor(this.view, DEFAULT_VIEW.spanX);
 		this.repaint();
+		return reiterate;
 	}
 
 	// Compute-class changes: apply + re-derive the kernel; the CALLER re-renders (matching
@@ -362,7 +379,7 @@ export class RenderPipeline {
 	// Kernel dispatch: Kernel 1 (optimized z²+c M-engine with DD/pert) ONLY when nothing
 	// general is needed; anything else → Kernel 2 (f64), which forces DD/pert off.
 	private deriveKernel(): void {
-		const k2 = this.formulaId !== 0 || this.juliaMode || this.filterId !== 0 || z0NeedsK2(this.z0);
+		const k2 = this.formulaId !== 0 || this.juliaMode || this.filterId !== 0 || z0NeedsK2(this.z0, this.bail);
 		this.fractalMode = k2 ? 1 : 0;
 		if (k2) { this.ddOverride = false; this.pertOverride = false; }
 		else { this.ddOverride = null; this.pertOverride = null; }

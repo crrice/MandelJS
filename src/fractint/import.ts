@@ -8,7 +8,7 @@
 // frm-translate.ts, from the file's own frm: block). Other types are refused.
 //---------------------------------------------------------------------------\\
 
-import { AppState, RawView, defaultState, MAP_DENSITY } from "../config";
+import { AppState, RawView, defaultState, validSkew, MAP_DENSITY } from "../config";
 import { ParEntry, ParFile, parGet, parBlock } from "./par";
 import { decodeColors, parseLogmap, logmapTable, colorWrap } from "./colors";
 import { translateFrm, fmtNum } from "./frm-translate";
@@ -24,7 +24,7 @@ const NOTED: { [k: string]: string } = {
 	passes: "MandelJS computes every pixel",
 	periodicity: "MandelJS uses its own periodicity check",
 	mathtolerance: "MandelJS picks its own precision (f64 / double-double / perturbation)",
-	formulafile: "only the par's own frm: blocks are read",
+	formulafile: "only frm: blocks in the loaded files are read",
 	symmetry: "MandelJS computes every pixel",
 	savename: "not used",
 };
@@ -64,6 +64,7 @@ function viewFrom(e: ParEntry, type: string, note: (key: string, level: ParLevel
 		xmag = parseFloat(f[3]) || 1;
 		rot = parseFloat(f[4]) || 0;
 		skew = parseFloat(f[5]) || 0;
+		if (!validSkew(skew)) { note("center-mag", "unsupported", "skew " + f[5] + " is outside ±90°; using 0"); skew = 0; }
 		const deep = Number(mag.toExponential(1).split("e")[1]) + 4 > 16;   // dec > DBL_DIG+1: the bignum path
 		cx = deep ? ddFromDecimal(f[0]) : [parseFloat(f[0]), 0];
 		cy = deep ? ddFromDecimal(f[1]) : [parseFloat(f[1]), 0];
@@ -126,8 +127,9 @@ export function importFractint(file: ParFile, e: ParEntry): ParImport {
 	// Escape: Fractint counting (z₀ + bailout set) with the iteration cap at maxiter (C3.2).
 	const params = numList(parGet(e, "params"));
 	const bailout = parGet(e, "bailout");
-	const rq = bailout != null ? parseFloat(bailout) : 4;
-	if (!(rq > 0)) return refuse("bailout=" + bailout + ": must be positive");
+	const rq = bailout != null ? Math.trunc(parseFloat(bailout)) : 4;   // rqlim is a long (cmdfiles.c)
+	if (!(rq >= 1)) return refuse("bailout=" + bailout + ": must be at least 1");
+	if (bailout != null && String(rq) !== bailout) note("bailout", "applied", "read as the integer " + rq + ", as Fractint does");
 	const maxit = Math.round(Number(parGet(e, "maxiter") ?? "150"));
 	if (!(maxit > 1)) return refuse("maxiter=" + parGet(e, "maxiter") + ": must be > 1");
 	s.cap = maxit;
@@ -140,12 +142,12 @@ export function importFractint(file: ParFile, e: ParEntry): ParImport {
 		s.juliaX = params[0] || 0;
 		s.juliaY = params[1] || 0;
 		s.bail = Math.sqrt(rq);
-		note("type", "approximated", "julia escape counts may differ from Fractint's by one (conventions C8)");
+		note("type", "applied", "escape counts follow Fractint's julia convention (conventions C8)");
 	} else {
 		const name = parGet(e, "formulaname");
 		if (!name) return refuse("type=formula needs formulaname=");
 		const block = parBlock(file, "frm", name);
-		if (!block) return refuse("formula " + name + " is not in this file (add its frm:" + name + " block; formulafile= is not read)");
+		if (!block) return refuse("formula " + name + " is not in this file (add its frm:" + name + " block, or load its .frm file with the par)");
 		const fns = (parGet(e, "function") || "").split("/").filter((f) => f !== "");
 		const t = translateFrm(block.body, params, fns);
 		const levels: { [k: string]: ParLevel } = { info: "applied", warn: "approximated", unsupported: "unsupported" };
@@ -159,8 +161,10 @@ export function importFractint(file: ParFile, e: ParEntry): ParImport {
 	}
 	if ((parGet(e, "float") || "n")[0].toLowerCase() !== "y") note("float", "approximated", "rendered in floating point (Fractint would use integer math)");
 
-	// Colour: the map palette, indexed by the integer count (discrete, no blending).
+	// Colour: the map palette, indexed by the integer count (discrete through the linear
+	// transfer, no blending).
 	s.discrete = true;
+	s.coloring = "linear";
 	s.palBlend = false;
 	const logv = parGet(e, "logmap");
 	if (logv != null) {
@@ -176,7 +180,7 @@ export function importFractint(file: ParFile, e: ParEntry): ParImport {
 	if (insv === "maxiter" || insv === "-1") {
 		const table = logmapTable(s.logmap, maxit);
 		inside = table ? table[maxit] : colorWrap(maxit);   // inside = maxit, through logmap (C5.5)
-	} else if (/^\d+$/.test(insv)) inside = Number(insv) & 255;
+	} else if (/^\d+$/.test(insv)) inside = colorWrap(Number(insv));
 	else note("inside", "unsupported", "inside=" + insv + (INSIDE_MODES[insv] ? " is a colouring mode MandelJS lacks" : " is not understood") + "; using entry 1");
 	const colors = parGet(e, "colors");
 	if (colors != null) {

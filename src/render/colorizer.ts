@@ -4,6 +4,7 @@
 // rebuild() (via themeColors), so importing this module stays Node-safe.
 import { View, SS, colorSample, setColorState, setIndexState } from "../kernel/kernel";
 import type { KernelColorState, KernelIndexState } from "../kernel/kernel";
+import { fineSpan } from "../math/frame";
 import { logmapTable } from "../fractint/colors";
 import { Palette, PALETTES, themeColors } from "../palette";
 import { FILTERS } from "../filters/index";
@@ -81,6 +82,12 @@ export class Colorizer {
 		return true;
 	}
 
+	// Does the coloring read the integer escape count (discrete or logmap)? Then the kernels
+	// must count (pipeline escapeSpec).
+	public get indexed(): boolean {
+		return this.discrete || this.logFlag !== 0;
+	}
+
 	// The index-coloring state (kernel indexColor) — on the main thread and in every worker.
 	public indexState(): KernelIndexState {
 		return { discrete: this.discrete, logTable: this.logTable, mapLut: this.map };
@@ -101,11 +108,11 @@ export class Colorizer {
 	// Map the density knob to the cyclic period, per band map (see the P0 kernel notes:
 	// sqrt/log are zoom-stable; linear stretches with zoom).
 	public densityMulFor(view: View, defaultSpanX: number): number {
-		if (this.discrete || this.logFlag !== 0) return 1 / this.densityBase;   // index → position: iterations per cycle
+		if (this.logFlag !== 0) return 1 / this.densityBase;   // logmap index → position: entries per cycle
 		if (this.bandMap === 1) return BAND_FREQ_SQRT / this.densityBase;
 		if (this.bandMap === 2) return BAND_FREQ_LOG / this.densityBase;
 		if (!this.wrap) return 1 / this.densityBase;
-		const zoom = defaultSpanX / view.spanX;
+		const zoom = defaultSpanX / fineSpan(view);
 		const stretch = zoom > 1 ? Math.pow(zoom, COLOR_STRETCH_EXP) : 1;
 		return 1 / (this.densityBase * stretch);
 	}
@@ -113,7 +120,7 @@ export class Colorizer {
 	// Color one field sample — the shared colorSample with this frame's level window.
 	public sampleColor(mu: number, de: number, view: View, levels: Levels, width: number): number {
 		return colorSample(mu, de, this.lut, this.inSet, this.mode, this.wrap, this.densityMul,
-			view.spanX / width, this.bandMap, levels.muLo, levels.muHi);
+			fineSpan(view) / width, this.bandMap, levels.muLo, levels.muHi);
 	}
 
 	// Average one edge pixel's SS² subsamples into a packed color.

@@ -10,10 +10,12 @@ import type { View } from "../kernel/kernel";
 import { AppState, PRESETS, urlFromState } from "../config";
 import { PALETTES, customPalette, mapColorsFrom } from "../palette";
 import { FNode, parseFormula } from "../formula";
+import { z0Key, z0NeedsK2 } from "../render/pipeline";
 import { fmtNum } from "./frm-translate";
 import { ddToDecimal } from "./decimal";
 
 const LINE = 76;               // wrap width: Fractint reads at most 512 characters per line
+const NAME_LEN = 18;           // Fractint's ITEMNAMELEN: longer entry / formula names are refused
 const FALLBACK_MAXIT = 1000;   // maxiter when the cap is adaptive (MandelJS's base budget)
 // The theme colors palette.ts falls back to (the subtle palette reads them; no DOM here).
 const INK: [number, number, number] = [231, 231, 226], PAPER: [number, number, number] = [14, 15, 18];
@@ -52,24 +54,32 @@ function colorsFor(s: AppState): string {
 	return mapColorsFrom(b.lut, b.inSet);
 }
 
-export function parFromState(name: string, view: View, s: AppState): string {
-	const id = name.replace(/\s+/g, "_");
+// seedAtC: the renderer's heuristic z₀ = c for a blank z₀ (pipeline decideSeedAtC), so the
+// frm init matches what is on screen.
+export function parFromState(name: string, view: View, s: AppState, seedAtC = false): string {
+	// A Fractint-safe name: no separators or header syntax, at most NAME_LEN characters.
+	const id = name.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, NAME_LEN) || "mandeljs";
 	const cmds: string[] = ["reset=2004"];
 	let frm = "";
+
+	// The radius the engine escapes at (pipeline escapeSpec: bail, else 16 on Kernel 1 and 2
+	// on Kernel 2), as Fractint's rqlim = R².
+	const k = z0Key(s.z0);
+	const k2 = s.formulaKey !== "0" || s.juliaOn || Number(s.filterId) !== 0 || z0NeedsK2(s.z0, s.bail);
+	const R = s.bail ?? (k2 ? 2 : 16);
 
 	// Type: the z²+c fast path is Fractint's mandel (z₀ = c) or julia; anything else is a
 	// formula written from our formula + z₀ + bailout.
 	const formula = s.formulaKey === "0" ? "z^2 + c" : s.formulaKey === "custom" ? s.expr : PRESETS[s.formulaKey]?.formula || "";
-	const k = s.z0.replace(/\s+/g, "").toLowerCase();   // pipeline.z0Key
 	if (s.formulaKey === "0" && s.juliaOn) {
 		cmds.push("type=julia", "params=" + s.juliaX + "/" + s.juliaY);
 	} else if (s.formulaKey === "0" && (k === "" || k === "c")) {
 		cmds.push("type=mandel");
 	} else {
 		const c = s.juliaOn ? "p1" : "pixel";
-		const f = parseFormula(formula), z0 = s.juliaOn ? null : parseFormula(k === "" ? "0" : s.z0);
+		const f = parseFormula(formula), z0 = s.juliaOn ? null : parseFormula(k === "" ? (seedAtC ? "c" : "0") : s.z0);
 		if (f && (z0 || s.juliaOn)) {
-			const l = fmtNum((s.bail ?? 2) * (s.bail ?? 2));
+			const l = fmtNum(R * R);
 			cmds.push("type=formula", "formulaname=" + id);
 			if (s.juliaOn) cmds.push("params=" + s.juliaX + "/" + s.juliaY);
 			frm = "\nfrm:" + id + " {\n" + "z=" + (z0 ? frmExpr(z0, c) : "pixel") + ":\n" + "z=" + frmExpr(f, c) + "\n|z| < " + l + "\n}\n";
@@ -77,7 +87,8 @@ export function parFromState(name: string, view: View, s: AppState): string {
 			cmds.push("type=mandel");   // the formula or z₀ does not parse: the Fractint side falls back
 		}
 	}
-	if (s.bail != null && !frm && s.bail !== 2) cmds.push("bailout=" + Math.max(1, Math.round(s.bail * s.bail)));   // rqlim is an integer
+	const rq = Math.max(1, Math.round(R * R));   // rqlim is an integer
+	if (!frm && rq !== 4) cmds.push("bailout=" + rq);
 
 	// center-mag: the frame height is 2/Mag; Xmag carries the width/height ratio against 4:3
 	// (snapped to 1 at 4:3, where Mag then comes from the width, as the importer reads it) and

@@ -26,6 +26,43 @@ Zero runtime dependencies — esbuild bundles `src/` into a static page (`dist/`
     npm run score     # Fractint reference score: par/*.par vs par/*.jpg (index agreement
                       # + negative controls), gated by goldens/par-scores.json
 
+## Settings beyond z² + c
+
+Each of these is an ordinary control and a permalink key. Each is written to the URL only when it is
+not at its default, so existing links stay byte-identical.
+
+- **Rotation** (render section; `rot`, plus `skew` / `xmag` from imports): rotates the frame
+  counter-clockwise. Box zoom, zoom-out, back, the M/J bundles, the probes and perturbation all
+  follow it; reset clears it.
+- **z₀ and bailout** (render section; `z0`, `bail`): the initial z as a formula of c, and the escape
+  radius. Setting either one switches the kernels to Fractint's escape counting: the test runs after
+  each step, and the count is the number of steps taken.
+- **Coloring toggles** (coloring section). They are independent, and every combination is legal:
+  - **discrete** (`disc=1`): colour by the integer escape count, banded through the coloring transfer.
+  - **logmap** (`lm=n`): Fractint's logmap transfer.
+  - **blend** (`pb=0` for off): off holds each palette colour instead of interpolating between them.
+  - **anti-alias** (`aa=0` for off): off gives one sample per pixel.
+
+  Discrete and logmap need the integer escape count. With no z₀ or bailout set, turning them on
+  re-renders with Fractint counting at the default radius.
+- **Map palette** (`pal=map&map=<colors=>&mapin=n`): an exact 256-entry Fractint map. With discrete
+  coloring and the linear transfer (or logmap), it gives Fractint's `pal8[count]`.
+
+### Fractint .par files
+
+`.par` is MandelJS's file format.
+
+- **Import:** the `.par files` section imports Fractint 20.04 entries of type `mandel`, `julia` and
+  `formula`. It can load files, take a paste, or accept a file dropped on the canvas. The rotated view,
+  escape counts, logmap, `inside=` and the `colors=` map are all carried over. A Fractint formula is
+  translated into MandelJS formula syntax (f(z, c), z₀, bailout), and anything that cannot be
+  translated is reported.
+- **Export:** **save .par** writes an entry that Fractint can load, plus a `; mandeljs:` line holding
+  the exact permalink, so MandelJS reloads it losslessly.
+
+The supported keys and constructs, the translation rules and the measured fidelity are in
+[`docs/fractint/support.md`](docs/fractint/support.md).
+
 ## Layout
 
 - `src/kernel/` — the compute core: `assemble.ts` GENERATES specialized escape kernels

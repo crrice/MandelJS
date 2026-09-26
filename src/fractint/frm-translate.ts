@@ -79,9 +79,10 @@ function tNote(level: FrmLevel, msg: string): void {
 
 // Comments go, backslash-newline joins, newlines become ",", spaces vanish, all lowercase.
 function tClean(src: string): string {
+	src = src.replace(/;[^\n]*/g, "");   // comments first: they may hold braces
 	const a = src.indexOf("{"), b = src.lastIndexOf("}");
 	const body = a >= 0 ? src.slice(a + 1, b > a ? b : src.length) : src;
-	return body.replace(/;[^\n]*/g, "").replace(/\\[ \t\r]*\n/g, "").replace(/\n/g, ",").replace(/[ \t\r]/g, "").toLowerCase();
+	return body.replace(/\\[ \t\r]*\n/g, "").replace(/\n/g, ",").replace(/[ \t\r]/g, "").toLowerCase();
 }
 
 function tTokenize(s: string): TTok[] {

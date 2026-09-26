@@ -55,9 +55,9 @@
 						<option value="distance">distance</option>
 					</select>
 				</label>
-				<label class="field checkbox escape-only" title="Color from the whole escape count instead of the smooth value: flat bands, one palette step per iteration (Fractint style).">
+				<label class="field checkbox escape-only" title="Color from the whole escape count instead of the smooth value: flat bands through the coloring transfer (linear = one palette step per iteration, Fractint style). The kernels then count escapes Fractint-style, so switching it re-renders.">
 					<input class="discrete-toggle" type="checkbox" /> discrete</label>
-				<label class="field escape-only" title="Fractint logmap: compresses high escape counts onto the palette (1 = log, n > 1 = linear up to n then log, -1 = old log, -n = square root). Blank or 0 = off; replaces the coloring transfer.">logmap
+				<label class="field escape-only" title="Fractint logmap: compresses high escape counts onto the palette (1 = log, n > 1 = linear up to n then log, -1 = old log, -n = square root). Blank or 0 = off; replaces the coloring transfer, and counts escapes Fractint-style (re-renders).">logmap
 					<input class="logmap-input" type="number" step="1" placeholder="off" />
 				</label>
 				<label class="field checkbox" title="Blend between palette colors. Unchecked: each color is held until the next (nearest stop, no interpolation).">

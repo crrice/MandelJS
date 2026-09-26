@@ -35,6 +35,9 @@ let VIEW_ASPECT = 2;
 // a valid permalink. inJulia only tells syncUrl which set type to record + which seed.
 let inJulia = false;
 let currentSeed = { cx: 0, cy: 0 };   // the active Julia seed, for the URL (set by enterJulia / restoreFromUrl)
+// The z₀ the engine runs: an invalid entry is refused (applyEscape) or applied as unset
+// (applyFullState), so the URL and the .par export read this, not the field.
+let appliedZ0 = "";
 
 // Serialize the ENTIRE app state into the address bar so any view is a shareable
 // permalink. The param schema (config.ts) does the writing — one row per param, write and
@@ -52,7 +55,7 @@ function currentState(): AppState {
 	return {
 		formulaKey: formulaSelect ? formulaSelect.value : "0",
 		expr: formulaInput ? formulaInput.value : "z^2 + c",
-		z0: z0Input ? z0Input.value.trim() : "",
+		z0: appliedZ0,
 		bail: currentBail(),
 		juliaOn: inJulia, juliaX: currentSeed.cx, juliaY: currentSeed.cy,
 		filterId: filterSelect ? filterSelect.value : "0",
@@ -287,7 +290,7 @@ dev.mandelDump = async () => {
 //   mandelPar(p)                   // re-import
 dev.mandelPar = (text?: string) => {
 	if (text == null) {
-		const par = parFromState("mandeljs", view, currentState());
+		const par = parFromState("mandeljs", view, currentState(), renderer.seedAtC);
 		console.log(par);
 		return par;
 	}
@@ -849,8 +852,9 @@ function currentLogmap(): number {
 	const n = logmapInput ? Number(logmapInput.value) : 0;
 	return Number.isInteger(n) ? n : 0;
 }
-if (discreteToggle) discreteToggle.addEventListener("change", () => { renderer.recolor({ discrete: discreteToggle.checked }); syncUrl(); });
-if (logmapInput) logmapInput.addEventListener("change", () => { renderer.recolor({ logmap: currentLogmap() }); syncUrl(); });
+// Discrete / logmap read the integer escape count: recolor says when that needs a re-render.
+if (discreteToggle) discreteToggle.addEventListener("change", () => { const re = renderer.recolor({ discrete: discreteToggle.checked }); syncUrl(); if (re) renderer.render(view); });
+if (logmapInput) logmapInput.addEventListener("change", () => { const re = renderer.recolor({ logmap: currentLogmap() }); syncUrl(); if (re) renderer.render(view); });
 if (palBlendToggle) palBlendToggle.addEventListener("change", () => { renderer.recolor({ palBlend: palBlendToggle.checked }); syncUrl(); });
 if (aaToggle) aaToggle.addEventListener("change", () => { renderer.configure({ aa: aaToggle.checked }); syncUrl(); renderer.render(view); });
 
@@ -989,7 +993,7 @@ function pushFilter(): void {
 function updateContextualControls(): void {
 	const filterOn = currentFilterId() !== 0;
 	const customOn = formulaSelect?.value === "custom";
-	const k2 = (formulaSelect ? formulaSelect.value !== "0" : false) || !!juliaToggle?.checked || filterOn || z0NeedsK2(z0Input ? z0Input.value : "");
+	const k2 = (formulaSelect ? formulaSelect.value !== "0" : false) || !!juliaToggle?.checked || filterOn || z0NeedsK2(appliedZ0, currentBail());
 	document.querySelectorAll<HTMLElement>(".filter-param").forEach((el) => el.classList.toggle("hidden", !filterOn));
 	formulaCustom?.classList.toggle("hidden", !customOn);   // the f(z,c)= text field appears only for "custom…"
 	if (!customOn && formulaError) formulaError.textContent = "";   // clear a stale error when leaving custom
@@ -1088,6 +1092,7 @@ function applyEscape(): void {
 	const z0 = z0Input ? z0Input.value.trim() : "";
 	const res = compileZ0(z0);
 	if (z0 !== "" && !res.ok) { showFormulaError("z₀: " + (res.error || "invalid")); return; }
+	appliedZ0 = z0;
 	renderer.configure({ escape: { z0, bail: currentBail() } });
 	updateContextualControls();
 	syncUrl();
@@ -1330,7 +1335,7 @@ dev.mandelExport = (width = 1920, opts) => runExport(width, !!(opts && opts.test
 // writes the current state as a Fractint entry with its lossless `; mandeljs:` line.
 initParImport({
 	apply: (r) => applyFullState(r),
-	exportPar: (name) => parFromState(name, view, currentState()),
+	exportPar: (name) => parFromState(name, view, currentState(), renderer.seedAtC),
 });
 
 // ---- Permalink restore + first render. Runs LAST (all controls + renderer methods
@@ -1409,6 +1414,7 @@ function applyFullState({ state: s, rawView }: { state: AppState; rawView: RawVi
 	if (formulaSelect) formulaSelect.value = s.formulaKey;
 	if (s.formulaKey === "custom" && formulaInput) formulaInput.value = s.expr;
 	if (z0Input) z0Input.value = s.z0;
+	appliedZ0 = s.z0 === "" || compileZ0(s.z0).ok ? s.z0 : "";
 	if (bailInput) bailInput.value = s.bail != null ? String(s.bail) : "";
 	if (filterSelect) filterSelect.value = s.filterId;
 	if (strandsSlider) strandsSlider.value = s.strands;

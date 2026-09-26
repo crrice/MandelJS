@@ -23,9 +23,9 @@ function viewOf(raw) {
 	return { cx: raw.cx, cxLo: raw.cxLo, cy: raw.cy, cyLo: raw.cyLo, spanX: raw.span, spanY: 0, rot: raw.rot, skew: raw.skew, xmag: raw.xmag };
 }
 
-// A plain escape-time colorSample call (cyclic, levels unused).
-function sample(mu, lut, inSet, densityMul) {
-	return M.colorSample(mu, 0, lut, inSet, 0, true, densityMul, 1, 2, 0, 1);
+// A plain escape-time colorSample call (cyclic, levels unused; the log transfer by default).
+function sample(mu, lut, inSet, densityMul, bandMap = 2) {
+	return M.colorSample(mu, 0, lut, inSet, 0, true, densityMul, 1, bandMap, 0, 1);
 }
 
 test("defaults write no new URL rows; every toggle round-trips", () => {
@@ -111,17 +111,20 @@ test("map palette: exact 256 entries, inside entry, gradient over 1..255", () =>
 	}
 });
 
-test("discrete: the integer count picks the color (density = iterations per cycle)", () => {
+test("discrete: the integer count picks the color, through the band transfer", () => {
 	const { lut, inSet } = M.PALETTES.escape.build(INK, PAPER, true);
 	const dm = 1 / 32;
 	const pos = (g) => { let t = g * dm; t -= t | 0; return lut[(t * 1023) | 0]; };
 	M.setIndexState(OFF);
 	assert.notEqual(sample(5.2, lut, inSet, dm), sample(5.9, lut, inSet, dm));   // smooth by default
 	M.setIndexState({ discrete: true, logTable: null, mapLut: null });
-	assert.equal(sample(5.2, lut, inSet, dm), sample(5.9, lut, inSet, dm));
-	assert.equal(sample(5.9, lut, inSet, dm), pos(5));
-	assert.equal(sample(0.4, lut, inSet, dm), pos(1));   // an escaper's count 0 reads 1
-	assert.equal(sample(Infinity, lut, inSet, dm), inSet);
+	assert.equal(sample(5.2, lut, inSet, dm, 0), sample(5.9, lut, inSet, dm, 0));
+	assert.equal(sample(5.9, lut, inSet, dm, 0), pos(5));
+	assert.equal(sample(0.4, lut, inSet, dm, 0), pos(1));   // an escaper's count 0 reads 1
+	assert.equal(sample(Infinity, lut, inSet, dm, 0), inSet);
+	// Independent of the transfer: discrete + sqrt / log band the transformed count.
+	assert.equal(sample(8.7, lut, inSet, dm, 1), pos(Math.sqrt(8)));
+	assert.equal(sample(7.3, lut, inSet, dm), pos(Math.log2(8)));
 	// logmap replaces the count: table[min(count, maxit)].
 	const table = M.logmapTable(538, 3200);
 	M.setIndexState({ discrete: true, logTable: table, mapLut: null });
@@ -148,7 +151,7 @@ test("discrete + map + blend off reproduces Fractint: pal8[wrap(logmap[count])],
 	const W = 64, H = 48, maxit = 3200;
 	const view = { cx: -0.7453, cxLo: 0, cy: 0.1127, cyLo: 0, spanX: 0.02, spanY: 0.015 };
 	M.installKernels(M.assembleAll({ usePeriod: false, formulaBody: null, filterId: 0, juliaMode: false, ...M.escapeSpec("0", 2, false, false) }).srcs);
-	M.setFrameState({ usePeriod: false, periodEps2: M.PERIOD_EPS2, useDD: false, usePert: false, bandMap: 2, ssaaOn: false });
+	M.setFrameState({ usePeriod: false, periodEps2: M.PERIOD_EPS2, useDD: false, usePert: false, bandMap: 0, ssaaOn: false });
 	const b = M.mapPalette(GOLDEN, 0, M.MAP_DENSITY).build(INK, PAPER, true, false);
 	const pal8 = M.pal8FromPal6(M.decodeColors(GOLDEN).pal6);
 	const rgb = (i) => ((255 << 24) | (pal8[i * 3 + 2] << 16) | (pal8[i * 3 + 1] << 8) | pal8[i * 3]) >>> 0;
@@ -167,7 +170,7 @@ test("discrete + map + blend off reproduces Fractint: pal8[wrap(logmap[count])],
 				const want = count === maxit ? rgb(0) : rgb(M.colorWrap(idx));
 				assert.equal(out[p], want, "px " + px + "," + py + " count " + count);
 				// Instant recolor from the stored Float32 field gives the same color.
-				assert.equal(sample(mu[p], b.lut, b.inSet, 1 / 255), want);
+				assert.equal(sample(mu[p], b.lut, b.inSet, 1 / 255, 0), want);
 				if (count === maxit) inside++; else escaped++;
 				if (count < maxit && idx > 255) wrapped++;
 			}
@@ -189,4 +192,49 @@ test("anti-aliasing off (aa=0) renders 1 sample per pixel, like --noaa", () => {
 	const off = run(q + "&aa=0", "a.png", []);
 	assert.deepEqual(off, run(q, "b.png", ["--noaa"]));
 	assert.notDeepEqual(off, run(q, "c.png", []));
+});
+
+// Discrete / logmap with no z₀ or bailout set: the kernels switch to integer counting at
+// today's radius (16 on Kernel 1, 2 on Kernel 2), so floor(mu) is the escape count.
+test("discrete with the default escape settings colors by the true count", () => {
+	assert.deepEqual(M.escapeSpec("", null, false, false, true), { bailR: 16 });
+	assert.deepEqual(M.escapeSpec("", null, true, false, true), { bailR: 2 });
+	assert.deepEqual(M.escapeSpec("", null, false, false, false), {});
+	const W = 64, H = 32, maxit = 400;
+	// Kernel 1 (z₀ = 0, test at the top of the loop): count = steps until |z| ≥ 16.
+	const k1 = (cr, ci) => {
+		let x = 0, y = 0;
+		for (let n = 0; n < maxit; n++) {
+			if (x * x + y * y >= 256) return n;
+			const x2 = x * x, y2 = y * y; y = 2 * x * y + ci; x = x2 - y2 + cr;
+		}
+		return maxit;
+	};
+	// Kernel 2 (a formula: step, then test |z| ≥ 2): count = steps.
+	const k2 = (cr, ci) => {
+		let x = 0, y = 0;
+		for (let n = 1; n < maxit; n++) {
+			const x3 = x * x * x - 3 * x * y * y, y3 = 3 * x * x * y - y * y * y;
+			x = x3 + cr; y = y3 + ci;
+			if (!(x * x + y * y < 4)) return n;
+		}
+		return maxit;
+	};
+	for (const [qs, ref] of [["?cx=-0.5&cy=0.3&span=1.5&col=linear&disc=1&aa=0", k1], ["?cx=0&cy=0&span=3&f=cubic&disc=1&aa=0", k2]]) {
+		const { state, rawView } = M.stateFromUrl(qs);
+		const f = M.setupHeadless(state, rawView, W, H, { iters: maxit, noperiod: true });
+		const { mu } = M.renderHeadless(f);
+		let escaped = 0;
+		for (let py = 0; py < H; py++) {
+			for (let px = 0; px < W; px++) {
+				const cr = f.view.cx + ((px + 0.5) / W - 0.5) * f.view.spanX, ci = f.view.cy + (0.5 - (py + 0.5) / H) * f.view.spanY;
+				const count = ref(cr, ci), m = mu[py * W + px];
+				if (count === maxit) { assert.ok(!isFinite(m)); continue; }
+				assert.equal(Math.floor(m), count, qs + " px " + px + "," + py);
+				escaped++;
+			}
+		}
+		assert.ok(escaped > 500, qs + " escaped " + escaped);
+	}
+	M.setIndexState(OFF);
 });

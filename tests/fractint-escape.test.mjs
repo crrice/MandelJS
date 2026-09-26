@@ -150,9 +150,25 @@ test("Kernel 2: the z₀ expression, and z² + c from z₀ = c matching Kernel 1
 	M.installKernels(M.assembleAll({ usePeriod: false, formulaBody: null, filterId: 0, juliaMode: false, ...M.escapeSpec("c", 2, false, false) }).srcs);
 	M.setFrameState({ ...frame, fractalMode: 0 });
 	pts.forEach(([cr, ci], i) => assert.equal(countOf(M.escapeK1(cr, ci, maxit), maxit), k2[i], cr + "," + ci));
-	// Julia keeps z₀ = the pixel, with the Fractint count.
+	// A z²+c Julia keeps z₀ = the pixel, with Fractint's type=julia count (calmanp5 dojulia_p5,
+	// C8): the escape at step k counts max(1, k − 1), and z_maxit is still tested.
 	M.installKernels(M.assembleAll({ usePeriod: false, formulaBody: null, filterId: 0, juliaMode: true, ...M.escapeSpec("0.5*c", 2, true, true) }).srcs);
 	M.setFrameState(frame);
+	for (const [zx, zy] of pts) {
+		let x = zx, y = zy, count = maxit;
+		for (let k = 1; k <= maxit; k++) {
+			const x2 = x * x, y2 = y * y; y = 2 * x * y + 0.156; x = x2 - y2 - 0.8;
+			if (x * x + y * y >= 4) { count = Math.max(1, k - 1); break; }
+		}
+		assert.equal(countOf(M.escapeK2(zx, zy, -0.8, 0.156, maxit), maxit), count);
+	}
+	// At the cap: an escape at step maxit counts maxit − 1; one step later it is inside.
+	const steps = Math.floor(M.escapeK2(0.25, 0.5, -0.8, 0.156, 10000)) + 1;
+	assert.ok(steps > 3);
+	assert.equal(Math.floor(M.escapeK2(0.25, 0.5, -0.8, 0.156, steps)), steps - 1);
+	assert.ok(!isFinite(M.escapeK2(0.25, 0.5, -0.8, 0.156, steps - 1)));
+	// A formula Julia is Fractint's type=formula: count = steps (C4.4).
+	M.installKernels(M.assembleAll({ usePeriod: false, formulaBody: M.compileFormula("z^2 + c").body, filterId: 0, juliaMode: true, ...M.escapeSpec("", 2, true, true) }).srcs);
 	for (const [zx, zy] of pts) {
 		let x = zx, y = zy, k = 1;
 		for (; k < maxit; k++) { const x2 = x * x, y2 = y * y; y = 2 * x * y + 0.156; x = x2 - y2 - 0.8; if (x * x + y * y >= 4) break; }

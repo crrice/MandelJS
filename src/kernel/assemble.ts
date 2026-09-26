@@ -344,7 +344,10 @@ K.out[0] = 0; K.out[2] = 3;
 return -Infinity;`;
 	if (fe) {
 		// Fractint shape (C4.4): z₀ = the baked expression (else the caller's), then step,
-		// observe and test the NEW z — z₀ itself is never tested. count = steps taken.
+		// observe and test the NEW z — z₀ itself is never tested. count = steps taken. A z²+c
+		// Julia is Fractint's type=julia (calmanp5 dojulia_p5, C8): no step is pre-counted, so
+		// the escape at step k counts max(1, k − 1) and z_maxIters is still tested.
+		const jul = spec.juliaMode && spec.formulaBody == null && !filter;
 		return wrap("k2", `
 const eps2 = K.eps2;
 const cx = ax, cy = ay;
@@ -354,7 +357,7 @@ ${spec.z0Body != null ? "{\n" + spec.z0Body + "\n}" : ""}
 let zx = _cre, zy = _cim, n = 0, escaped = false;
 ${filter ? filter.locals : ""}
 let psx = zx, psy = zy, pchk = ${PERIOD_WARMUP};
-while (n < maxIters - 1) {
+while (n < ${jul ? "maxIters" : "maxIters - 1"}) {
 	${step}
 	n++;
 	${observer}
@@ -363,7 +366,7 @@ while (n < maxIters - 1) {
 ${filter ? epilogue : `K.out[0] = 0;
 if (escaped) {
 	const mag2 = zx * zx + zy * zy;
-	${countExit("n", "mag2", fe.lnR2, "\t")}
+	${countExit(jul ? "n > 1 ? n - 1 : 1" : "n", "mag2", fe.lnR2, "\t")}
 }
 K.out[1] = n; K.out[2] = 3;
 return -Infinity;`}`);

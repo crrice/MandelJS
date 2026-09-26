@@ -7,7 +7,7 @@
 // transfer (colorSample, filter readouts via the registry), and the perturbation
 // reference builder. DOM-free; Node-importable.
 import { ddAdd, ddMul, ddSq, _dhi, _dlo } from "../math/dd";
-import { viewFrame, planeOffset, _ox, _oy } from "../math/frame";
+import { viewFrame, planeOffset, fineSpan, _ox, _oy } from "../math/frame";
 import type { Frame } from "../math/frame";
 import { FILTERS } from "../filters/index";
 import type { FilterColorFn } from "../filters/index";
@@ -292,30 +292,32 @@ function bandTransform(mu: number, bandMapN: number): number {
 }
 
 // mu → palette index. Discrete = the integer count (an escaper's count 0 reads 1, as in
-// Fractint); smooth keeps the fraction. The logmap table replaces the count, looked up at
+// Fractint; the kernels count whenever the index path is on — pipeline escapeSpec) through
+// the band transfer. The logmap table replaces count and transfer, looked up at
 // min(count, maxit) and interpolated between entries when smooth.
-function indexOf(mu: number): number {
+function indexOf(mu: number, bandMapN: number): number {
 	const x = mu < 1 ? 1 : mu;
 	const k = Math.floor(x);
-	if (!logTable) return discrete ? k : x;
+	if (!logTable) return bandTransform(k, bandMapN);
 	const last = logTable.length - 1;
 	const a = logTable[k < last ? k : last];
 	if (discrete) return a;
 	return a + (logTable[k + 1 < last ? k + 1 : last] - a) * (x - k);
 }
 
-// The index transfer: a map palette in discrete mode is Fractint's exact pal8[wrap(index)];
-// otherwise the index is a position on the gradient (densityMul = 1 / iterations per cycle).
-function indexColor(mu: number, lut: Uint32Array, cyclic: boolean, densityMul: number, lvlLo: number, lvlHi: number): number {
-	const g = indexOf(mu);
-	if (mapLut && discrete) return mapLut[colorWrap(g)];
+// The index transfer: a map palette in discrete mode with an integer index (logmap, or the
+// linear transfer) is Fractint's exact pal8[wrap(index)]; otherwise the index is a position
+// on the gradient (densityMul = the transfer's cycle rate).
+function indexColor(mu: number, lut: Uint32Array, cyclic: boolean, densityMul: number, bandMapN: number, lvlLo: number, lvlHi: number): number {
+	const g = indexOf(mu, bandMapN);
+	if (mapLut && discrete && (logTable || bandMapN === 0)) return mapLut[colorWrap(g)];
 	const lastIdx = lut.length - 1;
 	if (cyclic) {
 		let t = g * densityMul;
 		t -= (t | 0);
 		return lut[(t * lastIdx) | 0];
 	}
-	const glo = indexOf(lvlLo), ghi = indexOf(lvlHi);
+	const glo = indexOf(lvlLo, bandMapN), ghi = indexOf(lvlHi, bandMapN);
 	let t = (g - glo) / (ghi > glo ? ghi - glo : 1);
 	t = t < 0 ? 0 : t > 1 ? 1 : t;
 	return lut[(t * lastIdx) | 0];
@@ -340,7 +342,7 @@ export function colorSample(
 		td -= (td | 0);
 		return lut[(td * lastIdx) | 0];
 	}
-	if (indexOn) return indexColor(mu, lut, cyclic, densityMul, lvlLo, lvlHi);
+	if (indexOn) return indexColor(mu, lut, cyclic, densityMul, bandMapN, lvlLo, lvlHi);
 	const g = bandTransform(mu, bandMapN);
 	if (cyclic) {
 		let t = g * densityMul;
@@ -402,7 +404,7 @@ export function renderRegion(
 	lut: Uint32Array, inSet: number, densityMul: number, cyclic: boolean, mode: number,
 ): void {
 	const invW = 1 / canvasW, invH = 1 / canvasH;
-	const pixelSize = view.spanX * invW;
+	const pixelSize = fineSpan(view) * invW;
 	const invSS = 1 / SS, nSub = SS * SS;
 
 	function colorOf(mu: number, de: number): number {
