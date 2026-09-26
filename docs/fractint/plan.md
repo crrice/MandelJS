@@ -176,26 +176,32 @@ waves.
 
 `src/node-lib.ts` is append-only for every item, so its conflicts are trivial.
 
-## 6. Recommended defaults for open decisions
+## 6. Owner decisions (2026-09-26) — these supersede the draft defaults
 
-These are my recommendations; the chat lists the questions. Each one is changeable before Wave 1.
+1. **No lost functionality; everything is a toggle.** The current look (aliased, palette-blended) stays the
+   default. New independent coloring toggles: **discrete (banded) coloring** — integer escape count → palette
+   entry, Fractint style — vs smooth mu; **palette blending** on/off (interpolate between stops vs nearest
+   stop); **anti-aliasing** on/off; Fractint **logmap** as a coloring transfer option. Any combination is legal.
+2. **Rotation on every view** (plus skew/xmag in the view model): URL rows, a rotation control, box zoom / pan /
+   zoom-out / probes / perturbation all rotation-aware; reset clears it.
+3. **No "Fractint mode".** Every Fractint feature is an ordinary setting in the regular controls (bailout radius,
+   z₀ / init, iteration cap, discrete coloring, logmap, palette …) and a par import just sets them.
+4. **Fractint formulas are translated into MandelJS formula syntax** and filled into the normal (editable)
+   formula UI. The formula settings grow what translation needs — an **initial z₀ expression** and a **bailout
+   radius** — but no new functions without discussion: the translator rewrites Fractint built-ins into existing
+   ones where exact (sqr(x)→(x)^2, |x|→abs(x)^2, cabs→abs, real/imag→re/im, ident, recip, flip, cotan …) and
+   reports anything it cannot translate (user-visible report; candidates for a later discussion).
+5. v1 scope as proposed (types mandel/julia/formula; missing reset= ⇒ 2004 + warning; unsupported types refused).
+6. `jpeg-js` as a devDependency for the scoring harness.
+7. **Paired persistence:** the URL encodes the complete state AND a file export/import system uses **Fractint
+   .par as its standard format**. Export writes a Fractint-valid entry (type, center-mag with rotation/skew,
+   maxiter, colors=, logmap, inside, formula frm: block, …) plus a `; mandeljs:` comment line carrying the exact
+   MandelJS query string so MandelJS re-imports losslessly while Fractint still reads the rest.
+8. Research prototypes dropped.
 
-| # | Decision | Recommendation |
-|---|---|---|
-| D1 | Default look of an imported par | Indexed Fractint colouring **with** MandelJS edge-SSAA on (closer to the references, which are supersampled). An "aliased (Fractint-exact)" toggle provides the Tier 1 view |
-| D2 | Rotation | First-class: URL rows `rot` (+`skew`/`xmag`, only when non-default). A degrees field in *render*. Box zoom, pan and zoom-out respect it. Reset clears it; Julia entry starts unrotated |
-| D3 | Mode switch | One `fx` switch for the kernel semantics (count, bailout, fixed maxiter). Indexed colouring is on by default under `fx` but stays a separate choice. The imported 256-colour map doubles as a smooth palette in native mode |
-| D4 | URL encoding | Verbatim `colors=` string and frm text, percent-encoded (about 1.5 KB links; transparent, synchronous) |
-| D5 | Formula UI | Formula dropdown gains "Fractint formula": an editable textarea plus p1..p5 and fn1..fn4 fields. Julia toggle and filters are disabled under it |
-| D6 | Import UX | A "load par" button (accepts .par + .frm), drag-drop on the canvas, and paste. An entry picker for multi-entry files. A report pill for unsupported or approximated keys |
-| D7 | v1 scope | Types mandel/julia/formula. The frm subset is everything except `rand/srand` and `scrnpix/scrnmax/whitesq` (resolution-dependent). 20.04 parse bugs are rejected with a warning. Version gates are limited to the cheap ones (logmap <2002, wrap ≤1950, pow <1900). `float=n` renders as float, with a note |
-| D8 | Periodicity / guessing | MandelJS Brent check; no emulation of guessing or of Fractint periodicity (measured no-ops) |
-| D9 | Precision | Double-rounded centre on Fractint's double path; exact per-pixel c; MandelJS's own DD/pert gates |
-| D10 | Span convention | Resolution-independent (corners on the frame edges). This is ≤0.5 px at the edges versus Fractint's (dots−1) grid, and fixes a resolution-dependent quirk |
-| D11 | Export to Fractint | Deferred (W12 optional). MandelJS's own `.par` dialect export stays |
-| D12 | JPEG decoding for the harness | `jpeg-js` as a **devDependency** (runtime stays zero-dep; avoids ~6 MB of committed PNG decodes) |
-| D13 | CI tiers | `npm run golden:par` (bit-exact hashes of our own par renders at 640×480) + `npm run score` (Tier 1). Tier 2 is a manual script |
-| D14 | Reference images | Stay at `par/<name>.jpg` next to their pars (committed in 2317a58) |
+Consequences for §3/§4: W3 becomes a **translator** (Fractint frm → MandelJS formula + z₀ + bailout) instead of
+a separate frm compiler/kernel, so W7 folds into W5 (z₀ expression + bailout radius + integer-count semantics in
+the generated kernels); W6 becomes the independent coloring toggles; W12 (par export) is in scope.
 
 ## 7. Risks
 
