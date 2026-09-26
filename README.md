@@ -22,6 +22,9 @@ Zero runtime dependencies — esbuild bundles `src/` into a static page (`dist/`
     npm run bench     # standing perf gate: deterministic kernel workloads, min-of-7,
                       # machine-keyed baselines (bench/baselines.json); iteration counts
                       # asserted exactly. Record a machine: node bench/perf.mjs --update
+    npm run golden:par # bit-exact renders of par/*.par against goldens/par-goldens.json
+    npm run score     # Fractint reference score: par/*.par vs par/*.jpg (index agreement
+                      # + negative controls), gated by goldens/par-scores.json
 
 ## Layout
 
@@ -29,7 +32,9 @@ Zero runtime dependencies — esbuild bundles `src/` into a static page (`dist/`
   (precision × formula × filter × periodicity baked in, DD primitives inlined);
   `kernel.ts` is the runtime half (frame state, dispatch, the one coloring transfer).
 - `src/render/` — the pipeline: worker pool, explicit phase machine, field store,
-  colorizer, telemetry, and a render-sink seam (`CanvasSink` on screen).
+  colorizer, telemetry, and a render-sink seam (`CanvasSink` on screen). `headless.ts`
+  configures the same engine DOM-free for `render.mjs` (a permalink or `--par` → PNG) and
+  the par runners.
 - `src/filters/` — one `FilterDef` file per orbit-trap filter (kernel snippets + color
   readout + palette policy); the UI dropdown is generated from the registry.
 - `src/config.ts` — the app-state schema: URL permalinks serialize through per-parameter
@@ -45,6 +50,8 @@ Zero runtime dependencies — esbuild bundles `src/` into a static page (`dist/`
 
 `goldens/` holds bit-exact reference renders (see its README for the determinism
 scope); `bench/golden.mjs` replays them in Node against the same kernels the workers run.
+`bench/par-golden.mjs` and `bench/par-score.mjs` do the same for the committed Fractint pars,
+the latter scoring against the reference JPEGs (`docs/fractint/conventions.md` C6.5).
 
 Extracted from [fifthaleph-site](https://github.com/crrice/fifthaleph-site), where an
 earlier version of this lived under `src/pages/fractal-gen`.

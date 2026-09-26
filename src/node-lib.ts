@@ -26,3 +26,5 @@ export * from "./fractint/import";
 export { parFromState } from "./fractint/export";
 export { ddFromDecimal, ddToDecimal } from "./fractint/decimal";
 export { parseFormula } from "./formula";
+export { setupHeadless, renderHeadless } from "./render/headless";
+export type { HeadlessOpts, HeadlessFrame } from "./render/headless";
