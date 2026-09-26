@@ -1,0 +1,338 @@
+{
+	"p1|mandel|t0|j0": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "55102c4c",
+		"probeStep": "b7167373"
+	},
+	"p1|mandel|t0|j1": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "55102c4c",
+		"probeStep": "b7167373"
+	},
+	"p1|mandel|t1|j0": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "90fc5db9",
+		"probeStep": "b7167373"
+	},
+	"p1|mandel|t1|j1": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "3b9d088a",
+		"probeStep": "b7167373"
+	},
+	"p1|cubic|t0|j0": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "5a3656d3",
+		"probeStep": "2ee18325"
+	},
+	"p1|cubic|t0|j1": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "5a3656d3",
+		"probeStep": "2ee18325"
+	},
+	"p1|cubic|t1|j0": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "73e5ed20",
+		"probeStep": "2ee18325"
+	},
+	"p1|cubic|t1|j1": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "25df9951",
+		"probeStep": "2ee18325"
+	},
+	"p1|ship|t0|j0": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "ba978155",
+		"probeStep": "3cf00d67"
+	},
+	"p1|ship|t0|j1": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "ba978155",
+		"probeStep": "3cf00d67"
+	},
+	"p1|ship|t1|j0": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "082475a2",
+		"probeStep": "3cf00d67"
+	},
+	"p1|ship|t1|j1": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "79cb0393",
+		"probeStep": "3cf00d67"
+	},
+	"p1|cosine|t0|j0": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "52f0d637",
+		"probeStep": "0ec26fe9"
+	},
+	"p1|cosine|t0|j1": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "52f0d637",
+		"probeStep": "0ec26fe9"
+	},
+	"p1|cosine|t1|j0": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "e5165764",
+		"probeStep": "0ec26fe9"
+	},
+	"p1|cosine|t1|j1": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "d1365055",
+		"probeStep": "0ec26fe9"
+	},
+	"p1|tierazon|t0|j0": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "1576e07f",
+		"probeStep": "46cf80f1"
+	},
+	"p1|tierazon|t0|j1": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "1576e07f",
+		"probeStep": "46cf80f1"
+	},
+	"p1|tierazon|t1|j0": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "6ceff36c",
+		"probeStep": "46cf80f1"
+	},
+	"p1|tierazon|t1|j1": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "1a0d7ddd",
+		"probeStep": "46cf80f1"
+	},
+	"p1|z2c|t0|j0": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "3e93d04f",
+		"probeStep": "18eb03e1"
+	},
+	"p1|z2c|t0|j1": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "3e93d04f",
+		"probeStep": "18eb03e1"
+	},
+	"p1|z2c|t1|j0": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "f425735c",
+		"probeStep": "18eb03e1"
+	},
+	"p1|z2c|t1|j1": {
+		"k1f64": "5b0ed61f",
+		"k1dd": "978ef964",
+		"k1pert": "10e9ec70",
+		"k2": "cf43588d",
+		"probeStep": "18eb03e1"
+	},
+	"p0|mandel|t0|j0": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "f51eaea9",
+		"probeStep": "b7167373"
+	},
+	"p0|mandel|t0|j1": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "f51eaea9",
+		"probeStep": "b7167373"
+	},
+	"p0|mandel|t1|j0": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "90fc5db9",
+		"probeStep": "b7167373"
+	},
+	"p0|mandel|t1|j1": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "3b9d088a",
+		"probeStep": "b7167373"
+	},
+	"p0|cubic|t0|j0": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "03ae7890",
+		"probeStep": "2ee18325"
+	},
+	"p0|cubic|t0|j1": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "03ae7890",
+		"probeStep": "2ee18325"
+	},
+	"p0|cubic|t1|j0": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "73e5ed20",
+		"probeStep": "2ee18325"
+	},
+	"p0|cubic|t1|j1": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "25df9951",
+		"probeStep": "2ee18325"
+	},
+	"p0|ship|t0|j0": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "63436e52",
+		"probeStep": "3cf00d67"
+	},
+	"p0|ship|t0|j1": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "63436e52",
+		"probeStep": "3cf00d67"
+	},
+	"p0|ship|t1|j0": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "082475a2",
+		"probeStep": "3cf00d67"
+	},
+	"p0|ship|t1|j1": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "79cb0393",
+		"probeStep": "3cf00d67"
+	},
+	"p0|cosine|t0|j0": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "06cfea74",
+		"probeStep": "0ec26fe9"
+	},
+	"p0|cosine|t0|j1": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "06cfea74",
+		"probeStep": "0ec26fe9"
+	},
+	"p0|cosine|t1|j0": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "e5165764",
+		"probeStep": "0ec26fe9"
+	},
+	"p0|cosine|t1|j1": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "d1365055",
+		"probeStep": "0ec26fe9"
+	},
+	"p0|tierazon|t0|j0": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "e7f889bc",
+		"probeStep": "46cf80f1"
+	},
+	"p0|tierazon|t0|j1": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "e7f889bc",
+		"probeStep": "46cf80f1"
+	},
+	"p0|tierazon|t1|j0": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "6ceff36c",
+		"probeStep": "46cf80f1"
+	},
+	"p0|tierazon|t1|j1": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "1a0d7ddd",
+		"probeStep": "46cf80f1"
+	},
+	"p0|z2c|t0|j0": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "e589eb8c",
+		"probeStep": "18eb03e1"
+	},
+	"p0|z2c|t0|j1": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "e589eb8c",
+		"probeStep": "18eb03e1"
+	},
+	"p0|z2c|t1|j0": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "f425735c",
+		"probeStep": "18eb03e1"
+	},
+	"p0|z2c|t1|j1": {
+		"k1f64": "219624c7",
+		"k1dd": "e9d736aa",
+		"k1pert": "5aeef3eb",
+		"k2": "cf43588d",
+		"probeStep": "18eb03e1"
+	}
+}
