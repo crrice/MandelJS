@@ -248,6 +248,10 @@ h1 {
 .pal-stops input[type="color"]::-webkit-color-swatch-wrapper { padding: 2px; }
 .pal-stops input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
 .pal-inset { width: 26px; }
+/* Map-palette editor: the colors= string + inside entry, shown for palette=map. */
+.map-editor { flex-basis: 100%; }
+.map-editor.hidden { display: none; }
+.map-input { width: 260px; }
 .pal-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
 .pal-row .btn { padding: 5px 11px; font-size: 0.78rem; }
 

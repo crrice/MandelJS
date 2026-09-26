@@ -185,6 +185,9 @@ export interface RecolorPatch {
 	filterExposure?: number;
 	filterBlend?: number;
 	prov?: boolean;
+	discrete?: boolean;                             // integer-count (banded) coloring
+	palBlend?: boolean;                             // palette blending (false = nearest stop)
+	logmap?: number;                                // Fractint logmap flag (0 = off)
 }
 export interface ComputePatch {
 	formula?: { id: number } | { body: string };
@@ -196,6 +199,7 @@ export interface ComputePatch {
 	dd?: boolean | null;
 	period?: boolean;
 	sharpen?: boolean;
+	aa?: boolean;                                   // edge anti-aliasing pass (false = 1 sample/px)
 }
 
 export class RenderPipeline {
@@ -303,6 +307,13 @@ export class RenderPipeline {
 			this.provOn = p.prov;
 			if (p.prov) this.provLevels = this.field.computeProvLevels();
 		}
+		// Index coloring + blending live in the workers' palette state too → resend.
+		if (p.discrete !== undefined || p.palBlend !== undefined || p.logmap !== undefined) {
+			if (p.discrete !== undefined) this.colorizer.discrete = p.discrete;
+			if (p.logmap !== undefined) this.colorizer.setLogmap(p.logmap);
+			if (p.palBlend !== undefined) { this.colorizer.blend = p.palBlend; this.colorizer.rebuild(this.filterId); }
+			this.pool.setPalette(this.colorizer.paletteMsg());
+		}
 		this.colorizer.densityMul = this.colorizer.densityMulFor(this.view, DEFAULT_VIEW.spanX);
 		this.repaint();
 	}
@@ -340,6 +351,7 @@ export class RenderPipeline {
 		if (p.dd !== undefined) this.ddOverride = p.dd;
 		if (p.period !== undefined) this.usePeriod = p.period;
 		if (p.sharpen !== undefined) this.sharpenOn = p.sharpen;
+		if (p.aa !== undefined) this.ssaaRefine = p.aa;
 		this.deriveKernel();
 		this.ensureKernels();
 		// A changed formula body warrants a clean-slate pool (hang recovery for pathological
@@ -484,6 +496,8 @@ export class RenderPipeline {
 		// Size the initial cap: probe (f64) / budget formula (DD & pert) / forced.
 		this.ffEstIters = 0;
 		const maxIters = maxItersArg ?? this.iterCapForced ?? (this.useDD || this.usePert ? this.itersForView(view, this.usePert) : this.probeCap(view));
+		// The logmap table is built over this frame's cap (Fractint's maxit) — before any tile.
+		if (this.colorizer.setLogCap(maxIters)) this.pool.setPalette(this.colorizer.paletteMsg());
 
 		// Full-canvas tile queue, dispatch-order dispersed (deterministic Fisher–Yates) so
 		// the FF-ETA's in-flight sample stays spatially representative.

@@ -5,11 +5,11 @@ import { View, DEFAULT_VIEW, FORMULA_MANDEL } from "./kernel/kernel";
 import { ddAdd, _dhi, _dlo } from "./math/dd";
 import { viewFrame, planeOffset, _ox, _oy } from "./math/frame";
 import { compileFormula, compileZ0 } from "./formula";
-import { Palette, PALETTES, customPalette, currentPalette } from "./palette";
+import { Palette, PALETTES, customPalette, mapPalette, mapColorsFrom, currentPalette, themeColors } from "./palette";
 import { RenderPipeline, z0NeedsK2 } from "./render/pipeline";
 import { CanvasSink } from "./render/sink";
 import type { GenStats, FrameStats } from "./render/telemetry";
-import { AppState, PRESETS, CUSTOM_DENSITY, urlFromState, stateFromUrl, parFromState, stateFromPar } from "./config";
+import { AppState, PRESETS, CUSTOM_DENSITY, MAP_DENSITY, defaultDensityFor, urlFromState, stateFromUrl, parFromState, stateFromPar } from "./config";
 import { FILTERS } from "./filters/index";
 import type { RawView } from "./config";
 import { easel, canvas, ctx, DEBUG } from "./ui/dom";
@@ -62,8 +62,14 @@ function currentState(): AppState {
 		stops: customStops.slice(),
 		inset: palInset ? palInset.value : "#000000",
 		cyclic: palCyclic ? palCyclic.checked : true,
+		map: mapInput ? mapInput.value.trim() : "",
+		mapInside: currentMapInside(),
 		density: densitySlider ? densitySlider.value : "32",
 		coloring: coloringSelect ? coloringSelect.value : "log",
+		discrete: discreteToggle ? discreteToggle.checked : false,
+		logmap: currentLogmap(),
+		palBlend: palBlendToggle ? palBlendToggle.checked : true,
+		aa: aaToggle ? aaToggle.checked : true,
 		cap: currentIterCap(),
 	};
 }
@@ -827,6 +833,22 @@ if (coloringSelect) {
 	coloringSelect.addEventListener("change", () => { applyColoringFromControls(); syncUrl(); });
 }
 
+// Independent coloring toggles: discrete (integer-count) bands, Fractint logmap and palette
+// blending recolor instantly; anti-aliasing is a render pass, so it re-renders.
+const discreteToggle = document.querySelector(".discrete-toggle") as HTMLInputElement | null;
+const logmapInput = document.querySelector(".logmap-input") as HTMLInputElement | null;
+const palBlendToggle = document.querySelector(".palblend-toggle") as HTMLInputElement | null;
+const aaToggle = document.querySelector(".aa-toggle") as HTMLInputElement | null;
+// The logmap field's flag: blank / non-integer = 0 (off).
+function currentLogmap(): number {
+	const n = logmapInput ? Number(logmapInput.value) : 0;
+	return Number.isInteger(n) ? n : 0;
+}
+if (discreteToggle) discreteToggle.addEventListener("change", () => { renderer.recolor({ discrete: discreteToggle.checked }); syncUrl(); });
+if (logmapInput) logmapInput.addEventListener("change", () => { renderer.recolor({ logmap: currentLogmap() }); syncUrl(); });
+if (palBlendToggle) palBlendToggle.addEventListener("change", () => { renderer.recolor({ palBlend: palBlendToggle.checked }); syncUrl(); });
+if (aaToggle) aaToggle.addEventListener("change", () => { renderer.configure({ aa: aaToggle.checked }); syncUrl(); renderer.render(view); });
+
 // Palette instrument — palette picker + density slider. Wrap is no longer user-facing:
 // each palette's own default (cyclic) is used (setPalette resets it).
 const densitySlider = document.querySelector(".density-slider") as HTMLInputElement | null;
@@ -876,11 +898,39 @@ if (palRemove) palRemove.addEventListener("click", () => { if (customStops.lengt
 if (palInset) palInset.addEventListener("input", () => applyCustomPalette());
 if (palCyclic) palCyclic.addEventListener("change", () => applyCustomPalette());
 
+// ---- Map palette: an exact 256-entry Fractint map (a colors= string) + its inside entry.
+// Picking it with no map yet snapshots the escape gradient as a map to start from. ----
+const mapEditor = document.querySelector(".map-editor") as HTMLElement | null;
+const mapInput = document.querySelector(".map-input") as HTMLInputElement | null;
+const mapInsideInput = document.querySelector(".map-inside") as HTMLInputElement | null;
+function currentMapInside(): number {
+	const n = mapInsideInput ? Number(mapInsideInput.value) : 0;
+	return Number.isInteger(n) && n >= 0 && n <= 255 ? n : 0;
+}
+function applyMapPalette(): void {
+	if (!mapInput) return;
+	if (mapInput.value.trim() === "") {
+		const { ink, paper } = themeColors();
+		const built = PALETTES.escape.build(ink, paper, true);
+		mapInput.value = mapColorsFrom(built.lut, built.inSet);
+	}
+	const p = mapPalette(mapInput.value.trim(), currentMapInside(), MAP_DENSITY);
+	showFormulaError(p ? "" : "map: invalid colors= string");
+	if (!p) return;
+	renderer.recolor({ palette: p });
+	if (densitySlider) densitySlider.value = String(MAP_DENSITY);
+	syncUrl();
+}
+if (mapInput) mapInput.addEventListener("change", () => applyMapPalette());
+if (mapInsideInput) mapInsideInput.addEventListener("change", () => applyMapPalette());
+
 if (paletteSelect) {
 	paletteSelect.addEventListener("change", () => {
 		const isCustom = paletteSelect.value === "custom";
 		paletteEditor?.classList.toggle("hidden", !isCustom);
+		mapEditor?.classList.toggle("hidden", paletteSelect.value !== "map");
 		if (isCustom) { renderStops(); applyCustomPalette(); return; }
+		if (paletteSelect.value === "map") { applyMapPalette(); return; }
 		const p = PALETTES[paletteSelect.value];
 		if (!p) return;
 		renderer.recolor({ palette: p });   // resets effective wrap/density to the palette defaults
@@ -1307,13 +1357,18 @@ function applyEngineState(target: RenderPipeline, s: AppState): void {
 	// Coloring: palette (resets density to its default) → density override → transfer mode.
 	if (s.paletteKey === "custom") {
 		target.recolor({ palette: customPalette(s.stops, s.inset, s.cyclic, CUSTOM_DENSITY) });
+	} else if (s.paletteKey === "map") {
+		const p = mapPalette(s.map, s.mapInside, MAP_DENSITY);
+		if (p) target.recolor({ palette: p });
 	} else if (s.paletteKey !== "escape" && PALETTES[s.paletteKey]) {
 		target.recolor({ palette: PALETTES[s.paletteKey] });
 	}
-	const palDefault = s.paletteKey === "custom" ? CUSTOM_DENSITY : (PALETTES[s.paletteKey] ? PALETTES[s.paletteKey].density : -1);
-	if (Number(s.density) !== palDefault) target.recolor({ density: Number(s.density) });
+	if (Number(s.density) !== defaultDensityFor(s.paletteKey)) target.recolor({ density: Number(s.density) });
 	if (s.coloring === "distance") target.recolor({ coloring: { mode: 1, bandMap: 0 } });
 	else target.recolor({ coloring: { mode: 0, bandMap: s.coloring === "sqrt" ? 1 : s.coloring === "log" ? 2 : 0 } });
+	// The independent coloring toggles (defaults: smooth, no logmap, blended, anti-aliased).
+	target.recolor({ discrete: s.discrete, logmap: s.logmap, palBlend: s.palBlend });
+	target.configure({ aa: s.aa });
 	// Forced iteration cap — applied before the first render.
 	target.configure({ iterCap: s.cap });
 	// Set type + seed.
@@ -1356,13 +1411,22 @@ function applyFullState({ state: s, rawView }: { state: AppState; rawView: RawVi
 		renderStops();
 		updatePalBar();
 		if (densitySlider) densitySlider.value = String(CUSTOM_DENSITY);
+	} else if (s.paletteKey === "map") {
+		if (paletteSelect) paletteSelect.value = "map";
+		if (mapInput) mapInput.value = s.map;
+		if (mapInsideInput) mapInsideInput.value = String(s.mapInside);
+		mapEditor?.classList.remove("hidden");
+		if (densitySlider) densitySlider.value = String(MAP_DENSITY);
 	} else if (s.paletteKey !== "escape" && paletteSelect && PALETTES[s.paletteKey]) {
 		paletteSelect.value = s.paletteKey;
 		if (densitySlider) densitySlider.value = String(PALETTES[s.paletteKey].density);
 	}
-	const palDefault = s.paletteKey === "custom" ? CUSTOM_DENSITY : (PALETTES[s.paletteKey] ? PALETTES[s.paletteKey].density : -1);
-	if (Number(s.density) !== palDefault && densitySlider) densitySlider.value = s.density;
+	if (Number(s.density) !== defaultDensityFor(s.paletteKey) && densitySlider) densitySlider.value = s.density;
 	if (coloringSelect) coloringSelect.value = s.coloring;
+	if (discreteToggle) discreteToggle.checked = s.discrete;
+	if (logmapInput) logmapInput.value = s.logmap !== 0 ? String(s.logmap) : "";
+	if (palBlendToggle) palBlendToggle.checked = s.palBlend;
+	if (aaToggle) aaToggle.checked = s.aa;
 	if (itercapInput) itercapInput.value = s.cap != null ? String(s.cap) : "";
 	// Formula error/note pill (the engine install happens in applyEngineState).
 	if (s.formulaKey === "custom") {

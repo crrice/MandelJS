@@ -2,7 +2,7 @@
 // entry. TileMsg extends the kernel's frame-state shape, so the pipeline's dispatch, the
 // worker's setFrameState(m), and the main-thread probe paths all speak ONE shape — a
 // single source of truth for "everything a tile render needs to know".
-import type { View, KernelFrameState } from "./kernel/kernel";
+import type { View, KernelFrameState, KernelIndexState } from "./kernel/kernel";
 
 export interface TileMsg extends KernelFrameState {
 	type: "tile"; gen: number;
@@ -23,8 +23,9 @@ export interface DoneMsg {
 	ssaaJob?: boolean;   // true => the mu/de buffers hold raw SS² subsamples per edge pixel
 }
 
-// Palette hand-off: each worker gets its own copy of the baked LUT (structured clone, ~4KB).
-export interface PaletteMsg { type: "palette"; lut: Uint32Array; inSet: number; cyclic: boolean; }
+// Palette hand-off: each worker gets its own copy of the baked LUT (structured clone, ~4KB),
+// plus the index-coloring state (discrete / logmap table / map entries).
+export interface PaletteMsg extends KernelIndexState { type: "palette"; lut: Uint32Array; inSet: number; cyclic: boolean; }
 
 // Generated-kernel install: the assembled sources for the current specialization key
 // (kernel/assemble.ts). Workers compile via installKernels — the same sources the main

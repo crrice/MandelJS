@@ -55,6 +55,10 @@ const CORPUS = [
 	"?cx=0&cy=0&span=4&f=custom&expr=-%28z%5E1.68%29+%2B+z%5E1.4142+%2B+c&z0=0.5231078513927684&bail=10&ar=1.3333333&cap=3200",
 	"?cx=0&cy=0&span=4&f=cubic&z0=0.5*c+%2B+0.1*i&bail=3.5&j=1&jx=0.1&jy=0.7",
 	"?cx=-1&cy=0&span=4&rot=30&bail=100&col=linear",
+	// coloring toggles (after col, before cap) + the map palette (in the palette row)
+	"?cx=-1&cy=0&span=4&col=linear&disc=1&lm=538&pb=0&aa=0",
+	"?cx=-1&cy=0&span=4&bail=2&pal=map&map=000zzz%3C253%3E000&mapin=1&disc=1&lm=-1&pb=0&cap=3200",
+	"?cx=-1&cy=0&span=4&pal=map&map=000zzz%3C253%3E000&dens=32",
 	// everything at once
 	"?cx=0.5192304140682561&cy=0.7674373931280046&span=1.3382715312396376&f=custom&expr=%28z%5E2+%2B+c%29+*+sin%28z%5E%28c*i%29%29&j=1&jx=0.4206477290564087&jy=0.5647650444593624&filt=1&str=0.1&exp=7.5&fb=1&ar=1.3333333&pal=custom&stops=000000-ffffff&inset=ff8800&cyc=0&dens=12&col=sqrt&cap=5000",
 ];

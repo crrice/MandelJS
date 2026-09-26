@@ -10,6 +10,7 @@
 // the old code used them (julia seed f64s, cap number, stops list, cyclic flag).
 import type { View } from "./kernel/kernel";
 import { PALETTES } from "./palette";
+import { decodeColors } from "./fractint/colors";
 
 // The formula dropdown, as data. Key = the <option> value. "0" is the standard z²+c
 // (Kernel 1 fast path, no compiled formula). "custom" is the editable field. Every other
@@ -25,6 +26,7 @@ export const PRESETS: { [key: string]: Preset } = {
 };
 
 export const CUSTOM_DENSITY = 32;   // the custom palette's fixed default density
+export const MAP_DENSITY = 255;     // the map palette's: one cycle of its 255 outside entries
 
 // What a change to each param costs — the taxonomy the UI dispatch follows (today by
 // convention in main.ts's handlers; a P2 binder can drive it from here).
@@ -47,8 +49,14 @@ export interface AppState {
 	stops: string[];         // custom palette stops, "#rrggbb" each
 	inset: string;           // custom palette in-set color, "#rrggbb"
 	cyclic: boolean;         // custom palette bands flag
+	map: string;             // map palette: a Fractint colors= string, verbatim
+	mapInside: number;       // map palette: the in-set entry (Fractint inside=, 0..255)
 	density: string;         // density slider value, verbatim
 	coloring: string;        // "linear" | "sqrt" | "log" | "distance"
+	discrete: boolean;       // color from the integer escape count (Fractint bands)
+	logmap: number;          // Fractint logmap flag (0 = off)
+	palBlend: boolean;       // palette blending (false = nearest stop)
+	aa: boolean;             // edge anti-aliasing
 	cap: number | null;      // forced iteration cap (null = adaptive)
 }
 
@@ -59,8 +67,9 @@ export function defaultState(): AppState {
 		filterId: "0", strands: "0.08", exposure: "4", blend: "0",
 		aspect: "2",
 		paletteKey: "escape", stops: ["#0d0221", "#3a0ca3", "#7209b7", "#f72585", "#ffd60a"],
-		inset: "#000000", cyclic: true,
+		inset: "#000000", cyclic: true, map: "", mapInside: 0,
 		density: String(PALETTES.escape.density), coloring: "log",
+		discrete: false, logmap: 0, palBlend: true, aa: true,
 		cap: null,
 	};
 }
@@ -71,9 +80,11 @@ export function defaultState(): AppState {
 // (math/frame.ts), at their defaults 0/0/1 when the URL omits them.
 export interface RawView { cx: number; cxLo: number; cy: number; cyLo: number; span: number; rot: number; skew: number; xmag: number; }
 
-// The density the URL omits: each palette's own default (custom → CUSTOM_DENSITY).
-function defaultDensityFor(paletteKey: string): number {
+// The density the URL omits: each palette's own default (custom → CUSTOM_DENSITY, map →
+// MAP_DENSITY).
+export function defaultDensityFor(paletteKey: string): number {
 	if (paletteKey === "custom") return CUSTOM_DENSITY;
+	if (paletteKey === "map") return MAP_DENSITY;
 	return PALETTES[paletteKey] ? PALETTES[paletteKey].density : -1;
 }
 
@@ -146,7 +157,7 @@ const ROWS: ParamRow[] = [
 		write(p, _v, s) { if (s.aspect !== "2") p.set("ar", s.aspect); },
 		read(p, s) { const ar = p.get("ar"); if (ar && isFinite(Number(ar)) && Number(ar) > 0) s.aspect = ar; },
 	},
-	{ // palette (+ the custom gradient when selected)
+	{ // palette (+ the custom gradient or the map when selected)
 		cost: "recolor",
 		write(p, _v, s) {
 			if (s.paletteKey !== "escape") p.set("pal", s.paletteKey);
@@ -154,6 +165,10 @@ const ROWS: ParamRow[] = [
 				p.set("stops", s.stops.map((h) => h.replace("#", "")).join("-"));
 				p.set("inset", s.inset.replace("#", ""));
 				if (!s.cyclic) p.set("cyc", "0");   // bands default ON → omit
+			}
+			if (s.paletteKey === "map") {
+				p.set("map", s.map);
+				if (s.mapInside !== 0) p.set("mapin", String(s.mapInside));
 			}
 		},
 		read(p, s) {
@@ -169,6 +184,16 @@ const ROWS: ParamRow[] = [
 				}
 				if (/^[0-9a-fA-F]{6}$/.test(p.get("inset") || "")) s.inset = "#" + p.get("inset");
 				s.cyclic = p.get("cyc") !== "0";
+			} else if (pal === "map") {
+				// A map that does not decode leaves the default palette.
+				const m = p.get("map");
+				if (m && decodeColors(m).ok) {
+					s.paletteKey = "map";
+					s.map = m;
+					s.density = String(MAP_DENSITY);
+					const mi = Number(p.get("mapin") || "0");
+					s.mapInside = Number.isInteger(mi) && mi >= 0 && mi <= 255 ? mi : 0;
+				}
 			} else if (pal && PALETTES[pal]) {
 				s.paletteKey = pal;
 				s.density = String(PALETTES[pal].density);   // palette selection resets density to its default
@@ -184,6 +209,26 @@ const ROWS: ParamRow[] = [
 		cost: "recolor",
 		write(p, _v, s) { if (s.coloring !== "log") p.set("col", s.coloring); },
 		read(p, s) { const col = p.get("col"); if (col) s.coloring = col; },
+	},
+	{ // discrete (integer-count) coloring — only when on
+		cost: "recolor",
+		write(p, _v, s) { if (s.discrete) p.set("disc", "1"); },
+		read(p, s) { s.discrete = p.get("disc") === "1"; },
+	},
+	{ // Fractint logmap flag — only when on; non-integer reads as off
+		cost: "recolor",
+		write(p, _v, s) { if (s.logmap !== 0) p.set("lm", String(s.logmap)); },
+		read(p, s) { const lm = Number(p.get("lm") || "0"); s.logmap = Number.isInteger(lm) ? lm : 0; },
+	},
+	{ // palette blending — on by default
+		cost: "recolor",
+		write(p, _v, s) { if (!s.palBlend) p.set("pb", "0"); },
+		read(p, s) { s.palBlend = p.get("pb") !== "0"; },
+	},
+	{ // edge anti-aliasing — on by default
+		cost: "reiterate",
+		write(p, _v, s) { if (!s.aa) p.set("aa", "0"); },
+		read(p, s) { s.aa = p.get("aa") !== "0"; },
 	},
 	{ // forced iteration cap — only when set
 		cost: "reiterate",

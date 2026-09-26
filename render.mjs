@@ -78,11 +78,14 @@ const maxIters = flags.iters || state.cap || 1500;
 const density = Number(state.density) || 32;
 const pal = state.paletteKey === "custom"
 	? M.customPalette(state.stops, state.inset, state.cyclic, M.CUSTOM_DENSITY)
-	: (M.PALETTES[state.paletteKey] || M.PALETTES.escape);
+	: state.paletteKey === "map" ? M.mapPalette(state.map, state.mapInside, M.MAP_DENSITY)
+		: (M.PALETTES[state.paletteKey] || M.PALETTES.escape);
 const cyclic = state.paletteKey === "custom" ? state.cyclic : pal.cyclic;
-const { lut, inSet } = pal.build([231, 231, 226], [14, 15, 18], cyclic);
+const { lut, inSet, map } = pal.build([231, 231, 226], [14, 15, 18], cyclic, state.palBlend);
 const mode = state.coloring === "distance" ? 1 : 0;
 const bandMap = state.coloring === "linear" ? 0 : state.coloring === "sqrt" ? 1 : 2;
+// Index coloring (discrete / logmap over this render's cap / the map's exact entries).
+M.setIndexState({ discrete: state.discrete, logTable: M.logmapTable(state.logmap, maxIters), mapLut: map || null });
 
 M.setFrameState({
 	usePeriod, periodEps2: M.periodEps2For(view, useDD), useDD, usePert,
@@ -91,10 +94,10 @@ M.setFrameState({
 	juliaMode: state.juliaOn, mSeedAtC: false, juliaCx: state.juliaX, juliaCy: state.juliaY,
 	filterId, trapDStrands: Number(state.strands), filterDFactor: Number(state.exposure),
 	filterBlend: Number(state.blend), filterDensity: 1,
-	ssaaOn: !flags.noaa,   // edge-supersampled like the app's resting frame; --noaa = 1-sample
+	ssaaOn: !flags.noaa && state.aa,   // edge-supersampled like the app's resting frame; --noaa (or aa=0) = 1-sample
 });
 if (k2 && !state.juliaOn && M.z0Key(z0) === "" && M.decideSeedAtC(view)) {
-	M.setFrameState({ usePeriod, periodEps2: M.periodEps2For(view, useDD), useDD, usePert, bandMap, fractalMode: 1, formulaId: M.FORMULA_CUSTOM, juliaMode: false, mSeedAtC: true, juliaCx: state.juliaX, juliaCy: state.juliaY, filterId, trapDStrands: Number(state.strands), filterDFactor: Number(state.exposure), filterBlend: Number(state.blend), filterDensity: 1, ssaaOn: !flags.noaa });
+	M.setFrameState({ usePeriod, periodEps2: M.periodEps2For(view, useDD), useDD, usePert, bandMap, fractalMode: 1, formulaId: M.FORMULA_CUSTOM, juliaMode: false, mSeedAtC: true, juliaCx: state.juliaX, juliaCy: state.juliaY, filterId, trapDStrands: Number(state.strands), filterDFactor: Number(state.exposure), filterBlend: Number(state.blend), filterDensity: 1, ssaaOn: !flags.noaa && state.aa });
 }
 if (usePert) M.computeRef(view, maxIters);
 M.resetTallies();

@@ -2,6 +2,7 @@
 // palette.ts — a small pluggable palette system, baked into a LUT per render.
 // Main-thread only (themeColors reads the DOM); workers receive baked LUTs by message.
 //---------------------------------------------------------------------------\\
+import { decodeColors, pal8FromPal6, encodeColors } from "./fractint/colors";
 
 export type RGB = [number, number, number];
 
@@ -10,12 +11,15 @@ export interface Palette {
 	density: number;  // DEFAULT iterations per gradient cycle / ramp; user-overridable
 	// Build a 1D lookup table (+ in-set color) for the theme and the *effective*
 	// wrap. Taking wrap as an argument (rather than reading `cyclic`) is what lets
-	// a user flip bands<->ramp and get a freshly rebuilt, seamless LUT either way.
-	build(ink: RGB, paper: RGB, cyclic: boolean): { lut: Uint32Array; inSet: number };
+	// a user flip bands<->ramp and get a freshly rebuilt, seamless LUT either way. blend
+	// false = nearest stop, no interpolation. A map palette also returns its exact entries.
+	build(ink: RGB, paper: RGB, cyclic: boolean, blend?: boolean): { lut: Uint32Array; inSet: number; map?: Uint32Array };
 }
 
 const LUT_SIZE = 1024;
 const TAU = Math.PI * 2;
+// Blending off on a procedural (stop-less) palette: its curve held at this many even stops.
+const NOMINAL_STOPS = 16;
 
 // Little-endian RGBA pack (matches Uint32 view over the byte buffer).
 function pack(r: number, g: number, b: number): number {
@@ -23,6 +27,8 @@ function pack(r: number, g: number, b: number): number {
 }
 function clamp255(x: number): number { return x < 0 ? 0 : x > 255 ? 255 : x; }
 function lerp(a: number, b: number, t: number): number { return a + (b - a) * t; }
+// A procedural palette's position with blending off: snapped to the nearest nominal stop.
+function stepT(t: number, blend: boolean): number { return blend ? t : Math.round(t * NOMINAL_STOPS) / NOMINAL_STOPS; }
 
 // Inigo Quilez cosine palette: a + b*cos(2pi*(c*t + d)) per channel. Only
 // evaluated LUT_SIZE times at build, so the trig is free at render time.
@@ -37,8 +43,9 @@ function cosPalette(t: number, a: RGB, b: RGB, c: RGB, d: RGB): RGB {
 // Build a LUT by interpolating a gradient across arbitrary color stops (linear
 // per segment, faithful to the given colors). When cyclic, the first stop is
 // appended so the gradient loops back on itself — LUT[0] === LUT[last] — which
-// is what keeps wrapped (banded) rendering free of a hard seam.
-function buildStopsLut(stops: RGB[], cyclic: boolean): Uint32Array {
+// is what keeps wrapped (banded) rendering free of a hard seam. Without blend each entry
+// takes the NEAREST stop's color instead.
+function buildStopsLut(stops: RGB[], cyclic: boolean, blend = true): Uint32Array {
 	const pts = cyclic ? stops.concat([stops[0]]) : stops;
 	const segs = pts.length - 1;
 	const lut = new Uint32Array(LUT_SIZE);
@@ -46,7 +53,8 @@ function buildStopsLut(stops: RGB[], cyclic: boolean): Uint32Array {
 		const f = (i / (LUT_SIZE - 1)) * segs;   // position along the stop list
 		let si = f | 0;
 		if (si >= segs) si = segs - 1;           // clamp the final endpoint
-		const lt = f - si;                        // fraction within this segment
+		let lt = f - si;                          // fraction within this segment
+		if (!blend) lt = lt < 0.5 ? 0 : 1;
 		const a = pts[si], b = pts[si + 1];
 		lut[i] = pack(lerp(a[0], b[0], lt) | 0, lerp(a[1], b[1], lt) | 0, lerp(a[2], b[2], lt) | 0);
 	}
@@ -60,8 +68,8 @@ function stopsPalette(hexes: string[], cyclic: boolean, density: number): Palett
 	return {
 		cyclic,
 		density,
-		build(_ink: RGB, _paper: RGB, wrap: boolean): { lut: Uint32Array; inSet: number } {
-			return { lut: buildStopsLut(stops, wrap), inSet: pack(0, 0, 0) };
+		build(_ink: RGB, _paper: RGB, wrap: boolean, blend = true): { lut: Uint32Array; inSet: number } {
+			return { lut: buildStopsLut(stops, wrap, blend), inSet: pack(0, 0, 0) };
 		},
 	};
 }
@@ -79,10 +87,47 @@ export function customPalette(hexes: string[], insetHex: string, cyclic: boolean
 	return {
 		cyclic,
 		density,
-		build(_ink: RGB, _paper: RGB, wrap: boolean): { lut: Uint32Array; inSet: number } {
-			return { lut: buildStopsLut(stops, wrap), inSet: pack(inset[0], inset[1], inset[2]) };
+		build(_ink: RGB, _paper: RGB, wrap: boolean, blend = true): { lut: Uint32Array; inSet: number } {
+			return { lut: buildStopsLut(stops, wrap, blend), inSet: pack(inset[0], inset[1], inset[2]) };
 		},
 	};
+}
+
+// A MAP palette: an exact 256-entry Fractint map from a colors= string (C5.1/C5.4). Entry
+// `inside` (Fractint's inside=, 0 by default) is the in-set color; discrete coloring indexes
+// the entries exactly (kernel indexColor). As a gradient it is entries 1..255 on a cycle of
+// 255 — the position of count k is entry k, wrapping 255 → 1 like Fractint. null when the
+// string does not decode.
+export function mapPalette(colors: string, inside: number, density: number): Palette | null {
+	const res = decodeColors(colors);
+	if (!res.ok || !res.pal6) return null;
+	const pal8 = pal8FromPal6(res.pal6);
+	const map = new Uint32Array(256);
+	for (let i = 0; i < 256; i++) map[i] = pack(pal8[i * 3], pal8[i * 3 + 1], pal8[i * 3 + 2]);
+	const stops: RGB[] = [];
+	for (let k = 0; k < 255; k++) {
+		const e = k === 0 ? 255 : k;   // cycle position 0 ≡ 255
+		stops.push([pal8[e * 3], pal8[e * 3 + 1], pal8[e * 3 + 2]]);
+	}
+	return {
+		cyclic: true,
+		density,
+		build(_ink: RGB, _paper: RGB, wrap: boolean, blend = true): { lut: Uint32Array; inSet: number; map: Uint32Array } {
+			return { lut: buildStopsLut(stops, wrap, blend), inSet: map[inside & 255], map };
+		},
+	};
+}
+
+// A gradient LUT (+ its in-set color) sampled as a 256-entry map, colors= encoded: entry 0
+// is the in-set color, entry k the LUT at cycle position k/255 — the map palette's own
+// layout, so a map made from a palette reads back as that palette.
+export function mapColorsFrom(lut: Uint32Array, inSet: number): string {
+	const pal8 = new Uint8Array(768);
+	for (let k = 0; k < 256; k++) {
+		const c = k === 0 ? inSet : lut[Math.round(((k % 255) / 255) * (lut.length - 1))];
+		pal8[k * 3] = c & 255; pal8[k * 3 + 1] = (c >> 8) & 255; pal8[k * 3 + 2] = (c >> 16) & 255;
+	}
+	return encodeColors(pal8, true);
 }
 
 export const PALETTES: Record<string, Palette> = {
@@ -90,12 +135,12 @@ export const PALETTES: Record<string, Palette> = {
 	escape: {
 		cyclic: true,
 		density: 32,
-		build(): { lut: Uint32Array; inSet: number } {
+		build(_ink: RGB, _paper: RGB, _cyclic: boolean, blend = true): { lut: Uint32Array; inSet: number } {
 			const a: RGB = [0.5, 0.5, 0.5], bb: RGB = [0.5, 0.5, 0.5];
 			const c: RGB = [1, 1, 1], d: RGB = [0.65, 0.5, 0.2];
 			const lut = new Uint32Array(LUT_SIZE);
 			for (let i = 0; i < LUT_SIZE; i++) {
-				const [r, g, b] = cosPalette(i / (LUT_SIZE - 1), a, bb, c, d);
+				const [r, g, b] = cosPalette(stepT(i / (LUT_SIZE - 1), blend), a, bb, c, d);
 				lut[i] = pack(r | 0, g | 0, b | 0);
 			}
 			return { lut, inSet: pack(0, 0, 0) };
@@ -107,10 +152,10 @@ export const PALETTES: Record<string, Palette> = {
 	subtle: {
 		cyclic: false,
 		density: 48,
-		build(ink: RGB, paper: RGB, cyclic: boolean): { lut: Uint32Array; inSet: number } {
+		build(ink: RGB, paper: RGB, cyclic: boolean, blend = true): { lut: Uint32Array; inSet: number } {
 			const lut = new Uint32Array(LUT_SIZE);
 			for (let i = 0; i < LUT_SIZE; i++) {
-				let t = i / (LUT_SIZE - 1);
+				let t = stepT(i / (LUT_SIZE - 1), blend);
 				if (cyclic) t = 1 - Math.abs(2 * t - 1); // triangle paper->ink->paper: loops seamlessly
 				t = t * t * (3 - 2 * t);                 // smoothstep for a soft falloff
 				lut[i] = pack(

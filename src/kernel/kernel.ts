@@ -11,6 +11,7 @@ import { viewFrame, planeOffset, _ox, _oy } from "../math/frame";
 import type { Frame } from "../math/frame";
 import { FILTERS } from "../filters/index";
 import type { FilterColorFn } from "../filters/index";
+import { colorWrap } from "../fractint/colors";
 
 //---------------------------------------------------------------------------\\
 // Types + shared constants
@@ -139,6 +140,14 @@ let provOn = false, provLo = 0, provHi = 1;
 let provLut: Uint32Array | null = null;
 let ssaaOn = true;
 
+// Index coloring (discrete counts / logmap / the map palette's exact entries — C5.9). Recolor-
+// class, so it travels with the palette: main thread via Colorizer.pushColorState, workers via
+// the palette message. All off = today's smooth transfer.
+let discrete = false;
+let logTable: Uint8Array | null = null;
+let mapLut: Uint32Array | null = null;
+let indexOn = false;
+
 // Perturbation reference (built once per generation by computeRef; consumed via KCTX).
 let refZx = new Float64Array(1), refZy = new Float64Array(1), refLen = 0;
 let refOffX = 0, refOffY = 0;
@@ -195,6 +204,20 @@ export function setColorState(s: KernelColorState): void {
 	filterDFactor = s.filterDFactor;
 	filterBlend = s.filterBlend;
 	filterDensity = s.filterDensity;
+}
+
+export interface KernelIndexState {
+	discrete: boolean;             // color from the integer escape count, not smooth mu
+	logTable: Uint8Array | null;   // Fractint logmap table over 0..maxit (null = off)
+	mapLut: Uint32Array | null;    // a map palette's 256 packed entries (null = gradient palette)
+}
+
+// Apply the index-coloring state colorSample reads (see indexColor).
+export function setIndexState(s: KernelIndexState): void {
+	discrete = s.discrete;
+	logTable = s.logTable;
+	mapLut = s.mapLut;
+	indexOn = discrete || logTable !== null;
 }
 
 export function resetTallies(): void {
@@ -268,6 +291,36 @@ function bandTransform(mu: number, bandMapN: number): number {
 	return mu;
 }
 
+// mu → palette index. Discrete = the integer count (an escaper's count 0 reads 1, as in
+// Fractint); smooth keeps the fraction. The logmap table replaces the count, looked up at
+// min(count, maxit) and interpolated between entries when smooth.
+function indexOf(mu: number): number {
+	const x = mu < 1 ? 1 : mu;
+	const k = Math.floor(x);
+	if (!logTable) return discrete ? k : x;
+	const last = logTable.length - 1;
+	const a = logTable[k < last ? k : last];
+	if (discrete) return a;
+	return a + (logTable[k + 1 < last ? k + 1 : last] - a) * (x - k);
+}
+
+// The index transfer: a map palette in discrete mode is Fractint's exact pal8[wrap(index)];
+// otherwise the index is a position on the gradient (densityMul = 1 / iterations per cycle).
+function indexColor(mu: number, lut: Uint32Array, cyclic: boolean, densityMul: number, lvlLo: number, lvlHi: number): number {
+	const g = indexOf(mu);
+	if (mapLut && discrete) return mapLut[colorWrap(g)];
+	const lastIdx = lut.length - 1;
+	if (cyclic) {
+		let t = g * densityMul;
+		t -= (t | 0);
+		return lut[(t * lastIdx) | 0];
+	}
+	const glo = indexOf(lvlLo), ghi = indexOf(lvlHi);
+	let t = (g - glo) / (ghi > glo ? ghi - glo : 1);
+	t = t < 0 ? 0 : t > 1 ? 1 : t;
+	return lut[(t * lastIdx) | 0];
+}
+
 export function colorSample(
 	mu: number, de: number, lut: Uint32Array, inSet: number,
 	mode: number, cyclic: boolean, densityMul: number,
@@ -287,6 +340,7 @@ export function colorSample(
 		td -= (td | 0);
 		return lut[(td * lastIdx) | 0];
 	}
+	if (indexOn) return indexColor(mu, lut, cyclic, densityMul, lvlLo, lvlHi);
 	const g = bandTransform(mu, bandMapN);
 	if (cyclic) {
 		let t = g * densityMul;
