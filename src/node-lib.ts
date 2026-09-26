@@ -14,3 +14,7 @@ export { BufferSink } from "./render/sink";
 export { Emitter } from "./render/events";
 export { decideNext, useDDFor, periodEps2For, decideSeedAtC } from "./render/pipeline";
 export type { Phase, AdvanceInput, AdvanceDecision } from "./render/pipeline";
+export * from "./fractint/par";
+export * from "./fractint/colors";
+export { translateFrm } from "./fractint/frm-translate";
+export type { FrmTranslation, FrmReport, FrmLevel } from "./fractint/frm-translate";
