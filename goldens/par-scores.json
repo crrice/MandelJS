@@ -1,0 +1,7 @@
+{
+	"note": "Tier 1 Fractint reference scores (docs/fractint/conventions.md C6.5), bench/par-score.mjs: AA off at the JPEG size, point-sampled every stride-th pixel center. min/max are the gates; recorded is the last PAR_SCORE_UPDATE=1 run (informational).",
+	"pars": [
+		{"par":"par/midgetbrot.par","jpg":"par/midgetbrot.jpg","stride":2,"min":{"idx":0.79},"max":{"controls":0.1},"recorded":{"samples":480000,"unambiguous":318911,"idx":0.8025,"idx1":0.9109,"flat":0.9968,"flatSamples":188132,"rawMed":4.5826,"rawMean":20.6497,"ctlPlus":0.0478,"ctlMinus":0.061,"ctlRot":0.0952}},
+		{"par":"par/goldenerror.par","jpg":"par/goldenerror.jpg","stride":3,"min":{"idx":0.62},"max":{"controls":0.1},"recorded":{"samples":187500,"unambiguous":85245,"idx":0.636,"idx1":0.6988,"flat":0.9111,"flatSamples":26607,"rawMed":38.1314,"rawMean":60.9286,"ctlPlus":0.0512,"ctlMinus":0.0301,"ctlRot":0.0505}}
+	]
+}

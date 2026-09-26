@@ -4,7 +4,7 @@
 // whatever tile it's handed and transfers the buffers straight back. Workers keep
 // provisional coloring OFF (CAPPED → black per tile); the main thread overlays the heat.
 import {
-	SS, setFrameState, resetTallies, installKernels,
+	SS, setFrameState, setIndexState, resetTallies, installKernels,
 	computeRef, renderRegion, sharpenPoints, ssaaPoints,
 	iterAcc, escAcc, inAcc, perAcc, capAcc,
 } from "./kernel/kernel";
@@ -21,7 +21,7 @@ let refGen = -1;   // generation the cached perturbation reference orbit was com
 
 self.onmessage = (e: MessageEvent): void => {
 	const m = e.data as WorkerInMsg;
-	if (m.type === "palette") { PAL = m; return; }
+	if (m.type === "palette") { PAL = m; setIndexState(m); return; }
 	if (m.type === "kernels") { installKernels(m.srcs); return; }
 
 	// Tile job. The message IS the kernel frame state (TileMsg extends KernelFrameState),

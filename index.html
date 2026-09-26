@@ -41,10 +41,11 @@
 						<option value="abyss">abyss</option>
 						<option value="twilight">twilight</option>
 						<option value="custom">custom</option>
+						<option value="map">map (Fractint)</option>
 					</select>
 				</label>
 				<label class="field">density
-					<input class="density-slider" type="range" min="8" max="128" step="1" />
+					<input class="density-slider" type="range" min="8" max="255" step="1" />
 				</label>
 				<label class="field escape-only">coloring
 					<select class="coloring-select">
@@ -54,6 +55,25 @@
 						<option value="distance">distance</option>
 					</select>
 				</label>
+				<label class="field checkbox escape-only" title="Color from the whole escape count instead of the smooth value: flat bands through the coloring transfer (linear = one palette step per iteration, Fractint style). The kernels then count escapes Fractint-style, so switching it re-renders.">
+					<input class="discrete-toggle" type="checkbox" /> discrete</label>
+				<label class="field escape-only" title="Fractint logmap: compresses high escape counts onto the palette (1 = log, n > 1 = linear up to n then log, -1 = old log, -n = square root). Blank or 0 = off; replaces the coloring transfer, and counts escapes Fractint-style (re-renders).">logmap
+					<input class="logmap-input" type="number" step="1" placeholder="off" />
+				</label>
+				<label class="field checkbox" title="Blend between palette colors. Unchecked: each color is held until the next (nearest stop, no interpolation).">
+					<input class="palblend-toggle" type="checkbox" checked /> blend</label>
+				<label class="field checkbox" title="Anti-alias edges with a supersampling pass after the frame settles. Unchecked: one sample per pixel.">
+					<input class="aa-toggle" type="checkbox" checked /> anti-alias</label>
+				<div class="map-editor hidden">
+					<div class="pal-row">
+						<label class="field" title="A 256-entry Fractint map as a colors= string (entry 0 first). Discrete coloring indexes it exactly; otherwise it is a smooth cyclic gradient.">colors=
+							<input class="map-input formula-input" type="text" spellcheck="false" autocomplete="off" autocapitalize="off" />
+						</label>
+						<label class="field" title="The map entry used for the inside of the set (Fractint inside=).">inside
+							<input class="map-inside" type="number" min="0" max="255" step="1" value="0" />
+						</label>
+					</div>
+				</div>
 				<div class="palette-editor hidden">
 					<div class="pal-bar" title="live gradient preview"></div>
 					<div class="pal-stops"></div>
@@ -83,6 +103,12 @@
 					<input class="formula-input" type="text" spellcheck="false" autocomplete="off" autocapitalize="off"
 						value="z^2 + c" title="e.g. z^2 + c · (z^2+c)*sin(z^(c*i)) · z^3 + c · c*sin(z)" />
 				</label>
+				<label class="field" title="Initial z₀ as a formula of c (e.g. 0 · c · 0.5*c). Blank = the default seed. Setting it (or a bailout) counts escapes Fractint-style: tested after each step, count = steps taken.">z₀ =
+					<input class="z0-input formula-input" type="text" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="auto" />
+				</label>
+				<label class="field" title="Escape radius R: a point escapes once |z| ≥ R. Blank = the default (16 for z² + c, 2 otherwise).">bailout
+					<input class="bail-input" type="number" min="0" step="any" placeholder="auto" />
+				</label>
 				<span class="formula-error" role="alert"></span>
 				<label class="field checkbox"><input class="julia-toggle" type="checkbox" /> julia</label>
 				<label class="field">filter
@@ -109,6 +135,9 @@
 						<option value="1.6">16:10</option>
 						<option value="1">1:1</option>
 					</select>
+				</label>
+				<label class="field" title="Rotate the view by this many degrees (counter-clockwise). Zooms keep it; reset clears it.">rotation
+					<input class="rot-input" type="number" min="-360" max="360" step="any" value="0" />
 				</label>
 			</div>
 		</details>
@@ -147,6 +176,32 @@
 					<button class="btn export-cancel hidden" type="button">cancel</button>
 				</div>
 				<span class="export-status" aria-live="polite"></span>
+			</div>
+		</details>
+
+		<details class="ctrl-section">
+			<summary>.par files</summary>
+			<div class="ctrl-body">
+				<label class="btn par-load" title="Load a Fractint .par (or a MandelJS export). Pick any .frm formula files it uses along with it. You can also drop the files on the canvas.">load .par
+					<input class="par-file" type="file" accept=".par,.frm,.txt" multiple hidden />
+				</label>
+				<button class="btn par-paste" type="button" title="Paste the text of a .par entry.">paste</button>
+				<label class="field par-entry-field hidden">entry
+					<select class="par-entry"></select>
+				</label>
+				<label class="field" title="The entry name for save; also the file name. An import sets it to the entry's name.">name
+					<input class="par-name formula-input" type="text" spellcheck="false" autocomplete="off" value="mandeljs" />
+				</label>
+				<button class="btn par-save" type="button" title="Save the current view as a Fractint .par entry. Fractint can load it; MandelJS reloads it exactly (the ; mandeljs: line).">save .par</button>
+				<div class="par-paste-box hidden">
+					<textarea class="par-text formula-input" rows="6" spellcheck="false" placeholder="Name { type=mandel center-mag=… }"></textarea>
+					<button class="btn par-paste-go" type="button">import</button>
+				</div>
+				<div class="par-report hidden" role="status">
+					<button class="par-report-close" type="button" aria-label="dismiss">×</button>
+					<div class="par-report-head"></div>
+					<ul class="par-report-list"></ul>
+				</div>
 			</div>
 		</details>
 

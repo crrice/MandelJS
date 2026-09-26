@@ -3,17 +3,20 @@
 // src/kernel/, orchestration in src/render/pipeline.ts; the worker pool runs src/worker.ts.
 import { View, DEFAULT_VIEW, FORMULA_MANDEL } from "./kernel/kernel";
 import { ddAdd, _dhi, _dlo } from "./math/dd";
-import { compileFormula } from "./formula";
-import { Palette, PALETTES, customPalette, currentPalette } from "./palette";
-import { RenderPipeline } from "./render/pipeline";
+import { viewFrame, planeOffset, _ox, _oy } from "./math/frame";
+import { compileFormula, compileZ0 } from "./formula";
+import { Palette, PALETTES, customPalette, mapPalette, mapColorsFrom, currentPalette, themeColors } from "./palette";
+import { RenderPipeline, z0NeedsK2 } from "./render/pipeline";
 import { CanvasSink } from "./render/sink";
 import type { GenStats, FrameStats } from "./render/telemetry";
-import { AppState, PRESETS, CUSTOM_DENSITY, urlFromState, stateFromUrl, parFromState, stateFromPar } from "./config";
+import { AppState, PRESETS, CUSTOM_DENSITY, MAP_DENSITY, defaultDensityFor, urlFromState, stateFromUrl, stateFromPar } from "./config";
+import { parFromState } from "./fractint/export";
 import { FILTERS } from "./filters/index";
 import type { RawView } from "./config";
 import { easel, canvas, ctx, DEBUG } from "./ui/dom";
 import { computeGeometry, applyGeometry, pinGeometry, getResolution, setResolution } from "./ui/viewport";
 import type { ResolutionMode } from "./ui/viewport";
+import { initParImport } from "./ui/par-import";
 
 //---------------------------------------------------------------------------\\
 // Orchestration
@@ -32,6 +35,9 @@ let VIEW_ASPECT = 2;
 // a valid permalink. inJulia only tells syncUrl which set type to record + which seed.
 let inJulia = false;
 let currentSeed = { cx: 0, cy: 0 };   // the active Julia seed, for the URL (set by enterJulia / restoreFromUrl)
+// The z₀ the engine runs: an invalid entry is refused (applyEscape) or applied as unset
+// (applyFullState), so the URL and the .par export read this, not the field.
+let appliedZ0 = "";
 
 // Serialize the ENTIRE app state into the address bar so any view is a shareable
 // permalink. The param schema (config.ts) does the writing — one row per param, write and
@@ -39,6 +45,7 @@ let currentSeed = { cx: 0, cy: 0 };   // the active Julia seed, for the URL (set
 // pre-P1 serializer. Called by every mutating control (and restoreFromUrl).
 function syncUrl(): void {
 	history.replaceState(null, "", urlFromState(view, currentState()));
+	if (rotInput) rotInput.value = String(view.rot || 0);   // every view change passes here: keep the rotation field in step
 }
 
 // Gather the live app state from the controls + module vars — the ONE place serialization
@@ -48,6 +55,8 @@ function currentState(): AppState {
 	return {
 		formulaKey: formulaSelect ? formulaSelect.value : "0",
 		expr: formulaInput ? formulaInput.value : "z^2 + c",
+		z0: appliedZ0,
+		bail: currentBail(),
 		juliaOn: inJulia, juliaX: currentSeed.cx, juliaY: currentSeed.cy,
 		filterId: filterSelect ? filterSelect.value : "0",
 		strands: strandsSlider ? strandsSlider.value : "0.08",
@@ -58,8 +67,14 @@ function currentState(): AppState {
 		stops: customStops.slice(),
 		inset: palInset ? palInset.value : "#000000",
 		cyclic: palCyclic ? palCyclic.checked : true,
+		map: mapInput ? mapInput.value.trim() : "",
+		mapInside: currentMapInside(),
 		density: densitySlider ? densitySlider.value : "32",
 		coloring: coloringSelect ? coloringSelect.value : "log",
+		discrete: discreteToggle ? discreteToggle.checked : false,
+		logmap: currentLogmap(),
+		palBlend: palBlendToggle ? palBlendToggle.checked : true,
+		aa: aaToggle ? aaToggle.checked : true,
 		cap: currentIterCap(),
 	};
 }
@@ -267,19 +282,22 @@ dev.mandelDump = async () => {
 	return rec;
 };
 
-// .par round-trip (schema-driven; see config.ts). No argument: log + return the current
-// state as a Fractint-style parameter block. With text: parse it and apply the whole
-// state (same applier as a URL permalink), then render. e.g.
+// .par round-trip (see config.ts / fractint/export.ts). No argument: log + return the current
+// state as a Fractint par entry (with its lossless `; mandeljs:` line). With text: parse it
+// (MandelJS, legacy or Fractint entry) and apply the whole state (same applier as a URL
+// permalink), then render; returns the import report, or the reason it was refused. e.g.
 //   const p = mandelPar()          // export
 //   mandelPar(p)                   // re-import
 dev.mandelPar = (text?: string) => {
 	if (text == null) {
-		const par = parFromState("mandeljs", view, currentState());
+		const par = parFromState("mandeljs", view, currentState(), renderer.seedAtC);
 		console.log(par);
 		return par;
 	}
-	applyFullState(stateFromPar(text));
-	return "par applied";
+	const r = stateFromPar(text);
+	if (r.error) return r.error;
+	applyFullState(r);
+	return r.report.length ? r.report : "par applied";
 };
 
 // URL round-trip test hook (pure, no rendering): parse a query string through the schema
@@ -288,7 +306,7 @@ dev.mandelPar = (text?: string) => {
 dev.mandelUrlRT = (qs: string) => {
 	const { state, rawView } = stateFromUrl(qs);
 	const v: View = rawView
-		? { cx: rawView.cx, cxLo: rawView.cxLo, cy: rawView.cy, cyLo: rawView.cyLo, spanX: rawView.span, spanY: 0 }
+		? { cx: rawView.cx, cxLo: rawView.cxLo, cy: rawView.cy, cyLo: rawView.cyLo, spanX: rawView.span, spanY: 0, rot: rawView.rot, skew: rawView.skew, xmag: rawView.xmag }
 		: view;
 	return urlFromState(v, state);
 };
@@ -760,13 +778,15 @@ zoomButton.addEventListener("click", () => {
 	if (!r) return;
 	// Recenter in double-double: newCenter = oldCenter + boxOffset. In f64 the offset is
 	// lost once it drops below the center's ULP (~|c|·ε); ddAdd's twoSum keeps it, so the
-	// box lands where you drew it.
-	const offX = (r[0] + r[2] / 2 - 0.5) * view.spanX;
-	const offY = (0.5 - (r[1] + r[3] / 2)) * view.spanY;   // Im up: match the render's flipped y-map so the box lands where drawn
+	// box lands where you drew it. The box is drawn in the (possibly rotated) frame, so
+	// scaling the spans composes it exactly: rot/skew/xmag carry over unchanged.
+	planeOffset(viewFrame(view), r[0] + r[2] / 2 - 0.5, 0.5 - (r[1] + r[3] / 2));   // Im up: match the render's flipped y-map so the box lands where drawn
+	const offX = _ox, offY = _oy;
 	ddAdd(view.cx, view.cxLo, offX, 0); const ncx = _dhi, ncxLo = _dlo;
 	ddAdd(view.cy, view.cyLo, offY, 0); const ncy = _dhi, ncyLo = _dlo;
 	pushHistory(view);
 	goTo({
+		...view,
 		cx: ncx, cxLo: ncxLo, cy: ncy, cyLo: ncyLo,
 		spanX: view.spanX * r[2],
 		spanY: view.spanY * r[3],
@@ -794,8 +814,20 @@ if (outButton) {
 
 resetButton.addEventListener("click", () => {
 	pushHistory(view);
-	goTo(defaultViewFor());
+	goTo(defaultViewFor());   // default views are unrotated: reset clears the rotation
 });
+
+// Frame rotation in degrees (Fractint sign: the content turns counter-clockwise). A
+// navigation step like a zoom — back restores the old frame; later zooms keep it.
+const rotInput = document.querySelector(".rot-input") as HTMLInputElement | null;
+if (rotInput) {
+	rotInput.addEventListener("change", () => {
+		const rot = Number(rotInput.value);
+		if (!isFinite(rot) || rot === (view.rot || 0)) { rotInput.value = String(view.rot || 0); return; }
+		pushHistory(view);
+		goTo({ ...view, rot });
+	});
+}
 
 // Coloring method (optional control) — one dropdown for all four paths: escape-time bands
 // with the linear / √ / log transforms, plus distance estimate. Each recolors instantly.
@@ -808,6 +840,23 @@ function applyColoringFromControls(): void {
 if (coloringSelect) {
 	coloringSelect.addEventListener("change", () => { applyColoringFromControls(); syncUrl(); });
 }
+
+// Independent coloring toggles: discrete (integer-count) bands, Fractint logmap and palette
+// blending recolor instantly; anti-aliasing is a render pass, so it re-renders.
+const discreteToggle = document.querySelector(".discrete-toggle") as HTMLInputElement | null;
+const logmapInput = document.querySelector(".logmap-input") as HTMLInputElement | null;
+const palBlendToggle = document.querySelector(".palblend-toggle") as HTMLInputElement | null;
+const aaToggle = document.querySelector(".aa-toggle") as HTMLInputElement | null;
+// The logmap field's flag: blank / non-integer = 0 (off).
+function currentLogmap(): number {
+	const n = logmapInput ? Number(logmapInput.value) : 0;
+	return Number.isInteger(n) ? n : 0;
+}
+// Discrete / logmap read the integer escape count: recolor says when that needs a re-render.
+if (discreteToggle) discreteToggle.addEventListener("change", () => { const re = renderer.recolor({ discrete: discreteToggle.checked }); syncUrl(); if (re) renderer.render(view); });
+if (logmapInput) logmapInput.addEventListener("change", () => { const re = renderer.recolor({ logmap: currentLogmap() }); syncUrl(); if (re) renderer.render(view); });
+if (palBlendToggle) palBlendToggle.addEventListener("change", () => { renderer.recolor({ palBlend: palBlendToggle.checked }); syncUrl(); });
+if (aaToggle) aaToggle.addEventListener("change", () => { renderer.configure({ aa: aaToggle.checked }); syncUrl(); renderer.render(view); });
 
 // Palette instrument — palette picker + density slider. Wrap is no longer user-facing:
 // each palette's own default (cyclic) is used (setPalette resets it).
@@ -858,11 +907,39 @@ if (palRemove) palRemove.addEventListener("click", () => { if (customStops.lengt
 if (palInset) palInset.addEventListener("input", () => applyCustomPalette());
 if (palCyclic) palCyclic.addEventListener("change", () => applyCustomPalette());
 
+// ---- Map palette: an exact 256-entry Fractint map (a colors= string) + its inside entry.
+// Picking it with no map yet snapshots the escape gradient as a map to start from. ----
+const mapEditor = document.querySelector(".map-editor") as HTMLElement | null;
+const mapInput = document.querySelector(".map-input") as HTMLInputElement | null;
+const mapInsideInput = document.querySelector(".map-inside") as HTMLInputElement | null;
+function currentMapInside(): number {
+	const n = mapInsideInput ? Number(mapInsideInput.value) : 0;
+	return Number.isInteger(n) && n >= 0 && n <= 255 ? n : 0;
+}
+function applyMapPalette(): void {
+	if (!mapInput) return;
+	if (mapInput.value.trim() === "") {
+		const { ink, paper } = themeColors();
+		const built = PALETTES.escape.build(ink, paper, true);
+		mapInput.value = mapColorsFrom(built.lut, built.inSet);
+	}
+	const p = mapPalette(mapInput.value.trim(), currentMapInside(), MAP_DENSITY);
+	showFormulaError(p ? "" : "map: invalid colors= string");
+	if (!p) return;
+	renderer.recolor({ palette: p });
+	if (densitySlider) densitySlider.value = String(MAP_DENSITY);
+	syncUrl();
+}
+if (mapInput) mapInput.addEventListener("change", () => applyMapPalette());
+if (mapInsideInput) mapInsideInput.addEventListener("change", () => applyMapPalette());
+
 if (paletteSelect) {
 	paletteSelect.addEventListener("change", () => {
 		const isCustom = paletteSelect.value === "custom";
 		paletteEditor?.classList.toggle("hidden", !isCustom);
+		mapEditor?.classList.toggle("hidden", paletteSelect.value !== "map");
 		if (isCustom) { renderStops(); applyCustomPalette(); return; }
+		if (paletteSelect.value === "map") { applyMapPalette(); return; }
 		const p = PALETTES[paletteSelect.value];
 		if (!p) return;
 		renderer.recolor({ palette: p });   // resets effective wrap/density to the palette defaults
@@ -895,8 +972,10 @@ if (filterSelectEl) {
 
 const formulaSelect = document.querySelector(".formula-select") as HTMLSelectElement | null;
 const formulaCustom = document.querySelector(".formula-custom") as HTMLElement | null;
-const formulaInput = document.querySelector(".formula-input") as HTMLInputElement | null;
+const formulaInput = document.querySelector(".formula-custom .formula-input") as HTMLInputElement | null;
 const formulaError = document.querySelector(".formula-error") as HTMLElement | null;
+const z0Input = document.querySelector(".z0-input") as HTMLInputElement | null;       // initial z₀ (a formula of c; blank = default seed)
+const bailInput = document.querySelector(".bail-input") as HTMLInputElement | null;   // bailout radius (blank = default)
 const juliaToggle = document.querySelector(".julia-toggle") as HTMLInputElement | null;
 const filterSelect = document.querySelector(".filter-select") as HTMLSelectElement | null;
 const strandsSlider = document.querySelector(".strands-slider") as HTMLInputElement | null;
@@ -914,7 +993,7 @@ function pushFilter(): void {
 function updateContextualControls(): void {
 	const filterOn = currentFilterId() !== 0;
 	const customOn = formulaSelect?.value === "custom";
-	const k2 = (formulaSelect ? formulaSelect.value !== "0" : false) || !!juliaToggle?.checked || filterOn;
+	const k2 = (formulaSelect ? formulaSelect.value !== "0" : false) || !!juliaToggle?.checked || filterOn || z0NeedsK2(appliedZ0, currentBail());
 	document.querySelectorAll<HTMLElement>(".filter-param").forEach((el) => el.classList.toggle("hidden", !filterOn));
 	formulaCustom?.classList.toggle("hidden", !customOn);   // the f(z,c)= text field appears only for "custom…"
 	if (!customOn && formulaError) formulaError.textContent = "";   // clear a stale error when leaving custom
@@ -1000,6 +1079,34 @@ if (formulaInput) {
 	formulaInput.addEventListener("change", () => applyCustomFormula());
 	formulaInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); applyCustomFormula(); } });
 }
+
+// Formula escape settings: z₀ (a formula of c) + bailout radius. Either one set switches to
+// Fractint escape counting (the test after each step, count = steps — see escapeSpec);
+// both re-iterate the current view. Blank bailout = the kernel's default radius.
+function currentBail(): number | null {
+	if (!bailInput || bailInput.value.trim() === "") return null;
+	const r = Number(bailInput.value);
+	return isFinite(r) && r > 0 ? r : null;
+}
+function applyEscape(): void {
+	const z0 = z0Input ? z0Input.value.trim() : "";
+	const res = compileZ0(z0);
+	if (z0 !== "" && !res.ok) { showFormulaError("z₀: " + (res.error || "invalid")); return; }
+	appliedZ0 = z0;
+	renderer.configure({ escape: { z0, bail: currentBail() } });
+	updateContextualControls();
+	syncUrl();
+	renderer.render(view);
+}
+if (z0Input) {
+	z0Input.addEventListener("input", () => {
+		const res = compileZ0(z0Input.value);
+		showFormulaError(z0Input.value.trim() === "" || res.ok ? "" : "z₀: " + (res.error || "invalid"));
+	});
+	z0Input.addEventListener("change", () => applyEscape());
+	z0Input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); applyEscape(); } });
+}
+if (bailInput) bailInput.addEventListener("change", () => applyEscape());
 
 if (filterSelect) {
 	filterSelect.addEventListener("change", () => { pushFilter(); updateContextualControls(); syncUrl(); renderer.render(view); });
@@ -1224,6 +1331,13 @@ async function runExport(width: number, test = false, refine = true): Promise<Bl
 // skips the sharpening ladder (AA still runs).
 dev.mandelExport = (width = 1920, opts) => runExport(width, !!(opts && opts.test), !(opts && opts.refine === false));
 
+// .par load/save (ui/par-import.ts): an accepted import applies like a permalink; save
+// writes the current state as a Fractint entry with its lossless `; mandeljs:` line.
+initParImport({
+	apply: (r) => applyFullState(r),
+	exportPar: (name) => parFromState(name, view, currentState(), renderer.seedAtC),
+});
+
 // ---- Permalink restore + first render. Runs LAST (all controls + renderer methods
 // exist). The schema (config.ts) parses the URL into an AppState; applyFullState pushes
 // it into the controls + renderer (no change events → no premature renders/syncs), then
@@ -1252,19 +1366,26 @@ function applyEngineState(target: RenderPipeline, s: AppState): void {
 			target.configure({ formula: { id: FORMULA_MANDEL } });   // "0" → standard z²+c (Kernel 1)
 		}
 	}
+	// Escape settings (an invalid z₀ applies as unset; applyFullState shows its error).
+	target.configure({ escape: { z0: s.z0 === "" || compileZ0(s.z0).ok ? s.z0 : "", bail: s.bail } });
 	// Filter + params, then the A/B blend method.
 	target.configure({ filter: { id: Number(s.filterId) || 0, dStrands: Number(s.strands), dFactor: Number(s.exposure) } });
 	target.recolor({ filterBlend: Number(s.blend) });
 	// Coloring: palette (resets density to its default) → density override → transfer mode.
 	if (s.paletteKey === "custom") {
 		target.recolor({ palette: customPalette(s.stops, s.inset, s.cyclic, CUSTOM_DENSITY) });
-	} else if (s.paletteKey !== "escape" && PALETTES[s.paletteKey]) {
-		target.recolor({ palette: PALETTES[s.paletteKey] });
+	} else if (s.paletteKey === "map") {
+		const p = mapPalette(s.map, s.mapInside, MAP_DENSITY);
+		if (p) target.recolor({ palette: p });
+	} else if (PALETTES[s.paletteKey]) {
+		target.recolor({ palette: PALETTES[s.paletteKey] });   // escape too: a par import may replace another palette
 	}
-	const palDefault = s.paletteKey === "custom" ? CUSTOM_DENSITY : (PALETTES[s.paletteKey] ? PALETTES[s.paletteKey].density : -1);
-	if (Number(s.density) !== palDefault) target.recolor({ density: Number(s.density) });
+	if (Number(s.density) !== defaultDensityFor(s.paletteKey)) target.recolor({ density: Number(s.density) });
 	if (s.coloring === "distance") target.recolor({ coloring: { mode: 1, bandMap: 0 } });
 	else target.recolor({ coloring: { mode: 0, bandMap: s.coloring === "sqrt" ? 1 : s.coloring === "log" ? 2 : 0 } });
+	// The independent coloring toggles (defaults: smooth, no logmap, blended, anti-aliased).
+	target.recolor({ discrete: s.discrete, logmap: s.logmap, palBlend: s.palBlend });
+	target.configure({ aa: s.aa });
 	// Forced iteration cap — applied before the first render.
 	target.configure({ iterCap: s.cap });
 	// Set type + seed.
@@ -1292,39 +1413,51 @@ function applyFullState({ state: s, rawView }: { state: AppState; rawView: RawVi
 	// Controls reflect the state.
 	if (formulaSelect) formulaSelect.value = s.formulaKey;
 	if (s.formulaKey === "custom" && formulaInput) formulaInput.value = s.expr;
+	if (z0Input) z0Input.value = s.z0;
+	appliedZ0 = s.z0 === "" || compileZ0(s.z0).ok ? s.z0 : "";
+	if (bailInput) bailInput.value = s.bail != null ? String(s.bail) : "";
 	if (filterSelect) filterSelect.value = s.filterId;
 	if (strandsSlider) strandsSlider.value = s.strands;
 	if (exposureSlider) exposureSlider.value = s.exposure;
 	if (blendSelect) blendSelect.value = s.blend;
+	if (paletteSelect) paletteSelect.value = s.paletteKey;
+	paletteEditor?.classList.toggle("hidden", s.paletteKey !== "custom");
+	mapEditor?.classList.toggle("hidden", s.paletteKey !== "map");
 	if (s.paletteKey === "custom") {
-		if (paletteSelect) paletteSelect.value = "custom";
 		customStops = s.stops.slice();
 		if (palInset) palInset.value = s.inset;
 		if (palCyclic) palCyclic.checked = s.cyclic;
-		paletteEditor?.classList.remove("hidden");
 		renderStops();
 		updatePalBar();
 		if (densitySlider) densitySlider.value = String(CUSTOM_DENSITY);
-	} else if (s.paletteKey !== "escape" && paletteSelect && PALETTES[s.paletteKey]) {
-		paletteSelect.value = s.paletteKey;
+	} else if (s.paletteKey === "map") {
+		if (mapInput) mapInput.value = s.map;
+		if (mapInsideInput) mapInsideInput.value = String(s.mapInside);
+		if (densitySlider) densitySlider.value = String(MAP_DENSITY);
+	} else if (PALETTES[s.paletteKey]) {
 		if (densitySlider) densitySlider.value = String(PALETTES[s.paletteKey].density);
 	}
-	const palDefault = s.paletteKey === "custom" ? CUSTOM_DENSITY : (PALETTES[s.paletteKey] ? PALETTES[s.paletteKey].density : -1);
-	if (Number(s.density) !== palDefault && densitySlider) densitySlider.value = s.density;
+	if (Number(s.density) !== defaultDensityFor(s.paletteKey) && densitySlider) densitySlider.value = s.density;
 	if (coloringSelect) coloringSelect.value = s.coloring;
+	if (discreteToggle) discreteToggle.checked = s.discrete;
+	if (logmapInput) logmapInput.value = s.logmap !== 0 ? String(s.logmap) : "";
+	if (palBlendToggle) palBlendToggle.checked = s.palBlend;
+	if (aaToggle) aaToggle.checked = s.aa;
 	if (itercapInput) itercapInput.value = s.cap != null ? String(s.cap) : "";
 	// Formula error/note pill (the engine install happens in applyEngineState).
 	if (s.formulaKey === "custom") {
 		const res = compileFormula(s.expr);
 		showFormulaError(!res.ok ? res.error || "invalid formula" : res.refsC === false && !s.juliaOn ? "note: no c — every point is identical" : "");
 	}
+	const z0Res = compileZ0(s.z0);
+	if (s.z0 !== "" && !z0Res.ok) showFormulaError("z₀: " + (z0Res.error || "invalid"));
 
 	applyEngineState(renderer, s);
 
 	// View + set type. spanY derives from the REQUESTED aspect — the same window on
 	// every device regardless of the buffer's pixel count.
 	const urlView: View | null = rawView
-		? { cx: rawView.cx, cxLo: rawView.cxLo, cy: rawView.cy, cyLo: rawView.cyLo, spanX: rawView.span, spanY: rawView.span / VIEW_ASPECT }
+		? { cx: rawView.cx, cxLo: rawView.cxLo, cy: rawView.cy, cyLo: rawView.cyLo, spanX: rawView.span, spanY: rawView.span / VIEW_ASPECT, rot: rawView.rot, skew: rawView.skew, xmag: rawView.xmag }
 		: null;
 	if (s.juliaOn) {
 		mBundle = { view: defaultViewFor(), history: [] };   // inJulia still false → a sensible M-view for a later exit
@@ -1338,6 +1471,7 @@ function applyFullState({ state: s, rawView }: { state: AppState; rawView: RawVi
 		if (juliaToggle) juliaToggle.checked = false;
 		view = urlView || defaultViewFor();
 	}
+	setHistory([]);   // a new state starts a new exploration (an import replaces the page's state)
 
 	updateContextualControls();   // fix any conflicts (e.g. distance coloring on Kernel 2 → log)
 	syncUrl();                    // normalize the address bar to the canonical serialization

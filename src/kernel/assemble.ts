@@ -21,6 +21,12 @@ export interface KernelSpec {
 	formulaBody: string | null;   // compiled f(z,c) body (assigns _cre/_cim), null = z²+c
 	filterId: number;             // 0 = escape-time
 	juliaMode: boolean;           // K2 trap-geometry + observer-skip baking
+	// Fractint escape semantics (C3.2/C3.5/C4.4) — absent on every default spec, whose source
+	// stays byte-identical. With bailR: test |z|² ≥ R² AFTER each step; the escape count is
+	// the number of steps (1..maxIters−1); mu = count + a smooth fraction in [0, 1).
+	bailR?: number;
+	seedC?: boolean;              // with bailR, Kernel 1: z₀ = c (the textbook orbit one step behind)
+	z0Body?: string;              // with bailR, Kernel 2: compiled z₀ expression of c (assigns _cre/_cim)
 }
 
 export interface AssembledKernels {
@@ -115,31 +121,67 @@ const wrap = (name: string, body: string): string =>
 	body + `\n//# sourceURL=mandel-kernel/${name}.js`;
 
 //---------------------------------------------------------------------------\\
+// Fractint escape semantics (KernelSpec.bailR). Kernel 1 keeps its loop shape — the test
+// at the top of the loop sees z_n after n steps, so the count is n; with seedC the orbit
+// from z₀ = c is the textbook one a step ahead, so the count is n − 1 (≥ 1) and the loop
+// runs one extra step to still test z_maxIters (C3.5). The interior shortcuts are exact only
+// while every in-set orbit (|z| ≤ 2, and |z| = 2 at c = −2) stays under R: baked for R > 2.
+//---------------------------------------------------------------------------\\
+
+interface FracEsc { r2: string; lnR2: string; loop: string; count: string; shortcuts: boolean; }
+
+function fracEsc(spec: KernelSpec): FracEsc | null {
+	if (spec.bailR == null) return null;
+	const R = spec.bailR;
+	return {
+		r2: String(R * R), lnR2: String(Math.log(R * R)),
+		loop: spec.seedC ? "n <= maxIters" : "n < maxIters",
+		count: spec.seedC ? "n > 1 ? n - 1 : 1" : "n",
+		shortcuts: R > 2,
+	};
+}
+
+// Escape exit: mu = count + a smooth fraction in [0, 1) from the escape |z| against the
+// actual R. floor(mu) IS the count — also after the field's Float32 store: a fraction that
+// would round up to count + 1 is pinned to the largest float32 below it.
+function countExit(count: string, mag2: string, lnR2: string, ind: string): string {
+	return [
+		`const cnt = ${count};`,
+		`const fr = 1 - Math.log2(Math.log(${mag2}) / ${lnR2});`,
+		"let mu = cnt + (fr > 0 ? fr : 0);",
+		"if (Math.fround(mu) >= cnt + 1) mu = Math.fround((cnt + 1) * 0.9999999403953552);",
+		"K.out[1] = n; K.out[2] = 0;",
+		"return mu;",
+	].join("\n" + ind);
+}
+
+//---------------------------------------------------------------------------\\
 // K1 f64 — the optimized z²+c Mandelbrot engine (escape-time, derivative for DE).
 //---------------------------------------------------------------------------\\
 
-function emitK1f64(usePeriod: boolean): string {
+function emitK1f64(usePeriod: boolean, fe: FracEsc | null): string {
 	const per = usePeriod ? `
 if (n >= ${PERIOD_WARMUP}) {
 	const rx = zx - refx, ry = zy - refy;
 	if (rx * rx + ry * ry < eps2) { K.out[0] = 0; K.out[1] = n; K.out[2] = 2; return Infinity; }
 	if (n === checkAt) { refx = zx; refy = zy; checkAt *= 2; }
 }` : "";
+	const exit = fe ? countExit(fe.count, "mag2", fe.lnR2, "\t\t") : `const mu = n + 1 - Math.log(0.5 * Math.log(mag2)) / Math.LN2;
+		K.out[1] = n; K.out[2] = 0;
+		return mu < 0 ? 0 : mu;`;
 	return wrap("k1f64", `
 const eps2 = K.eps2;
-${shortcuts("cr", "ci")}
+${!fe || fe.shortcuts ? shortcuts("cr", "ci") : ""}
 let zx = 0, zy = 0, dzx = 0, dzy = 0, n = 0;
 let refx = 0, refy = 0, checkAt = ${PERIOD_WARMUP};
-while (n < maxIters) {
+while (${fe ? fe.loop : "n < maxIters"}) {
 	const x2 = zx * zx, y2 = zy * zy;
 	const mag2 = x2 + y2;
-	if (mag2 > ${BAILOUT2}) {
+	if (${fe ? "mag2 >= " + fe.r2 : "mag2 > " + BAILOUT2}) {
 		const zmag = Math.sqrt(mag2);
 		const dmag = Math.sqrt(dzx * dzx + dzy * dzy);
 		K.out[0] = dmag > 1e-300 ? 2 * zmag * Math.log(zmag) / dmag : 1e30;
-		const mu = n + 1 - Math.log(0.5 * Math.log(mag2)) / Math.LN2;
-		K.out[1] = n; K.out[2] = 0;
-		return mu < 0 ? 0 : mu;
+		${exit}
 	}
 	const ndzx = 2 * (zx * dzx - zy * dzy) + 1;
 	const ndzy = 2 * (zx * dzy + zy * dzx);
@@ -159,30 +201,31 @@ return -Infinity;`);
 // |z|<|δ| or reference exhaustion, full-z Brent. (cr,ci) = full coord, (ax,ay) = δc.
 //---------------------------------------------------------------------------\\
 
-function emitK1pert(usePeriod: boolean): string {
+function emitK1pert(usePeriod: boolean, fe: FracEsc | null): string {
 	const per = usePeriod ? `
 	if (n >= ${PERIOD_WARMUP}) {
 		const rx = zx - refx, ry = zy - refy;
 		if (rx * rx + ry * ry < eps2) { K.out[0] = 0; K.out[1] = n; K.out[2] = 2; return Infinity; }
 		if (n === checkAt) { refx = zx; refy = zy; checkAt *= 2; }
 	}` : "";
+	const exit = fe ? countExit(fe.count, "z2", fe.lnR2, "\t\t") : `const mu = n + 1 - Math.log(0.5 * Math.log(z2)) / Math.LN2;
+		K.out[1] = n; K.out[2] = 0;
+		return mu < 0 ? 0 : mu;`;
 	return wrap("k1pert", `
 const eps2 = K.eps2;
 const refZx = K.refZx, refZy = K.refZy, refLen = K.refLen;
 const dcx = ax, dcy = ay;
-${shortcuts("cr", "ci")}
+${!fe || fe.shortcuts ? shortcuts("cr", "ci") : ""}
 let dx = 0, dy = 0, dzx = 0, dzy = 0, n = 0, m = 0;
 let refx = 0, refy = 0, checkAt = ${PERIOD_WARMUP};
-while (n < maxIters) {
+while (${fe ? fe.loop : "n < maxIters"}) {
 	const Zx = refZx[m], Zy = refZy[m];
 	const zx = Zx + dx, zy = Zy + dy;
 	const z2 = zx * zx + zy * zy;
-	if (z2 > ${BAILOUT2}) {
+	if (${fe ? "z2 >= " + fe.r2 : "z2 > " + BAILOUT2}) {
 		const zmag = Math.sqrt(z2), dmag = Math.sqrt(dzx * dzx + dzy * dzy);
 		K.out[0] = dmag > 1e-300 ? 2 * zmag * Math.log(zmag) / dmag : 1e30;
-		const mu = n + 1 - Math.log(0.5 * Math.log(z2)) / Math.LN2;
-		K.out[1] = n; K.out[2] = 0;
-		return mu < 0 ? 0 : mu;
+		${exit}
 	}${per}
 	const ndzx = 2 * (zx * dzx - zy * dzy) + 1, ndzy = 2 * (zx * dzy + zy * dzx);
 	dzx = ndzx; dzy = ndzy;
@@ -202,19 +245,20 @@ return -Infinity;`);
 // old ddAdd/ddMul/ddSq call sequences). (cr,ci) = hi limbs, (ax,ay) = lo limbs.
 //---------------------------------------------------------------------------\\
 
-function emitK1dd(usePeriod: boolean): string {
+function emitK1dd(usePeriod: boolean, fe: FracEsc | null): string {
 	const e = new Emit();
 	// Loop body, emitted in the exact sequence of the old escapeSmoothDD.
 	const [zr2h, zr2l] = e.ddSq("zrhi", "zrlo");
 	const [zi2h, zi2l] = e.ddSq("zihi", "zilo");
 	e.push(`const mag2 = ${zr2h} + ${zi2h};`);
-	e.push(`if (mag2 > ${BAILOUT2}) {
+	const exit = fe ? countExit(fe.count, "mag2", fe.lnR2, "\t") : `const mu = n + 1 - Math.log(0.5 * Math.log(mag2)) / Math.LN2;
+	K.out[1] = n; K.out[2] = 0;
+	return mu < 0 ? 0 : mu;`;
+	e.push(`if (${fe ? "mag2 >= " + fe.r2 : "mag2 > " + BAILOUT2}) {
 	const zmag = Math.sqrt(mag2);
 	const dmag = Math.sqrt(dzxhi * dzxhi + dzyhi * dzyhi);
 	K.out[0] = dmag > 1e-300 ? 2 * zmag * Math.log(zmag) / dmag : 1e30;
-	const mu = n + 1 - Math.log(0.5 * Math.log(mag2)) / Math.LN2;
-	K.out[1] = n; K.out[2] = 0;
-	return mu < 0 ? 0 : mu;
+	${exit}
 }`);
 	// z' = 2·z·z' + 1 (all DD; uses the current z)
 	const [zdxh, zdxl] = e.ddMul("zrhi", "zrlo", "dzxhi", "dzxlo");
@@ -247,11 +291,11 @@ function emitK1dd(usePeriod: boolean): string {
 	}
 	return wrap("k1dd", `
 const eps2 = K.eps2;
-${shortcuts("cr", "ci", "ax === 0 && ")}
+${!fe || fe.shortcuts ? shortcuts("cr", "ci", "ax === 0 && ") : ""}
 let zrhi = 0, zrlo = 0, zihi = 0, zilo = 0;
 let dzxhi = 0, dzxlo = 0, dzyhi = 0, dzylo = 0, n = 0;
 let refxhi = 0, refxlo = 0, refyhi = 0, refylo = 0, checkAt = ${PERIOD_WARMUP};
-while (n < maxIters) {
+while (${fe ? fe.loop : "n < maxIters"}) {
 ${e.lines.join("\n")}
 }
 K.out[0] = 0.5 * Math.log(dzxhi * dzxhi + dzyhi * dzyhi + 1e-300);
@@ -265,7 +309,7 @@ return -Infinity;`);
 // (cr,ci) = z₀, (ax,ay) = c.
 //---------------------------------------------------------------------------\\
 
-function emitK2(spec: KernelSpec): string {
+function emitK2(spec: KernelSpec, fe: FracEsc | null): string {
 	const filter = spec.filterId !== 0 ? FILTERS[spec.filterId] : null;
 	// Step: inlined z²+c or the compiled formula body (assigns _cre/_cim locals).
 	const step = spec.formulaBody == null
@@ -298,6 +342,35 @@ if (escaped) {
 }
 K.out[0] = 0; K.out[2] = 3;
 return -Infinity;`;
+	if (fe) {
+		// Fractint shape (C4.4): z₀ = the baked expression (else the caller's), then step,
+		// observe and test the NEW z — z₀ itself is never tested. count = steps taken. A z²+c
+		// Julia is Fractint's type=julia (calmanp5 dojulia_p5, C8): no step is pre-counted, so
+		// the escape at step k counts max(1, k − 1) and z_maxIters is still tested.
+		const jul = spec.juliaMode && spec.formulaBody == null && !filter;
+		return wrap("k2", `
+const eps2 = K.eps2;
+const cx = ax, cy = ay;
+${trapInit}
+let _cre = cr, _cim = ci;
+${spec.z0Body != null ? "{\n" + spec.z0Body + "\n}" : ""}
+let zx = _cre, zy = _cim, n = 0, escaped = false;
+${filter ? filter.locals : ""}
+let psx = zx, psy = zy, pchk = ${PERIOD_WARMUP};
+while (n < ${jul ? "maxIters" : "maxIters - 1"}) {
+	${step}
+	n++;
+	${observer}
+	if (!(zx * zx + zy * zy < ${fe.r2})) { escaped = true; break; }${per}
+}
+${filter ? epilogue : `K.out[0] = 0;
+if (escaped) {
+	const mag2 = zx * zx + zy * zy;
+	${countExit(jul ? "n > 1 ? n - 1 : 1" : "n", "mag2", fe.lnR2, "\t")}
+}
+K.out[1] = n; K.out[2] = 3;
+return -Infinity;`}`);
+	}
 	return wrap("k2", `
 const eps2 = K.eps2;
 const cx = ax, cy = ay;
@@ -337,16 +410,18 @@ function djb2(s: string): string {
 }
 
 export function assembleAll(spec: KernelSpec): AssembledKernels {
+	const fe = fracEsc(spec);
 	const key = "p" + (spec.usePeriod ? 1 : 0) +
 		"|f" + (spec.formulaBody != null ? djb2(spec.formulaBody) : "-") +
-		"|t" + spec.filterId + "|j" + (spec.juliaMode ? 1 : 0);
+		"|t" + spec.filterId + "|j" + (spec.juliaMode ? 1 : 0) +
+		(fe ? "|b" + spec.bailR + (spec.seedC ? "c" : "") + (spec.z0Body != null ? "|z" + djb2(spec.z0Body) : "") : "");
 	return {
 		key,
 		srcs: {
-			k1f64: emitK1f64(spec.usePeriod),
-			k1dd: emitK1dd(spec.usePeriod),
-			k1pert: emitK1pert(spec.usePeriod),
-			k2: emitK2(spec),
+			k1f64: emitK1f64(spec.usePeriod, fe),
+			k1dd: emitK1dd(spec.usePeriod, fe),
+			k1pert: emitK1pert(spec.usePeriod, fe),
+			k2: emitK2(spec, fe),
 			probeStep: emitProbeStep(spec.formulaBody),
 		},
 	};

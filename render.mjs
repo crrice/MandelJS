@@ -4,6 +4,7 @@
 // dependencies (PNG encoding = node:zlib deflate + a CRC32).
 //
 //   node render.mjs "<?query>" <out.png> [--size WxH] [--iters N] [--noaa]
+//   node render.mjs --par par/midgetbrot.par [--entry name] <out.png> [--size WxH]
 //   node render.mjs "?cx=0&cy=0&span=3.2&j=1&jx=0.323&jy=-0.046&pal=custom&stops=ffffff&inset=000000" .renders/julia.png --size 640x640
 //
 // --noaa: 1-sample per pixel (no edge supersampling). With a single-stop palette + a
@@ -15,7 +16,7 @@
 // --iters for deep windows), no sharpening ladder, no level-snap repaint (non-cyclic
 // palettes use the provisional 0..1/densityMul mapping), density is the zoom-1 mapping.
 // Build first: npm run build.
-import { writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { deflateSync } from "node:zlib";
 import * as M from "./dist/node-lib.js";
@@ -32,75 +33,47 @@ for (let i = 0; i < args.length; i++) {
 	else if (args[i] === "--iters") flags.iters = Number(args[++i]);
 	else if (args[i] === "--noaa") flags.noaa = true;
 	else if (args[i] === "--noperiod") flags.noperiod = true;
+	else if (args[i] === "--par") flags.par = args[++i];
+	else if (args[i] === "--entry") flags.entry = args[++i];
 	else pos.push(args[i]);
 }
-const [query, outPath] = pos;
-if (!query || !outPath) {
-	console.error('usage: node render.mjs "<?query>" <out.png> [--size WxH] [--iters N]');
+const [query, outPath] = flags.par ? [null, pos[0]] : pos;
+if ((!query && !flags.par) || !outPath) {
+	console.error('usage: node render.mjs "<?query>" <out.png> [--size WxH] [--iters N]\n       node render.mjs --par <file.par> [--entry name] <out.png> [--size WxH]');
 	process.exit(2);
 }
-const sm = /^(\d+)x(\d+)$/.exec(flags.size || "640x320");
+
+// The state: a permalink, or a .par entry (Fractint or MandelJS) through the app's importer.
+let state, rawView;
+if (flags.par) {
+	const imp = M.stateFromPar(readFileSync(flags.par, "utf8"), flags.entry);
+	if (imp.error) { console.error("par refused: " + imp.error); process.exit(1); }
+	for (const n of imp.report) if (n.level !== "applied") console.error("  " + n.level + "  " + n.key + ": " + n.msg);
+	({ state, rawView } = imp);
+} else {
+	({ state, rawView } = M.stateFromUrl(query));
+}
+// A par's default size follows its window aspect (square pixels).
+const sm = /^(\d+)x(\d+)$/.exec(flags.size || (flags.par ? "640x" + Math.round(640 / Number(state.aspect)) : "640x320"));
 if (!sm) { console.error("--size must look like 640x640"); process.exit(2); }
 const W = Number(sm[1]), H = Number(sm[2]);
 
 //---------------------------------------------------------------------------\\
-// Engine setup — the golden-runner recipe: state → kernels → frame → renderRegion.
-//---------------------------------------------------------------------------\\
-
-const { state, rawView } = M.stateFromUrl(query);
-const raw = rawView || { cx: -1, cxLo: 0, cy: 0, cyLo: 0, span: 4 };
-const view = { cx: raw.cx, cxLo: raw.cxLo, cy: raw.cy, cyLo: raw.cyLo, spanX: raw.span, spanY: raw.span / (W / H) };
-
-let formulaBody = null;
-const preset = M.PRESETS[state.formulaKey];
-const src = state.formulaKey === "custom" ? state.expr : preset && preset.formula;
-if (src) {
-	const res = M.compileFormula(src);
-	if (!res.ok) { console.error("formula failed to compile: " + (res.error || "")); process.exit(1); }
-	formulaBody = res.body;
-}
-const filterId = Number(state.filterId) || 0;
+// Engine setup + render — the shared headless recipe (src/render/headless.ts).
 // --noperiod: bake the cycle-detector OUT. Near parabolic parameters the Brent ε-check
 // can falsely mark slow-crawling EXTERIOR orbits as periodic (in-set); disabling it makes
 // a threshold render an honest dwell level-set (at the cost of no interior early-out).
-const usePeriod = !flags.noperiod;
-M.installKernels(M.assembleAll({ usePeriod, formulaBody, filterId, juliaMode: state.juliaOn }).srcs);
+//---------------------------------------------------------------------------\\
 
-const k2 = formulaBody != null || state.juliaOn || filterId !== 0;
-const useDD = k2 ? false : M.useDDFor(view, W);
-const usePert = useDD;
-const maxIters = flags.iters || state.cap || 1500;
-
-// Palette: the app's own bakes. Custom stops/inset are absolute; theme args only matter
-// for the theme-aware built-ins ("subtle") — standalone dark fallbacks used there.
-const density = Number(state.density) || 32;
-const pal = state.paletteKey === "custom"
-	? M.customPalette(state.stops, state.inset, state.cyclic, M.CUSTOM_DENSITY)
-	: (M.PALETTES[state.paletteKey] || M.PALETTES.escape);
-const cyclic = state.paletteKey === "custom" ? state.cyclic : pal.cyclic;
-const { lut, inSet } = pal.build([231, 231, 226], [14, 15, 18], cyclic);
-const mode = state.coloring === "distance" ? 1 : 0;
-const bandMap = state.coloring === "linear" ? 0 : state.coloring === "sqrt" ? 1 : 2;
-
-M.setFrameState({
-	usePeriod, periodEps2: M.periodEps2For(view, useDD), useDD, usePert,
-	bandMap,
-	fractalMode: k2 ? 1 : 0, formulaId: formulaBody != null ? M.FORMULA_CUSTOM : 0,
-	juliaMode: state.juliaOn, mSeedAtC: false, juliaCx: state.juliaX, juliaCy: state.juliaY,
-	filterId, trapDStrands: Number(state.strands), filterDFactor: Number(state.exposure),
-	filterBlend: Number(state.blend), filterDensity: 1,
-	ssaaOn: !flags.noaa,   // edge-supersampled like the app's resting frame; --noaa = 1-sample
-});
-if (k2 && !state.juliaOn && M.decideSeedAtC(view)) {
-	M.setFrameState({ usePeriod, periodEps2: M.periodEps2For(view, useDD), useDD, usePert, bandMap, fractalMode: 1, formulaId: M.FORMULA_CUSTOM, juliaMode: false, mSeedAtC: true, juliaCx: state.juliaX, juliaCy: state.juliaY, filterId, trapDStrands: Number(state.strands), filterDFactor: Number(state.exposure), filterBlend: Number(state.blend), filterDensity: 1, ssaaOn: !flags.noaa });
+let frame;
+try {
+	frame = M.setupHeadless(state, rawView, W, H, { iters: flags.iters, noaa: flags.noaa, noperiod: flags.noperiod });
+} catch (e) {
+	console.error(e.message); process.exit(1);
 }
-if (usePert) M.computeRef(view, maxIters);
 M.resetTallies();
-
-const N = W * H;
-const out = new Uint32Array(N), mu = new Float32Array(N), de = new Float32Array(N);
 const t0 = performance.now();
-M.renderRegion(out, mu, de, W, 0, 0, W, H, W, H, view, maxIters, lut, inSet, 1 / density, cyclic, mode);
+const { out } = M.renderHeadless(frame);
 const ms = performance.now() - t0;
 
 //---------------------------------------------------------------------------\\

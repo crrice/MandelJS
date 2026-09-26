@@ -2,8 +2,10 @@
 // per-filter override, provisional ramp) + every "sample → packed color" path, all routed
 // through the kernel's single colorSample so nothing can drift. Reads the DOM only inside
 // rebuild() (via themeColors), so importing this module stays Node-safe.
-import { View, SS, colorSample, setColorState } from "../kernel/kernel";
-import type { KernelColorState } from "../kernel/kernel";
+import { View, SS, colorSample, setColorState, setIndexState } from "../kernel/kernel";
+import type { KernelColorState, KernelIndexState } from "../kernel/kernel";
+import { fineSpan } from "../math/frame";
+import { logmapTable } from "../fractint/colors";
 import { Palette, PALETTES, themeColors } from "../palette";
 import { FILTERS } from "../filters/index";
 import type { PaletteMsg } from "../protocol";
@@ -27,9 +29,15 @@ export class Colorizer {
 	public densityMul = 1 / 32;
 	public bandMap = 2;            // escape band transfer (0 linear / 1 sqrt / 2 log)
 	public mode = 0;               // 0 = escape-time, 1 = distance
+	public discrete = false;       // color from the integer escape count (Fractint bands)
+	public blend = true;           // palette blending (false = nearest stop)
 	public lut!: Uint32Array;
 	public inSet = 0;
+	private map: Uint32Array | null = null;   // a map palette's exact entries
 	private provLut!: Uint32Array;
+	private logFlag = 0;           // Fractint logmap (its LogFlag; 0 = off)
+	private logCap = 0;            // the maxit the logmap table was built for
+	private logTable: Uint8Array | null = null;
 
 	public constructor(palette: Palette, filterId: number) {
 		this.palette = palette;
@@ -51,30 +59,60 @@ export class Colorizer {
 	public rebuild(filterId: number): void {
 		const { ink, paper } = themeColors();
 		const ov = filterId !== 0 && FILTERS[filterId] ? FILTERS[filterId].lut : null;
-		const built = this.palette.build(ink, paper, ov ? ov.cyclic : this.wrap);
+		const built = this.palette.build(ink, paper, ov ? ov.cyclic : this.wrap, this.blend);
 		this.lut = built.lut;
 		this.inSet = built.inSet;
+		this.map = built.map || null;
 		this.provLut = PALETTES.subtle.build(ink, paper, false).lut;
+	}
+
+	// Set the logmap flag; the table is built over 0..the cap last given to setLogCap.
+	public setLogmap(flag: number): void {
+		this.logFlag = flag;
+		this.logTable = flag !== 0 && this.logCap > 1 ? logmapTable(flag, this.logCap) : null;
+	}
+
+	// The frame's iteration cap is Fractint's maxit for the logmap table (fixed per render, so
+	// the sharpening ladder never re-bands). True when the table was rebuilt.
+	public setLogCap(maxit: number): boolean {
+		if (maxit === this.logCap) return false;
+		this.logCap = maxit;
+		if (this.logFlag === 0) return false;
+		this.setLogmap(this.logFlag);
+		return true;
+	}
+
+	// Does the coloring read the integer escape count (discrete or logmap)? Then the kernels
+	// must count (pipeline escapeSpec).
+	public get indexed(): boolean {
+		return this.discrete || this.logFlag !== 0;
+	}
+
+	// The index-coloring state (kernel indexColor) — on the main thread and in every worker.
+	public indexState(): KernelIndexState {
+		return { discrete: this.discrete, logTable: this.logTable, mapLut: this.map };
 	}
 
 	// The palette message each worker holds (its own structured-clone copy, ~4KB).
 	public paletteMsg(): PaletteMsg {
-		return { type: "palette", lut: this.lut, inSet: this.inSet, cyclic: this.wrap };
+		return { type: "palette", lut: this.lut, inSet: this.inSet, cyclic: this.wrap, ...this.indexState() };
 	}
 
 	// Push the color-pass state colorSample/filterColor read — called before EVERY
 	// main-thread color path so none can run on stale kernel state.
 	public pushColorState(cs: Omit<KernelColorState, "provLut">): void {
 		setColorState({ ...cs, provLut: this.provLut });
+		setIndexState(this.indexState());
 	}
 
 	// Map the density knob to the cyclic period, per band map (see the P0 kernel notes:
 	// sqrt/log are zoom-stable; linear stretches with zoom).
 	public densityMulFor(view: View, defaultSpanX: number): number {
+		if (this.logFlag !== 0) return 1 / this.densityBase;   // logmap index → position: entries per cycle
 		if (this.bandMap === 1) return BAND_FREQ_SQRT / this.densityBase;
 		if (this.bandMap === 2) return BAND_FREQ_LOG / this.densityBase;
 		if (!this.wrap) return 1 / this.densityBase;
-		const zoom = defaultSpanX / view.spanX;
+		const zoom = defaultSpanX / fineSpan(view);
 		const stretch = zoom > 1 ? Math.pow(zoom, COLOR_STRETCH_EXP) : 1;
 		return 1 / (this.densityBase * stretch);
 	}
@@ -82,7 +120,7 @@ export class Colorizer {
 	// Color one field sample — the shared colorSample with this frame's level window.
 	public sampleColor(mu: number, de: number, view: View, levels: Levels, width: number): number {
 		return colorSample(mu, de, this.lut, this.inSet, this.mode, this.wrap, this.densityMul,
-			view.spanX / width, this.bandMap, levels.muLo, levels.muHi);
+			fineSpan(view) / width, this.bandMap, levels.muLo, levels.muHi);
 	}
 
 	// Average one edge pixel's SS² subsamples into a packed color.

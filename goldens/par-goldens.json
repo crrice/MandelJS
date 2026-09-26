@@ -1,0 +1,7 @@
+{
+	"note": "Bit-exact field hashes of MandelJS's own renders of the committed pars (bench/par-golden.mjs): imported via config.stateFromPar, rendered by src/render/headless.ts with AA off (1 sample per pixel center), FNV-1a 32 over the raw mu/de Float32 fields and the packed RGBA pixels. Node baseline (V8 Math precision); re-record only on purpose with PAR_GOLDEN_UPDATE=1.",
+	"pars": [
+		{"par":"par/midgetbrot.par","w":640,"h":480,"maxIters":1000,"iters":50618291,"esc":307106,"ins":0,"per":25,"cap":69,"muHash":"55ce8d40","deHash":"42938603","pixHash":"4fbf4824"},
+		{"par":"par/goldenerror.par","w":640,"h":480,"maxIters":3200,"iters":206615137,"esc":306752,"ins":0,"per":72,"cap":376,"muHash":"b41fe365","deHash":"34ab9dc5","pixHash":"c86ff7d4"}
+	]
+}

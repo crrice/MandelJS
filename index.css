@@ -217,6 +217,7 @@ h1 {
 	transition: border-color 0.15s ease, color 0.15s ease;
 }
 .formula-input:hover { border-color: #4c6ef5; }
+.formula-input.z0-input { width: 120px; }   /* z₀ = a short expression of c */
 .formula-input:focus-visible { outline: 2px solid #4c6ef5; outline-offset: 2px; }
 /* Parse error / note for the custom formula. Empty => collapsed. Amber-red so it reads as "fix this". */
 .formula-error {
@@ -247,6 +248,10 @@ h1 {
 .pal-stops input[type="color"]::-webkit-color-swatch-wrapper { padding: 2px; }
 .pal-stops input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
 .pal-inset { width: 26px; }
+/* Map-palette editor: the colors= string + inside entry, shown for palette=map. */
+.map-editor { flex-basis: 100%; }
+.map-editor.hidden { display: none; }
+.map-input { width: 260px; }
 .pal-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
 .pal-row .btn { padding: 5px 11px; font-size: 0.78rem; }
 
@@ -259,6 +264,33 @@ h1 {
 	max-width: 34ch;
 }
 .export-status:empty { display: none; }
+
+/* .par files: load/paste/save row, the paste box, and the import report (dismissible). */
+.par-entry-field.hidden, .par-paste-box.hidden, .par-report.hidden { display: none; }
+.par-name { width: 140px; }
+.par-paste-box { flex-basis: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+.par-text { width: 100%; line-height: 1.4; resize: vertical; }
+.par-report {
+	position: relative;
+	flex-basis: 100%;
+	padding: 8px 30px 8px 10px;
+	border: 1px solid #2a2c31;
+	border-radius: 6px;
+	background: #1a1c20;
+	font: 500 0.72rem/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+	color: #cdd6e6;
+}
+.par-report-list { margin: 6px 0 0; padding-left: 16px; }
+.par-report-list:empty { display: none; }
+.par-report-list .par-approximated { color: #f0b656; }
+.par-report-list .par-ignored { color: #a9aab0; }
+.par-report-list .par-unsupported, .par-report-list .par-error { color: #f08a6b; }
+.par-report-close {
+	position: absolute; top: 4px; right: 6px;
+	border: none; background: none; color: #a9aab0; font-size: 1rem; cursor: pointer;
+}
+.par-report-close:hover { color: #fff; }
+.easel.is-drop { border-color: #4c6ef5; }   /* a file dragged over the canvas */
 
 .field {
 	display: inline-flex;
@@ -280,6 +312,16 @@ h1 {
 	transition: border-color 0.15s ease, color 0.15s ease;
 }
 .field select:hover { color: #fff; border-color: #4c6ef5; }
+.field input[type="number"] {
+	font: inherit;
+	width: 90px;
+	color: #cdd6e6;
+	background: #1a1c20;
+	border: 1px solid #2a2c31;
+	border-radius: 6px;
+	padding: 7px 10px;
+}
+.field input[type="number"]:hover { border-color: #4c6ef5; }
 .field input[type="checkbox"] { accent-color: #4c6ef5; width: 15px; height: 15px; cursor: pointer; }
 .field input[type="range"] { accent-color: #4c6ef5; width: 104px; cursor: pointer; }
 .field :focus-visible { outline: 2px solid #4c6ef5; outline-offset: 2px; }

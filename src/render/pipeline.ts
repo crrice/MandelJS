@@ -13,6 +13,8 @@ import {
 import type { KernelFrameState } from "../kernel/kernel";
 import { assembleAll } from "../kernel/assemble";
 import type { KernelSpec } from "../kernel/assemble";
+import { viewFrame, planeOffset, fineSpan, _ox, _oy } from "../math/frame";
+import { compileZ0 } from "../formula";
 import type { Palette } from "../palette";
 import type { TileMsg, DoneMsg } from "../protocol";
 import { FieldStore, Levels, TileJob } from "./field";
@@ -56,14 +58,14 @@ const TILE_W = 20, TILE_H = 20;
 // Auto-gate double-double: engage once the pixel step nears the coordinate ULP (with a
 // few octaves of margin so DD is already on before the artifacts).
 export function useDDFor(v: View, canvasW: number): boolean {
-	const step = v.spanX / canvasW;
+	const step = fineSpan(v) / canvasW;
 	const ulp = Math.max(Math.abs(v.cx), Math.abs(v.cy)) * Number.EPSILON;
 	return step < ulp * DD_SWITCH_RATIO;
 }
 
 // Cycle-detection ε² tightens with zoom; DD tightens faster to a much lower floor.
 export function periodEps2For(v: View, useDD: boolean): number {
-	const zoom = DEFAULT_VIEW.spanX / v.spanX;
+	const zoom = DEFAULT_VIEW.spanX / fineSpan(v);
 	if (zoom <= PERIOD_EPS_ZOOM0) return PERIOD_EPS2;
 	if (useDD) {
 		const e2 = PERIOD_EPS2 * Math.pow(PERIOD_EPS_ZOOM0 / zoom, 1.3);
@@ -78,10 +80,46 @@ export function periodEps2For(v: View, useDD: boolean): number {
 // Requires the generated kernels (probeStep) to be installed.
 export function decideSeedAtC(view: View): boolean {
 	const S = [[0, 0], [0.31, 0.19], [-0.29, 0.23], [0.27, -0.21], [-0.33, -0.17]];
+	const f = viewFrame(view);
 	for (const [fx, fy] of S) {
-		if (probeStepFinite(view.cx + fx * view.spanX, view.cy + fy * view.spanY)) return false;
+		planeOffset(f, fx, fy);
+		if (probeStepFinite(view.cx + _ox, view.cy + _oy)) return false;
 	}
 	return true;
+}
+
+// The formula escape settings (z₀ expression + bailout radius). z0Key normalizes the z₀
+// text; "" (unset) keeps today's seed, including the heuristic z₀ = c parameter map.
+export function z0Key(z0: string): string {
+	return z0.replace(/\s+/g, "").toLowerCase();
+}
+
+// Kernel 1 serves z₀ "0" and "c" (the z²+c fast path with DD/perturbation); any other z₀
+// needs Kernel 2's baked expression. So does "c" under a radius below 2: Kernel 1 runs that
+// orbit from 0 and so also tests z₀ = c itself, which Fractint never does (it only agrees
+// while |c| ≥ R implies |c² + c| ≥ R, i.e. R ≥ 2).
+export function z0NeedsK2(z0: string, bail: number | null = null): boolean {
+	const k = z0Key(z0);
+	return k !== "" && k !== "0" && (k !== "c" || (bail != null && bail < 2));
+}
+
+// The escape settings → the KernelSpec fields. z₀ "" with bail null is today's semantics:
+// no fields, so the default kernels stay byte-identical. Anything set → Fractint's (C3.2/
+// C4.4), with R = bail or today's radius for the kernel in use (16 on Kernel 1, 2 on Kernel
+// 2). Kernel 2 bakes the compiled z₀ for Mandelbrot only — a Julia z₀ is the pixel.
+// counts (discrete or logmap coloring) needs the integer escape count, which only Fractint
+// counting carries (floor(mu) of the smooth value is not the count, C3.5): it switches the
+// counting on at today's radius.
+export function escapeSpec(z0: string, bail: number | null, k2: boolean, julia: boolean, counts = false): Pick<KernelSpec, "bailR" | "seedC" | "z0Body"> {
+	const k = z0Key(z0);
+	if (k === "" && bail == null && !counts) return {};
+	const out: Pick<KernelSpec, "bailR" | "seedC" | "z0Body"> = { bailR: bail ?? (k2 ? 2 : 16) };
+	if (!k2 && k === "c") out.seedC = true;
+	if (k2 && !julia && k !== "") {
+		const res = compileZ0(z0);
+		if (res.ok && res.body) out.z0Body = res.body;
+	}
+	return out;
 }
 
 // The render phases. The old implicit flags map onto the phase VALUE: sharpenStage/
@@ -152,9 +190,13 @@ export interface RecolorPatch {
 	filterExposure?: number;
 	filterBlend?: number;
 	prov?: boolean;
+	discrete?: boolean;                             // integer-count (banded) coloring
+	palBlend?: boolean;                             // palette blending (false = nearest stop)
+	logmap?: number;                                // Fractint logmap flag (0 = off)
 }
 export interface ComputePatch {
 	formula?: { id: number } | { body: string };
+	escape?: { z0: string; bail: number | null };   // formula escape settings (see escapeSpec)
 	setType?: { julia: boolean; cx?: number; cy?: number };
 	filter?: { id: number; dStrands: number; dFactor: number };
 	iterCap?: number | null;
@@ -162,6 +204,7 @@ export interface ComputePatch {
 	dd?: boolean | null;
 	period?: boolean;
 	sharpen?: boolean;
+	aa?: boolean;                                   // edge anti-aliasing pass (false = 1 sample/px)
 }
 
 export class RenderPipeline {
@@ -185,6 +228,8 @@ export class RenderPipeline {
 	private juliaCy = 0;
 	private customStepBody = "";
 	private mSeedAtC = false;
+	private z0 = "";                     // z₀ expression ("" = today's seed)
+	private bail: number | null = null;  // bailout radius (null = the kernel's default)
 	private filterId = 0;
 	private dStrands = 0.08;
 	private dFactor = 1;
@@ -219,17 +264,22 @@ export class RenderPipeline {
 		this.ensureKernels();   // assemble + install the default kernel set (main + workers)
 	}
 
-	// (Re)assemble the generated kernels for the current spec. Cached by assembly key:
-	// unchanged config → the SAME hot function objects keep running (JIT warmth); a config
-	// change installs locally and broadcasts the sources to the pool.
-	private ensureKernels(): void {
-		const spec: KernelSpec = {
+	// The kernel spec of the current config.
+	private kernelSpec(): KernelSpec {
+		return {
 			usePeriod: this.usePeriod,
 			formulaBody: this.formulaId === FORMULA_CUSTOM ? this.customStepBody : null,
 			filterId: this.filterId,
 			juliaMode: this.juliaMode,
+			...escapeSpec(this.z0, this.bail, this.fractalMode === 1, this.juliaMode, this.colorizer.indexed && this.filterId === 0),
 		};
-		const asm = assembleAll(spec);
+	}
+
+	// (Re)assemble the generated kernels for the current spec. Cached by assembly key:
+	// unchanged config → the SAME hot function objects keep running (JIT warmth); a config
+	// change installs locally and broadcasts the sources to the pool.
+	private ensureKernels(): void {
+		const asm = assembleAll(this.kernelSpec());
 		if (asm.key === this.kernelKey) return;
 		this.kernelKey = asm.key;
 		installKernels(asm.srcs);
@@ -237,6 +287,9 @@ export class RenderPipeline {
 	}
 
 	public get events(): Emitter<RendererEvents> { return this.telemetry.events; }
+
+	// The last render's heuristic seed (z₀ = c for a blank z₀; the .par export writes it).
+	public get seedAtC(): boolean { return this.mSeedAtC; }
 
 	// Read-only field access (mandelDump and friends — no more private-field casts).
 	public get fields(): { mu: Float32Array; de: Float32Array } {
@@ -247,8 +300,10 @@ export class RenderPipeline {
 	// Config intake, split by cost class.
 	//------------------------------------------------------------------------\\
 
-	// Recolor-class changes: apply, then ONE instant repaint from the stored field.
-	public recolor(p: RecolorPatch): void {
+	// Recolor-class changes: apply, then ONE instant repaint from the stored field. True when
+	// the change also needs a re-render (the CALLER renders): discrete / logmap coloring
+	// switches the kernels to integer escape counts when no z₀ / bailout does (escapeSpec).
+	public recolor(p: RecolorPatch): boolean {
 		if (p.theme) {
 			this.colorizer.rebuild(this.filterId);
 			this.pool.setPalette(this.colorizer.paletteMsg());
@@ -266,8 +321,18 @@ export class RenderPipeline {
 			this.provOn = p.prov;
 			if (p.prov) this.provLevels = this.field.computeProvLevels();
 		}
+		// Index coloring + blending live in the workers' palette state too → resend.
+		let reiterate = false;
+		if (p.discrete !== undefined || p.palBlend !== undefined || p.logmap !== undefined) {
+			if (p.discrete !== undefined) this.colorizer.discrete = p.discrete;
+			if (p.logmap !== undefined) this.colorizer.setLogmap(p.logmap);
+			if (p.palBlend !== undefined) { this.colorizer.blend = p.palBlend; this.colorizer.rebuild(this.filterId); }
+			this.pool.setPalette(this.colorizer.paletteMsg());
+			reiterate = assembleAll(this.kernelSpec()).key !== this.kernelKey;
+		}
 		this.colorizer.densityMul = this.colorizer.densityMulFor(this.view, DEFAULT_VIEW.spanX);
 		this.repaint();
+		return reiterate;
 	}
 
 	// Compute-class changes: apply + re-derive the kernel; the CALLER re-renders (matching
@@ -283,6 +348,7 @@ export class RenderPipeline {
 				this.formulaId = p.formula.id;
 			}
 		}
+		if (p.escape !== undefined) { this.z0 = p.escape.z0; this.bail = p.escape.bail; }
 		if (p.setType !== undefined) {
 			this.juliaMode = p.setType.julia;
 			if (p.setType.julia) { this.juliaCx = p.setType.cx ?? 0; this.juliaCy = p.setType.cy ?? 0; }
@@ -302,6 +368,7 @@ export class RenderPipeline {
 		if (p.dd !== undefined) this.ddOverride = p.dd;
 		if (p.period !== undefined) this.usePeriod = p.period;
 		if (p.sharpen !== undefined) this.sharpenOn = p.sharpen;
+		if (p.aa !== undefined) this.ssaaRefine = p.aa;
 		this.deriveKernel();
 		this.ensureKernels();
 		// A changed formula body warrants a clean-slate pool (hang recovery for pathological
@@ -312,7 +379,7 @@ export class RenderPipeline {
 	// Kernel dispatch: Kernel 1 (optimized z²+c M-engine with DD/pert) ONLY when nothing
 	// general is needed; anything else → Kernel 2 (f64), which forces DD/pert off.
 	private deriveKernel(): void {
-		const k2 = this.formulaId !== 0 || this.juliaMode || this.filterId !== 0;
+		const k2 = this.formulaId !== 0 || this.juliaMode || this.filterId !== 0 || z0NeedsK2(this.z0, this.bail);
 		this.fractalMode = k2 ? 1 : 0;
 		if (k2) { this.ddOverride = false; this.pertOverride = false; }
 		else { this.ddOverride = null; this.pertOverride = null; }
@@ -355,7 +422,7 @@ export class RenderPipeline {
 	//------------------------------------------------------------------------\\
 
 	private itersForView(v: View, usePert: boolean): number {
-		const zoom = DEFAULT_VIEW.spanX / v.spanX;
+		const zoom = DEFAULT_VIEW.spanX / fineSpan(v);
 		if (zoom <= 1) return ITER_BASE;
 		const budget = Math.round(ITER_BASE + ITER_SLOPE * Math.log2(zoom));
 		return usePert ? Math.min(ITER_CAP_PERT, budget * PERT_ITER_MULT) : Math.min(ITER_CAP, budget);
@@ -363,17 +430,17 @@ export class RenderPipeline {
 
 	private probeCap(view: View): number {
 		const floor = this.itersForView(view, false);
-		const zoom = DEFAULT_VIEW.spanX / view.spanX;
+		const zoom = DEFAULT_VIEW.spanX / fineSpan(view);
 		const budgetPerPx = FF_BUDGET_BASE + FF_BUDGET_SLOPE * Math.max(0, Math.log2(zoom));
 		const probeCeil = Math.max(floor, Math.round(budgetPerPx * FF_PROBE_CEIL_MULT));
 		// Probe the ACTIVE fractal, but measure escape DWELL (filter off) to size the cap.
 		setFrameState(this.frameState({ filterId: FILTER_NONE }));
 		const dwells: number[] = [];
+		const f = viewFrame(view);
 		for (let j = 0; j < FF_PROBE_NY; j++) {
-			const offY = (0.5 - (j + 0.5) / FF_PROBE_NY) * view.spanY;
 			for (let i = 0; i < FF_PROBE_NX; i++) {
-				const offX = ((i + 0.5) / FF_PROBE_NX - 0.5) * view.spanX;
-				const pxc = view.cx + offX, pyc = view.cy + offY;
+				planeOffset(f, (i + 0.5) / FF_PROBE_NX - 0.5, 0.5 - (j + 0.5) / FF_PROBE_NY);
+				const pxc = view.cx + _ox, pyc = view.cy + _oy;
 				const mu = !this.fractalMode
 					? escapeK1(pxc, pyc, probeCeil)
 					: this.juliaMode ? escapeK2(pxc, pyc, this.juliaCx, this.juliaCy, probeCeil)
@@ -421,11 +488,11 @@ export class RenderPipeline {
 		this.pool.supersede();
 		this.view = view;
 		this.field.resize(this.sink.width, this.sink.height);
-		// Mandelbrot seed choice (Kernel 2 only): probe f(0); heuristic map on universal
-		// singularity. Uses the generated probeStep (installed by ensureKernels above).
+		// Mandelbrot seed choice (Kernel 2 only, z₀ unset): probe f(0); heuristic map on
+		// universal singularity. Uses the generated probeStep (installed by ensureKernels above).
 		this.mSeedAtC = false;
 		let heuristic = false;
-		if (this.fractalMode && !this.juliaMode) {
+		if (this.fractalMode && !this.juliaMode && z0Key(this.z0) === "") {
 			setFrameState(this.frameState());
 			if (decideSeedAtC(view)) { this.mSeedAtC = true; heuristic = true; }
 		}
@@ -446,6 +513,8 @@ export class RenderPipeline {
 		// Size the initial cap: probe (f64) / budget formula (DD & pert) / forced.
 		this.ffEstIters = 0;
 		const maxIters = maxItersArg ?? this.iterCapForced ?? (this.useDD || this.usePert ? this.itersForView(view, this.usePert) : this.probeCap(view));
+		// The logmap table is built over this frame's cap (Fractint's maxit) — before any tile.
+		if (this.colorizer.setLogCap(maxIters)) this.pool.setPalette(this.colorizer.paletteMsg());
 
 		// Full-canvas tile queue, dispatch-order dispersed (deterministic Fisher–Yates) so
 		// the FF-ETA's in-flight sample stays spatially representative.

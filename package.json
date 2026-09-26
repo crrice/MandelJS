@@ -9,6 +9,8 @@
 		"typecheck": "tsc --noEmit",
 		"golden": "node build.mjs && node bench/golden.mjs",
 		"bench": "node build.mjs && node bench/perf.mjs",
+		"golden:par": "node build.mjs && node bench/par-golden.mjs",
+		"score": "node build.mjs && node bench/par-score.mjs",
 		"test": "node build.mjs && node --test \"tests/*.test.mjs\"",
 		"serve": "http-server dist -c-1 -p 8080"
 	},
@@ -16,6 +18,7 @@
 	"license": "ISC",
 	"devDependencies": {
 		"esbuild": "^0.28.1",
+		"jpeg-js": "^0.4.4",
 		"typescript": "^5.9.0"
 	}
 }
