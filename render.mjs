@@ -49,7 +49,7 @@ const W = Number(sm[1]), H = Number(sm[2]);
 
 const { state, rawView } = M.stateFromUrl(query);
 const raw = rawView || { cx: -1, cxLo: 0, cy: 0, cyLo: 0, span: 4 };
-const view = { cx: raw.cx, cxLo: raw.cxLo, cy: raw.cy, cyLo: raw.cyLo, spanX: raw.span, spanY: raw.span / (W / H) };
+const view = { cx: raw.cx, cxLo: raw.cxLo, cy: raw.cy, cyLo: raw.cyLo, spanX: raw.span, spanY: raw.span / (W / H), rot: raw.rot, skew: raw.skew, xmag: raw.xmag };
 
 let formulaBody = null;
 const preset = M.PRESETS[state.formulaKey];

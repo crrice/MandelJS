@@ -13,6 +13,7 @@ import {
 import type { KernelFrameState } from "../kernel/kernel";
 import { assembleAll } from "../kernel/assemble";
 import type { KernelSpec } from "../kernel/assemble";
+import { viewFrame, planeOffset, fineSpan, _ox, _oy } from "../math/frame";
 import type { Palette } from "../palette";
 import type { TileMsg, DoneMsg } from "../protocol";
 import { FieldStore, Levels, TileJob } from "./field";
@@ -56,14 +57,14 @@ const TILE_W = 20, TILE_H = 20;
 // Auto-gate double-double: engage once the pixel step nears the coordinate ULP (with a
 // few octaves of margin so DD is already on before the artifacts).
 export function useDDFor(v: View, canvasW: number): boolean {
-	const step = v.spanX / canvasW;
+	const step = fineSpan(v) / canvasW;
 	const ulp = Math.max(Math.abs(v.cx), Math.abs(v.cy)) * Number.EPSILON;
 	return step < ulp * DD_SWITCH_RATIO;
 }
 
 // Cycle-detection ε² tightens with zoom; DD tightens faster to a much lower floor.
 export function periodEps2For(v: View, useDD: boolean): number {
-	const zoom = DEFAULT_VIEW.spanX / v.spanX;
+	const zoom = DEFAULT_VIEW.spanX / fineSpan(v);
 	if (zoom <= PERIOD_EPS_ZOOM0) return PERIOD_EPS2;
 	if (useDD) {
 		const e2 = PERIOD_EPS2 * Math.pow(PERIOD_EPS_ZOOM0 / zoom, 1.3);
@@ -78,8 +79,10 @@ export function periodEps2For(v: View, useDD: boolean): number {
 // Requires the generated kernels (probeStep) to be installed.
 export function decideSeedAtC(view: View): boolean {
 	const S = [[0, 0], [0.31, 0.19], [-0.29, 0.23], [0.27, -0.21], [-0.33, -0.17]];
+	const f = viewFrame(view);
 	for (const [fx, fy] of S) {
-		if (probeStepFinite(view.cx + fx * view.spanX, view.cy + fy * view.spanY)) return false;
+		planeOffset(f, fx, fy);
+		if (probeStepFinite(view.cx + _ox, view.cy + _oy)) return false;
 	}
 	return true;
 }
@@ -355,7 +358,7 @@ export class RenderPipeline {
 	//------------------------------------------------------------------------\\
 
 	private itersForView(v: View, usePert: boolean): number {
-		const zoom = DEFAULT_VIEW.spanX / v.spanX;
+		const zoom = DEFAULT_VIEW.spanX / fineSpan(v);
 		if (zoom <= 1) return ITER_BASE;
 		const budget = Math.round(ITER_BASE + ITER_SLOPE * Math.log2(zoom));
 		return usePert ? Math.min(ITER_CAP_PERT, budget * PERT_ITER_MULT) : Math.min(ITER_CAP, budget);
@@ -363,17 +366,17 @@ export class RenderPipeline {
 
 	private probeCap(view: View): number {
 		const floor = this.itersForView(view, false);
-		const zoom = DEFAULT_VIEW.spanX / view.spanX;
+		const zoom = DEFAULT_VIEW.spanX / fineSpan(view);
 		const budgetPerPx = FF_BUDGET_BASE + FF_BUDGET_SLOPE * Math.max(0, Math.log2(zoom));
 		const probeCeil = Math.max(floor, Math.round(budgetPerPx * FF_PROBE_CEIL_MULT));
 		// Probe the ACTIVE fractal, but measure escape DWELL (filter off) to size the cap.
 		setFrameState(this.frameState({ filterId: FILTER_NONE }));
 		const dwells: number[] = [];
+		const f = viewFrame(view);
 		for (let j = 0; j < FF_PROBE_NY; j++) {
-			const offY = (0.5 - (j + 0.5) / FF_PROBE_NY) * view.spanY;
 			for (let i = 0; i < FF_PROBE_NX; i++) {
-				const offX = ((i + 0.5) / FF_PROBE_NX - 0.5) * view.spanX;
-				const pxc = view.cx + offX, pyc = view.cy + offY;
+				planeOffset(f, (i + 0.5) / FF_PROBE_NX - 0.5, 0.5 - (j + 0.5) / FF_PROBE_NY);
+				const pxc = view.cx + _ox, pyc = view.cy + _oy;
 				const mu = !this.fractalMode
 					? escapeK1(pxc, pyc, probeCeil)
 					: this.juliaMode ? escapeK2(pxc, pyc, this.juliaCx, this.juliaCy, probeCeil)

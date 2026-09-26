@@ -65,8 +65,9 @@ export function defaultState(): AppState {
 
 // The raw view numbers as they travel in the URL. spanY is NOT serialized — it derives
 // from span / aspect, and the aspect param must be applied first (main.ts owns that
-// ordering because it also resizes the canvas).
-export interface RawView { cx: number; cxLo: number; cy: number; cyLo: number; span: number; }
+// ordering because it also resizes the canvas). rot/skew/xmag are the frame affine
+// (math/frame.ts), at their defaults 0/0/1 when the URL omits them.
+export interface RawView { cx: number; cxLo: number; cy: number; cyLo: number; span: number; rot: number; skew: number; xmag: number; }
 
 // The density the URL omits: each palette's own default (custom → CUSTOM_DENSITY).
 function defaultDensityFor(paletteKey: string): number {
@@ -190,6 +191,9 @@ export function urlFromState(view: View, s: AppState): string {
 	p.set("cx", String(view.cx)); p.set("cy", String(view.cy)); p.set("span", String(view.spanX));
 	if (view.cxLo !== 0) p.set("cxl", String(view.cxLo));   // DD center lo-limbs, only on deep views
 	if (view.cyLo !== 0) p.set("cyl", String(view.cyLo));
+	if (view.rot) p.set("rot", String(view.rot));              // frame affine, only when non-default
+	if (view.skew) p.set("skew", String(view.skew));
+	if ((view.xmag || 1) !== 1) p.set("xmag", String(view.xmag));
 	for (const row of ROWS) row.write(p, view, s);
 	return "?" + p.toString();
 }
@@ -203,8 +207,12 @@ export function stateFromUrl(qs: string): { state: AppState; rawView: RawView | 
 	for (const row of ROWS) row.read(p, state);
 	const cx = parseFloat(p.get("cx") || ""), cy = parseFloat(p.get("cy") || ""), span = parseFloat(p.get("span") || "");
 	const cxLo = parseFloat(p.get("cxl") || "0"), cyLo = parseFloat(p.get("cyl") || "0");
+	const rot = parseFloat(p.get("rot") || "0"), skew = parseFloat(p.get("skew") || "0"), xmag = parseFloat(p.get("xmag") || "1");
 	const rawView = (isFinite(cx) && isFinite(cy) && isFinite(span) && span > 0)
-		? { cx, cxLo: isFinite(cxLo) ? cxLo : 0, cy, cyLo: isFinite(cyLo) ? cyLo : 0, span }
+		? {
+			cx, cxLo: isFinite(cxLo) ? cxLo : 0, cy, cyLo: isFinite(cyLo) ? cyLo : 0, span,
+			rot: isFinite(rot) ? rot : 0, skew: isFinite(skew) ? skew : 0, xmag: isFinite(xmag) && xmag !== 0 ? xmag : 1,
+		}
 		: null;
 	return { state, rawView };
 }

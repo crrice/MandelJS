@@ -18,3 +18,4 @@ export * from "./fractint/par";
 export * from "./fractint/colors";
 export { translateFrm } from "./fractint/frm-translate";
 export type { FrmTranslation, FrmReport, FrmLevel } from "./fractint/frm-translate";
+export * from "./math/frame";

@@ -7,6 +7,8 @@
 // transfer (colorSample, filter readouts via the registry), and the perturbation
 // reference builder. DOM-free; Node-importable.
 import { ddAdd, ddMul, ddSq, _dhi, _dlo } from "../math/dd";
+import { viewFrame, planeOffset, _ox, _oy } from "../math/frame";
+import type { Frame } from "../math/frame";
 import { FILTERS } from "../filters/index";
 import type { FilterColorFn } from "../filters/index";
 
@@ -21,6 +23,9 @@ export interface View {
 	cyLo: number;  // center imaginary axis — LO limb
 	spanX: number;
 	spanY: number;
+	rot?: number;    // frame rotation, degrees (Fractint sign; absent = 0) — see math/frame.ts
+	skew?: number;   // frame skew, degrees (absent = 0)
+	xmag?: number;   // horizontal magnification (absent or 0 = 1)
 }
 
 export const DEFAULT_VIEW: View = { cx: -1, cxLo: 0, cy: 0, cyLo: 0, spanX: 4, spanY: 2 };
@@ -217,10 +222,11 @@ function refOrbitLen(crhi: number, crlo: number, cihi: number, cilo: number, max
 
 export function computeRef(view: View, maxIters: number): void {
 	const PW = 8, PH = 8;
+	const f = viewFrame(view);
 	let bx = 0, by = 0, best = -1;
 	for (let j = 0; j < PH && best < maxIters; j++) {
 		for (let i = 0; i < PW; i++) {
-			const ox = ((i + 0.5) / PW - 0.5) * view.spanX, oy = (0.5 - (j + 0.5) / PH) * view.spanY;   // Im up (matches escapeAtPt)
+			planeOffset(f, (i + 0.5) / PW - 0.5, 0.5 - (j + 0.5) / PH); const ox = _ox, oy = _oy;   // Im up (matches escapeAtPt)
 			ddAdd(view.cx, view.cxLo, ox, 0); const crhi = _dhi, crlo = _dlo;
 			ddAdd(view.cy, view.cyLo, oy, 0); const cihi = _dhi, cilo = _dlo;
 			const len = refOrbitLen(crhi, crlo, cihi, cilo, maxIters);
@@ -299,9 +305,19 @@ export function colorSample(
 // to the installed kernels. Shared by renderRegion / sharpenPoints / ssaaPoints.
 //---------------------------------------------------------------------------\\
 
+// The frame basis of the last view seen (recomputed only when the view object changes).
+let frameView: View | null = null;
+let frame: Frame = { axis: true, ux: 0, uy: 0, vx: 0, vy: 0 };
+
 export function escapeAtPt(px: number, py: number, view: View, maxIters: number, invW: number, invH: number): number {
-	const offX = (px * invW - 0.5) * view.spanX;
-	const offY = (0.5 - py * invH) * view.spanY;   // screen row 0 = MAX Im (standard math convention)
+	if (view !== frameView) { frame = viewFrame(view); frameView = view; }
+	let offX: number, offY: number;
+	if (frame.axis) {
+		offX = (px * invW - 0.5) * view.spanX;
+		offY = (0.5 - py * invH) * view.spanY;   // screen row 0 = MAX Im (standard math convention)
+	} else {
+		planeOffset(frame, px * invW - 0.5, 0.5 - py * invH); offX = _ox; offY = _oy;
+	}
 	if (fractalMode) {
 		const pxc = view.cx + offX, pyc = view.cy + offY;
 		if (juliaMode) return fold(kK2!(pxc, pyc, juliaCx, juliaCy, maxIters, KCTX));   // z₀ = pixel, c = seed

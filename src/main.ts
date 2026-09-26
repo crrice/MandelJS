@@ -3,6 +3,7 @@
 // src/kernel/, orchestration in src/render/pipeline.ts; the worker pool runs src/worker.ts.
 import { View, DEFAULT_VIEW, FORMULA_MANDEL } from "./kernel/kernel";
 import { ddAdd, _dhi, _dlo } from "./math/dd";
+import { viewFrame, planeOffset, _ox, _oy } from "./math/frame";
 import { compileFormula } from "./formula";
 import { Palette, PALETTES, customPalette, currentPalette } from "./palette";
 import { RenderPipeline } from "./render/pipeline";
@@ -39,6 +40,7 @@ let currentSeed = { cx: 0, cy: 0 };   // the active Julia seed, for the URL (set
 // pre-P1 serializer. Called by every mutating control (and restoreFromUrl).
 function syncUrl(): void {
 	history.replaceState(null, "", urlFromState(view, currentState()));
+	if (rotInput) rotInput.value = String(view.rot || 0);   // every view change passes here: keep the rotation field in step
 }
 
 // Gather the live app state from the controls + module vars — the ONE place serialization
@@ -288,7 +290,7 @@ dev.mandelPar = (text?: string) => {
 dev.mandelUrlRT = (qs: string) => {
 	const { state, rawView } = stateFromUrl(qs);
 	const v: View = rawView
-		? { cx: rawView.cx, cxLo: rawView.cxLo, cy: rawView.cy, cyLo: rawView.cyLo, spanX: rawView.span, spanY: 0 }
+		? { cx: rawView.cx, cxLo: rawView.cxLo, cy: rawView.cy, cyLo: rawView.cyLo, spanX: rawView.span, spanY: 0, rot: rawView.rot, skew: rawView.skew, xmag: rawView.xmag }
 		: view;
 	return urlFromState(v, state);
 };
@@ -760,13 +762,15 @@ zoomButton.addEventListener("click", () => {
 	if (!r) return;
 	// Recenter in double-double: newCenter = oldCenter + boxOffset. In f64 the offset is
 	// lost once it drops below the center's ULP (~|c|·ε); ddAdd's twoSum keeps it, so the
-	// box lands where you drew it.
-	const offX = (r[0] + r[2] / 2 - 0.5) * view.spanX;
-	const offY = (0.5 - (r[1] + r[3] / 2)) * view.spanY;   // Im up: match the render's flipped y-map so the box lands where drawn
+	// box lands where you drew it. The box is drawn in the (possibly rotated) frame, so
+	// scaling the spans composes it exactly: rot/skew/xmag carry over unchanged.
+	planeOffset(viewFrame(view), r[0] + r[2] / 2 - 0.5, 0.5 - (r[1] + r[3] / 2));   // Im up: match the render's flipped y-map so the box lands where drawn
+	const offX = _ox, offY = _oy;
 	ddAdd(view.cx, view.cxLo, offX, 0); const ncx = _dhi, ncxLo = _dlo;
 	ddAdd(view.cy, view.cyLo, offY, 0); const ncy = _dhi, ncyLo = _dlo;
 	pushHistory(view);
 	goTo({
+		...view,
 		cx: ncx, cxLo: ncxLo, cy: ncy, cyLo: ncyLo,
 		spanX: view.spanX * r[2],
 		spanY: view.spanY * r[3],
@@ -794,8 +798,20 @@ if (outButton) {
 
 resetButton.addEventListener("click", () => {
 	pushHistory(view);
-	goTo(defaultViewFor());
+	goTo(defaultViewFor());   // default views are unrotated: reset clears the rotation
 });
+
+// Frame rotation in degrees (Fractint sign: the content turns counter-clockwise). A
+// navigation step like a zoom — back restores the old frame; later zooms keep it.
+const rotInput = document.querySelector(".rot-input") as HTMLInputElement | null;
+if (rotInput) {
+	rotInput.addEventListener("change", () => {
+		const rot = Number(rotInput.value);
+		if (!isFinite(rot) || rot === (view.rot || 0)) { rotInput.value = String(view.rot || 0); return; }
+		pushHistory(view);
+		goTo({ ...view, rot });
+	});
+}
 
 // Coloring method (optional control) — one dropdown for all four paths: escape-time bands
 // with the linear / √ / log transforms, plus distance estimate. Each recolors instantly.
@@ -1324,7 +1340,7 @@ function applyFullState({ state: s, rawView }: { state: AppState; rawView: RawVi
 	// View + set type. spanY derives from the REQUESTED aspect — the same window on
 	// every device regardless of the buffer's pixel count.
 	const urlView: View | null = rawView
-		? { cx: rawView.cx, cxLo: rawView.cxLo, cy: rawView.cy, cyLo: rawView.cyLo, spanX: rawView.span, spanY: rawView.span / VIEW_ASPECT }
+		? { cx: rawView.cx, cxLo: rawView.cxLo, cy: rawView.cy, cyLo: rawView.cyLo, spanX: rawView.span, spanY: rawView.span / VIEW_ASPECT, rot: rawView.rot, skew: rawView.skew, xmag: rawView.xmag }
 		: null;
 	if (s.juliaOn) {
 		mBundle = { view: defaultViewFor(), history: [] };   // inJulia still false → a sensible M-view for a later exit
