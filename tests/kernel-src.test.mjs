@@ -8,7 +8,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { assembleAll, compileFormula, PRESETS } from "../dist/node-lib.js";
+import { assembleAll, compileFormula, compileZ0, PRESETS } from "../dist/node-lib.js";
 
 const snapPath = fileURLToPath(new URL("../goldens/kernel-src.json", import.meta.url));
 const UPDATE = !!process.env.KERNEL_SRC_UPDATE;
@@ -43,6 +43,26 @@ function snapshot() {
 				for (const juliaMode of [false, true]) {
 					const label = "p" + (usePeriod ? 1 : 0) + "|" + name + "|t" + filterId + "|j" + (juliaMode ? 1 : 0);
 					const { srcs } = assembleAll({ usePeriod, formulaBody, filterId, juliaMode });
+					const row = {};
+					for (const k of Object.keys(srcs)) row[k] = djb2(srcs[k]);
+					out[label] = row;
+				}
+			}
+		}
+	}
+	// Formula escape settings (Fractint counting): NEW labels only, the rows above unchanged.
+	const ESC = {
+		"b2c": { bailR: 2, seedC: true },
+		"b10": { bailR: 10 },
+		"b10z": { bailR: 10, z0Body: compileZ0("0.5231078513927684").body },
+	};
+	for (const usePeriod of [true, false]) {
+		for (const name of ["mandel", "tierazon"]) {
+			const formulaBody = FORMULAS[name] != null ? compileFormula(FORMULAS[name]).body : null;
+			for (const filterId of [0, 1]) {
+				for (const [escName, esc] of Object.entries(ESC)) {
+					const label = "p" + (usePeriod ? 1 : 0) + "|" + name + "|t" + filterId + "|j0|" + escName;
+					const { srcs } = assembleAll({ usePeriod, formulaBody, filterId, juliaMode: false, ...esc });
 					const row = {};
 					for (const k of Object.keys(srcs)) row[k] = djb2(srcs[k]);
 					out[label] = row;

@@ -64,9 +64,11 @@ const filterId = Number(state.filterId) || 0;
 // can falsely mark slow-crawling EXTERIOR orbits as periodic (in-set); disabling it makes
 // a threshold render an honest dwell level-set (at the cost of no interior early-out).
 const usePeriod = !flags.noperiod;
-M.installKernels(M.assembleAll({ usePeriod, formulaBody, filterId, juliaMode: state.juliaOn }).srcs);
+// z₀ / bailout (the formula escape settings): an invalid z₀ applies as unset, like the app.
+const z0 = state.z0 === "" || M.compileZ0(state.z0).ok ? state.z0 : "";
+const k2 = formulaBody != null || state.juliaOn || filterId !== 0 || M.z0NeedsK2(z0);
+M.installKernels(M.assembleAll({ usePeriod, formulaBody, filterId, juliaMode: state.juliaOn, ...M.escapeSpec(z0, state.bail, k2, state.juliaOn) }).srcs);
 
-const k2 = formulaBody != null || state.juliaOn || filterId !== 0;
 const useDD = k2 ? false : M.useDDFor(view, W);
 const usePert = useDD;
 const maxIters = flags.iters || state.cap || 1500;
@@ -91,7 +93,7 @@ M.setFrameState({
 	filterBlend: Number(state.blend), filterDensity: 1,
 	ssaaOn: !flags.noaa,   // edge-supersampled like the app's resting frame; --noaa = 1-sample
 });
-if (k2 && !state.juliaOn && M.decideSeedAtC(view)) {
+if (k2 && !state.juliaOn && M.z0Key(z0) === "" && M.decideSeedAtC(view)) {
 	M.setFrameState({ usePeriod, periodEps2: M.periodEps2For(view, useDD), useDD, usePert, bandMap, fractalMode: 1, formulaId: M.FORMULA_CUSTOM, juliaMode: false, mSeedAtC: true, juliaCx: state.juliaX, juliaCy: state.juliaY, filterId, trapDStrands: Number(state.strands), filterDFactor: Number(state.exposure), filterBlend: Number(state.blend), filterDensity: 1, ssaaOn: !flags.noaa });
 }
 if (usePert) M.computeRef(view, maxIters);

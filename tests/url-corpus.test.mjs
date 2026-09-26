@@ -50,6 +50,11 @@ const CORPUS = [
 	"?cx=-1.415381481413331&cy=0.00122318048670787&span=6.6e-13&rot=-77.5&skew=0.009948339802928328",
 	"?cx=-0.7050815446907845&cy=-0.35135614735306503&span=1e-20&cxl=1.2345678901234566e-18&cyl=-3.3e-19&rot=72.5&skew=-3&xmag=1.5&col=sqrt",
 	"?cx=0&cy=0&span=4&xmag=0.5&j=1&jx=-0.8&jy=0.156",
+	// formula escape settings: z₀ + bailout (after f/expr, before the Julia rows)
+	"?cx=-1&cy=0&span=4&z0=c&bail=2&cap=1000",
+	"?cx=0&cy=0&span=4&f=custom&expr=-%28z%5E1.68%29+%2B+z%5E1.4142+%2B+c&z0=0.5231078513927684&bail=10&ar=1.3333333&cap=3200",
+	"?cx=0&cy=0&span=4&f=cubic&z0=0.5*c+%2B+0.1*i&bail=3.5&j=1&jx=0.1&jy=0.7",
+	"?cx=-1&cy=0&span=4&rot=30&bail=100&col=linear",
 	// everything at once
 	"?cx=0.5192304140682561&cy=0.7674373931280046&span=1.3382715312396376&f=custom&expr=%28z%5E2+%2B+c%29+*+sin%28z%5E%28c*i%29%29&j=1&jx=0.4206477290564087&jy=0.5647650444593624&filt=1&str=0.1&exp=7.5&fb=1&ar=1.3333333&pal=custom&stops=000000-ffffff&inset=ff8800&cyc=0&dens=12&col=sqrt&cap=5000",
 ];

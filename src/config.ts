@@ -33,6 +33,8 @@ export type Cost = "recolor" | "reiterate" | "reframe";
 export interface AppState {
 	formulaKey: string;      // "0" | preset key | "custom"
 	expr: string;            // custom formula text (meaningful when formulaKey === "custom")
+	z0: string;              // initial z₀ expression, may use c ("" = the default seed)
+	bail: number | null;     // bailout radius (null = the kernel's default)
 	juliaOn: boolean;
 	juliaX: number;          // Julia seed (f64s; String() round-trips exactly)
 	juliaY: number;
@@ -52,7 +54,7 @@ export interface AppState {
 
 export function defaultState(): AppState {
 	return {
-		formulaKey: "0", expr: "z^2 + c",
+		formulaKey: "0", expr: "z^2 + c", z0: "", bail: null,
 		juliaOn: false, juliaX: 0, juliaY: 0,
 		filterId: "0", strands: "0.08", exposure: "4", blend: "0",
 		aspect: "2",
@@ -97,6 +99,19 @@ const ROWS: ParamRow[] = [
 		cost: "reframe",
 		write(p, _v, s) { if (s.formulaKey === "custom") p.set("expr", s.expr); },
 		read(p, s) { const e = p.get("expr"); if (e != null) s.expr = e; },
+	},
+	{ // initial z₀ expression — only when set (any formula, not just custom)
+		cost: "reiterate",
+		write(p, _v, s) { if (s.z0 !== "") p.set("z0", s.z0); },
+		read(p, s) { const z = p.get("z0"); if (z != null) s.z0 = z; },
+	},
+	{ // bailout radius — only when set; non-positive / non-numeric reads as unset
+		cost: "reiterate",
+		write(p, _v, s) { if (s.bail != null) p.set("bail", String(s.bail)); },
+		read(p, s) {
+			const b = p.get("bail");
+			if (b != null) { const r = Number(b); s.bail = isFinite(r) && r > 0 ? r : null; }
+		},
 	},
 	{ // Julia set type + seed
 		cost: "reframe",

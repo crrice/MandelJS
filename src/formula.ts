@@ -301,3 +301,12 @@ export function compileFormula(src: string): FCompileResult {
 		return { ok: false, error: (err.message || "parse error") + (pos >= 0 ? fAt(pos) : "") };
 	}
 }
+
+// Compile an initial-z₀ expression (the formula settings' z₀, e.g. a translated Fractint
+// init). Same compiler and body shape (assigns _cre/_cim), but z has no value yet, so the
+// text may reference c only.
+export function compileZ0(src: string): FCompileResult {
+	const res = compileFormula(src);
+	if (res.ok && res.refsZ) return { ok: false, error: "z₀ can use c but not z" };
+	return res;
+}

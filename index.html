@@ -83,6 +83,12 @@
 					<input class="formula-input" type="text" spellcheck="false" autocomplete="off" autocapitalize="off"
 						value="z^2 + c" title="e.g. z^2 + c · (z^2+c)*sin(z^(c*i)) · z^3 + c · c*sin(z)" />
 				</label>
+				<label class="field" title="Initial z₀ as a formula of c (e.g. 0 · c · 0.5*c). Blank = the default seed. Setting it (or a bailout) counts escapes Fractint-style: tested after each step, count = steps taken.">z₀ =
+					<input class="z0-input formula-input" type="text" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="auto" />
+				</label>
+				<label class="field" title="Escape radius R: a point escapes once |z| ≥ R. Blank = the default (16 for z² + c, 2 otherwise).">bailout
+					<input class="bail-input" type="number" min="0" step="any" placeholder="auto" />
+				</label>
 				<span class="formula-error" role="alert"></span>
 				<label class="field checkbox"><input class="julia-toggle" type="checkbox" /> julia</label>
 				<label class="field">filter

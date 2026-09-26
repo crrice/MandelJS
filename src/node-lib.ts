@@ -19,3 +19,5 @@ export * from "./fractint/colors";
 export { translateFrm } from "./fractint/frm-translate";
 export type { FrmTranslation, FrmReport, FrmLevel } from "./fractint/frm-translate";
 export * from "./math/frame";
+export { compileZ0 } from "./formula";
+export { z0Key, z0NeedsK2, escapeSpec } from "./render/pipeline";

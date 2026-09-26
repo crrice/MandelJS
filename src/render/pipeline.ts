@@ -14,6 +14,7 @@ import type { KernelFrameState } from "../kernel/kernel";
 import { assembleAll } from "../kernel/assemble";
 import type { KernelSpec } from "../kernel/assemble";
 import { viewFrame, planeOffset, fineSpan, _ox, _oy } from "../math/frame";
+import { compileZ0 } from "../formula";
 import type { Palette } from "../palette";
 import type { TileMsg, DoneMsg } from "../protocol";
 import { FieldStore, Levels, TileJob } from "./field";
@@ -87,6 +88,35 @@ export function decideSeedAtC(view: View): boolean {
 	return true;
 }
 
+// The formula escape settings (z₀ expression + bailout radius). z0Key normalizes the z₀
+// text; "" (unset) keeps today's seed, including the heuristic z₀ = c parameter map.
+export function z0Key(z0: string): string {
+	return z0.replace(/\s+/g, "").toLowerCase();
+}
+
+// Kernel 1 serves z₀ "0" and "c" (the z²+c fast path with DD/perturbation); any other z₀
+// needs Kernel 2's baked expression.
+export function z0NeedsK2(z0: string): boolean {
+	const k = z0Key(z0);
+	return k !== "" && k !== "0" && k !== "c";
+}
+
+// The escape settings → the KernelSpec fields. z₀ "" with bail null is today's semantics:
+// no fields, so the default kernels stay byte-identical. Anything set → Fractint's (C3.2/
+// C4.4), with R = bail or today's radius for the kernel in use (16 on Kernel 1, 2 on Kernel
+// 2). Kernel 2 bakes the compiled z₀ for Mandelbrot only — a Julia z₀ is the pixel.
+export function escapeSpec(z0: string, bail: number | null, k2: boolean, julia: boolean): Pick<KernelSpec, "bailR" | "seedC" | "z0Body"> {
+	const k = z0Key(z0);
+	if (k === "" && bail == null) return {};
+	const out: Pick<KernelSpec, "bailR" | "seedC" | "z0Body"> = { bailR: bail ?? (k2 ? 2 : 16) };
+	if (!k2 && k === "c") out.seedC = true;
+	if (k2 && !julia && k !== "") {
+		const res = compileZ0(z0);
+		if (res.ok && res.body) out.z0Body = res.body;
+	}
+	return out;
+}
+
 // The render phases. The old implicit flags map onto the phase VALUE: sharpenStage/
 // sharpenMode → sharpen.{stage,sub}; ssaaPhase → kind "ssaa"; ffActive → kind
 // "firstFrame" (mirrored in telemetry for the ETA).
@@ -158,6 +188,7 @@ export interface RecolorPatch {
 }
 export interface ComputePatch {
 	formula?: { id: number } | { body: string };
+	escape?: { z0: string; bail: number | null };   // formula escape settings (see escapeSpec)
 	setType?: { julia: boolean; cx?: number; cy?: number };
 	filter?: { id: number; dStrands: number; dFactor: number };
 	iterCap?: number | null;
@@ -188,6 +219,8 @@ export class RenderPipeline {
 	private juliaCy = 0;
 	private customStepBody = "";
 	private mSeedAtC = false;
+	private z0 = "";                     // z₀ expression ("" = today's seed)
+	private bail: number | null = null;  // bailout radius (null = the kernel's default)
 	private filterId = 0;
 	private dStrands = 0.08;
 	private dFactor = 1;
@@ -231,6 +264,7 @@ export class RenderPipeline {
 			formulaBody: this.formulaId === FORMULA_CUSTOM ? this.customStepBody : null,
 			filterId: this.filterId,
 			juliaMode: this.juliaMode,
+			...escapeSpec(this.z0, this.bail, this.fractalMode === 1, this.juliaMode),
 		};
 		const asm = assembleAll(spec);
 		if (asm.key === this.kernelKey) return;
@@ -286,6 +320,7 @@ export class RenderPipeline {
 				this.formulaId = p.formula.id;
 			}
 		}
+		if (p.escape !== undefined) { this.z0 = p.escape.z0; this.bail = p.escape.bail; }
 		if (p.setType !== undefined) {
 			this.juliaMode = p.setType.julia;
 			if (p.setType.julia) { this.juliaCx = p.setType.cx ?? 0; this.juliaCy = p.setType.cy ?? 0; }
@@ -315,7 +350,7 @@ export class RenderPipeline {
 	// Kernel dispatch: Kernel 1 (optimized z²+c M-engine with DD/pert) ONLY when nothing
 	// general is needed; anything else → Kernel 2 (f64), which forces DD/pert off.
 	private deriveKernel(): void {
-		const k2 = this.formulaId !== 0 || this.juliaMode || this.filterId !== 0;
+		const k2 = this.formulaId !== 0 || this.juliaMode || this.filterId !== 0 || z0NeedsK2(this.z0);
 		this.fractalMode = k2 ? 1 : 0;
 		if (k2) { this.ddOverride = false; this.pertOverride = false; }
 		else { this.ddOverride = null; this.pertOverride = null; }
@@ -424,11 +459,11 @@ export class RenderPipeline {
 		this.pool.supersede();
 		this.view = view;
 		this.field.resize(this.sink.width, this.sink.height);
-		// Mandelbrot seed choice (Kernel 2 only): probe f(0); heuristic map on universal
-		// singularity. Uses the generated probeStep (installed by ensureKernels above).
+		// Mandelbrot seed choice (Kernel 2 only, z₀ unset): probe f(0); heuristic map on
+		// universal singularity. Uses the generated probeStep (installed by ensureKernels above).
 		this.mSeedAtC = false;
 		let heuristic = false;
-		if (this.fractalMode && !this.juliaMode) {
+		if (this.fractalMode && !this.juliaMode && z0Key(this.z0) === "") {
 			setFrameState(this.frameState());
 			if (decideSeedAtC(view)) { this.mSeedAtC = true; heuristic = true; }
 		}

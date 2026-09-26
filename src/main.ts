@@ -4,9 +4,9 @@
 import { View, DEFAULT_VIEW, FORMULA_MANDEL } from "./kernel/kernel";
 import { ddAdd, _dhi, _dlo } from "./math/dd";
 import { viewFrame, planeOffset, _ox, _oy } from "./math/frame";
-import { compileFormula } from "./formula";
+import { compileFormula, compileZ0 } from "./formula";
 import { Palette, PALETTES, customPalette, currentPalette } from "./palette";
-import { RenderPipeline } from "./render/pipeline";
+import { RenderPipeline, z0NeedsK2 } from "./render/pipeline";
 import { CanvasSink } from "./render/sink";
 import type { GenStats, FrameStats } from "./render/telemetry";
 import { AppState, PRESETS, CUSTOM_DENSITY, urlFromState, stateFromUrl, parFromState, stateFromPar } from "./config";
@@ -50,6 +50,8 @@ function currentState(): AppState {
 	return {
 		formulaKey: formulaSelect ? formulaSelect.value : "0",
 		expr: formulaInput ? formulaInput.value : "z^2 + c",
+		z0: z0Input ? z0Input.value.trim() : "",
+		bail: currentBail(),
 		juliaOn: inJulia, juliaX: currentSeed.cx, juliaY: currentSeed.cy,
 		filterId: filterSelect ? filterSelect.value : "0",
 		strands: strandsSlider ? strandsSlider.value : "0.08",
@@ -913,6 +915,8 @@ const formulaSelect = document.querySelector(".formula-select") as HTMLSelectEle
 const formulaCustom = document.querySelector(".formula-custom") as HTMLElement | null;
 const formulaInput = document.querySelector(".formula-input") as HTMLInputElement | null;
 const formulaError = document.querySelector(".formula-error") as HTMLElement | null;
+const z0Input = document.querySelector(".z0-input") as HTMLInputElement | null;       // initial z₀ (a formula of c; blank = default seed)
+const bailInput = document.querySelector(".bail-input") as HTMLInputElement | null;   // bailout radius (blank = default)
 const juliaToggle = document.querySelector(".julia-toggle") as HTMLInputElement | null;
 const filterSelect = document.querySelector(".filter-select") as HTMLSelectElement | null;
 const strandsSlider = document.querySelector(".strands-slider") as HTMLInputElement | null;
@@ -930,7 +934,7 @@ function pushFilter(): void {
 function updateContextualControls(): void {
 	const filterOn = currentFilterId() !== 0;
 	const customOn = formulaSelect?.value === "custom";
-	const k2 = (formulaSelect ? formulaSelect.value !== "0" : false) || !!juliaToggle?.checked || filterOn;
+	const k2 = (formulaSelect ? formulaSelect.value !== "0" : false) || !!juliaToggle?.checked || filterOn || z0NeedsK2(z0Input ? z0Input.value : "");
 	document.querySelectorAll<HTMLElement>(".filter-param").forEach((el) => el.classList.toggle("hidden", !filterOn));
 	formulaCustom?.classList.toggle("hidden", !customOn);   // the f(z,c)= text field appears only for "custom…"
 	if (!customOn && formulaError) formulaError.textContent = "";   // clear a stale error when leaving custom
@@ -1016,6 +1020,33 @@ if (formulaInput) {
 	formulaInput.addEventListener("change", () => applyCustomFormula());
 	formulaInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); applyCustomFormula(); } });
 }
+
+// Formula escape settings: z₀ (a formula of c) + bailout radius. Either one set switches to
+// Fractint escape counting (the test after each step, count = steps — see escapeSpec);
+// both re-iterate the current view. Blank bailout = the kernel's default radius.
+function currentBail(): number | null {
+	if (!bailInput || bailInput.value.trim() === "") return null;
+	const r = Number(bailInput.value);
+	return isFinite(r) && r > 0 ? r : null;
+}
+function applyEscape(): void {
+	const z0 = z0Input ? z0Input.value.trim() : "";
+	const res = compileZ0(z0);
+	if (z0 !== "" && !res.ok) { showFormulaError("z₀: " + (res.error || "invalid")); return; }
+	renderer.configure({ escape: { z0, bail: currentBail() } });
+	updateContextualControls();
+	syncUrl();
+	renderer.render(view);
+}
+if (z0Input) {
+	z0Input.addEventListener("input", () => {
+		const res = compileZ0(z0Input.value);
+		showFormulaError(z0Input.value.trim() === "" || res.ok ? "" : "z₀: " + (res.error || "invalid"));
+	});
+	z0Input.addEventListener("change", () => applyEscape());
+	z0Input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); applyEscape(); } });
+}
+if (bailInput) bailInput.addEventListener("change", () => applyEscape());
 
 if (filterSelect) {
 	filterSelect.addEventListener("change", () => { pushFilter(); updateContextualControls(); syncUrl(); renderer.render(view); });
@@ -1268,6 +1299,8 @@ function applyEngineState(target: RenderPipeline, s: AppState): void {
 			target.configure({ formula: { id: FORMULA_MANDEL } });   // "0" → standard z²+c (Kernel 1)
 		}
 	}
+	// Escape settings (an invalid z₀ applies as unset; applyFullState shows its error).
+	target.configure({ escape: { z0: s.z0 === "" || compileZ0(s.z0).ok ? s.z0 : "", bail: s.bail } });
 	// Filter + params, then the A/B blend method.
 	target.configure({ filter: { id: Number(s.filterId) || 0, dStrands: Number(s.strands), dFactor: Number(s.exposure) } });
 	target.recolor({ filterBlend: Number(s.blend) });
@@ -1308,6 +1341,8 @@ function applyFullState({ state: s, rawView }: { state: AppState; rawView: RawVi
 	// Controls reflect the state.
 	if (formulaSelect) formulaSelect.value = s.formulaKey;
 	if (s.formulaKey === "custom" && formulaInput) formulaInput.value = s.expr;
+	if (z0Input) z0Input.value = s.z0;
+	if (bailInput) bailInput.value = s.bail != null ? String(s.bail) : "";
 	if (filterSelect) filterSelect.value = s.filterId;
 	if (strandsSlider) strandsSlider.value = s.strands;
 	if (exposureSlider) exposureSlider.value = s.exposure;
@@ -1334,6 +1369,8 @@ function applyFullState({ state: s, rawView }: { state: AppState; rawView: RawVi
 		const res = compileFormula(s.expr);
 		showFormulaError(!res.ok ? res.error || "invalid formula" : res.refsC === false && !s.juliaOn ? "note: no c — every point is identical" : "");
 	}
+	const z0Res = compileZ0(s.z0);
+	if (s.z0 !== "" && !z0Res.ok) showFormulaError("z₀: " + (z0Res.error || "invalid"));
 
 	applyEngineState(renderer, s);
 
