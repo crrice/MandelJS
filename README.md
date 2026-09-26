@@ -44,6 +44,9 @@ Zero runtime dependencies — esbuild bundles `src/` into a static page (`dist/`
   frm → MandelJS formula translator, the importer (`import.ts`) and the exporter
   (`export.ts`: a Fractint-valid entry plus the `; mandeljs:` line).
 - `src/formula.ts` — the `f(z, c)` text → flat f64 codegen compiler.
+- `src/ui/` — page glue: DOM handles, canvas geometry (`viewport.ts`), and the `.par`
+  section (`par-import.ts`: load / drop / paste, the entry picker, the import report,
+  save `.par`; `.frm` files picked alongside supply formulas the par does not carry).
 - `src/main.ts` + `index.html` — the standalone shell and control wiring. The same
   engine is also embedded — wrapped in site chrome — on
   [fifthaleph.com/fractal-gen](https://fifthaleph.com/fractal-gen).

@@ -16,6 +16,7 @@ import type { RawView } from "./config";
 import { easel, canvas, ctx, DEBUG } from "./ui/dom";
 import { computeGeometry, applyGeometry, pinGeometry, getResolution, setResolution } from "./ui/viewport";
 import type { ResolutionMode } from "./ui/viewport";
+import { initParImport } from "./ui/par-import";
 
 //---------------------------------------------------------------------------\\
 // Orchestration
@@ -967,7 +968,7 @@ if (filterSelectEl) {
 
 const formulaSelect = document.querySelector(".formula-select") as HTMLSelectElement | null;
 const formulaCustom = document.querySelector(".formula-custom") as HTMLElement | null;
-const formulaInput = document.querySelector(".formula-input") as HTMLInputElement | null;
+const formulaInput = document.querySelector(".formula-custom .formula-input") as HTMLInputElement | null;
 const formulaError = document.querySelector(".formula-error") as HTMLElement | null;
 const z0Input = document.querySelector(".z0-input") as HTMLInputElement | null;       // initial z₀ (a formula of c; blank = default seed)
 const bailInput = document.querySelector(".bail-input") as HTMLInputElement | null;   // bailout radius (blank = default)
@@ -1325,6 +1326,13 @@ async function runExport(width: number, test = false, refine = true): Promise<Bl
 // skips the sharpening ladder (AA still runs).
 dev.mandelExport = (width = 1920, opts) => runExport(width, !!(opts && opts.test), !(opts && opts.refine === false));
 
+// .par load/save (ui/par-import.ts): an accepted import applies like a permalink; save
+// writes the current state as a Fractint entry with its lossless `; mandeljs:` line.
+initParImport({
+	apply: (r) => applyFullState(r),
+	exportPar: (name) => parFromState(name, view, currentState()),
+});
+
 // ---- Permalink restore + first render. Runs LAST (all controls + renderer methods
 // exist). The schema (config.ts) parses the URL into an AppState; applyFullState pushes
 // it into the controls + renderer (no change events → no premature renders/syncs), then
@@ -1364,8 +1372,8 @@ function applyEngineState(target: RenderPipeline, s: AppState): void {
 	} else if (s.paletteKey === "map") {
 		const p = mapPalette(s.map, s.mapInside, MAP_DENSITY);
 		if (p) target.recolor({ palette: p });
-	} else if (s.paletteKey !== "escape" && PALETTES[s.paletteKey]) {
-		target.recolor({ palette: PALETTES[s.paletteKey] });
+	} else if (PALETTES[s.paletteKey]) {
+		target.recolor({ palette: PALETTES[s.paletteKey] });   // escape too: a par import may replace another palette
 	}
 	if (Number(s.density) !== defaultDensityFor(s.paletteKey)) target.recolor({ density: Number(s.density) });
 	if (s.coloring === "distance") target.recolor({ coloring: { mode: 1, bandMap: 0 } });
@@ -1406,23 +1414,21 @@ function applyFullState({ state: s, rawView }: { state: AppState; rawView: RawVi
 	if (strandsSlider) strandsSlider.value = s.strands;
 	if (exposureSlider) exposureSlider.value = s.exposure;
 	if (blendSelect) blendSelect.value = s.blend;
+	if (paletteSelect) paletteSelect.value = s.paletteKey;
+	paletteEditor?.classList.toggle("hidden", s.paletteKey !== "custom");
+	mapEditor?.classList.toggle("hidden", s.paletteKey !== "map");
 	if (s.paletteKey === "custom") {
-		if (paletteSelect) paletteSelect.value = "custom";
 		customStops = s.stops.slice();
 		if (palInset) palInset.value = s.inset;
 		if (palCyclic) palCyclic.checked = s.cyclic;
-		paletteEditor?.classList.remove("hidden");
 		renderStops();
 		updatePalBar();
 		if (densitySlider) densitySlider.value = String(CUSTOM_DENSITY);
 	} else if (s.paletteKey === "map") {
-		if (paletteSelect) paletteSelect.value = "map";
 		if (mapInput) mapInput.value = s.map;
 		if (mapInsideInput) mapInsideInput.value = String(s.mapInside);
-		mapEditor?.classList.remove("hidden");
 		if (densitySlider) densitySlider.value = String(MAP_DENSITY);
-	} else if (s.paletteKey !== "escape" && paletteSelect && PALETTES[s.paletteKey]) {
-		paletteSelect.value = s.paletteKey;
+	} else if (PALETTES[s.paletteKey]) {
 		if (densitySlider) densitySlider.value = String(PALETTES[s.paletteKey].density);
 	}
 	if (Number(s.density) !== defaultDensityFor(s.paletteKey) && densitySlider) densitySlider.value = s.density;
@@ -1459,6 +1465,7 @@ function applyFullState({ state: s, rawView }: { state: AppState; rawView: RawVi
 		if (juliaToggle) juliaToggle.checked = false;
 		view = urlView || defaultViewFor();
 	}
+	setHistory([]);   // a new state starts a new exploration (an import replaces the page's state)
 
 	updateContextualControls();   // fix any conflicts (e.g. distance coloring on Kernel 2 → log)
 	syncUrl();                    // normalize the address bar to the canonical serialization

@@ -179,6 +179,32 @@
 			</div>
 		</details>
 
+		<details class="ctrl-section">
+			<summary>.par files</summary>
+			<div class="ctrl-body">
+				<label class="btn par-load" title="Load a Fractint .par (or a MandelJS export). Pick any .frm formula files it uses along with it. You can also drop the files on the canvas.">load .par
+					<input class="par-file" type="file" accept=".par,.frm,.txt" multiple hidden />
+				</label>
+				<button class="btn par-paste" type="button" title="Paste the text of a .par entry.">paste</button>
+				<label class="field par-entry-field hidden">entry
+					<select class="par-entry"></select>
+				</label>
+				<label class="field" title="The entry name for save; also the file name. An import sets it to the entry's name.">name
+					<input class="par-name formula-input" type="text" spellcheck="false" autocomplete="off" value="mandeljs" />
+				</label>
+				<button class="btn par-save" type="button" title="Save the current view as a Fractint .par entry. Fractint can load it; MandelJS reloads it exactly (the ; mandeljs: line).">save .par</button>
+				<div class="par-paste-box hidden">
+					<textarea class="par-text formula-input" rows="6" spellcheck="false" placeholder="Name { type=mandel center-mag=… }"></textarea>
+					<button class="btn par-paste-go" type="button">import</button>
+				</div>
+				<div class="par-report hidden" role="status">
+					<button class="par-report-close" type="button" aria-label="dismiss">×</button>
+					<div class="par-report-head"></div>
+					<ul class="par-report-list"></ul>
+				</div>
+			</div>
+		</details>
+
 		<div class="telemetry" aria-live="polite">
 			<div class="tstat" data-k="zoom"><div class="tstat-k">zoom</div><div class="tstat-v"></div></div>
 			<div class="tstat" data-k="precision"><div class="tstat-k">precision</div><div class="tstat-v"></div></div>
