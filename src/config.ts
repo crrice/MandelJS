@@ -11,6 +11,8 @@
 import type { View } from "./kernel/kernel";
 import { PALETTES } from "./palette";
 import { decodeColors } from "./fractint/colors";
+import { parseParFile } from "./fractint/par";
+import { importFractint, ParImport } from "./fractint/import";
 
 // The formula dropdown, as data. Key = the <option> value. "0" is the standard z²+c
 // (Kernel 1 fast path, no compiled formula). "custom" is the editable field. Every other
@@ -278,20 +280,23 @@ export function stateFromUrl(qs: string): { state: AppState; rawView: RawView | 
 }
 
 //---------------------------------------------------------------------------\\
-// .par — a Fractint-inspired plain-text parameter file over the SAME rows: `key=value`
-// lines using the URL keys, wrapped in a named block. Import feeds the same readers as a
-// URL, so the two formats cannot drift.
+// .par — Fractint's parameter-file format is the file format (writer: fractint/export.ts).
+// Reading dispatches on the entry: a `; mandeljs: <query>` line is the lossless MandelJS
+// state and wins; a Fractint entry goes through the importer (fractint/import.ts); anything
+// else is the legacy MandelJS dialect — `key=value` lines using the URL keys, read by the
+// same rows as a URL.
 //---------------------------------------------------------------------------\\
 
-export function parFromState(name: string, view: View, s: AppState): string {
-	const qs = urlFromState(view, s);
-	const p = new URLSearchParams(qs);
-	const lines: string[] = [];
-	p.forEach((v, k) => lines.push("  " + k + "=" + v));
-	return name.replace(/\s+/g, "_") + " { ; MandelJS parameter set\n" + lines.join("\n") + "\n}\n";
+// entryName picks one entry of a multi-entry file (default: the first).
+export function stateFromPar(text: string, entryName?: string): ParImport {
+	const file = parseParFile(text);
+	const e = entryName == null ? file.entries[0] : file.entries.find((x) => x.name.toLowerCase() === entryName.toLowerCase());
+	if (e && e.mandeljs != null) return { ...stateFromUrl(e.mandeljs), report: [] };
+	if (e && e.dialect === "fractint") return importFractint(file, e);
+	return { ...stateFromLegacyPar(text), report: [] };
 }
 
-export function stateFromPar(text: string): { state: AppState; rawView: RawView | null } {
+function stateFromLegacyPar(text: string): { state: AppState; rawView: RawView | null } {
 	const body = /\{([\s\S]*)\}/.exec(text);
 	const p = new URLSearchParams();
 	for (const line of (body ? body[1] : text).split("\n")) {

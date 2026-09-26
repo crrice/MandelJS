@@ -22,3 +22,7 @@ export * from "./math/frame";
 export { compileZ0 } from "./formula";
 export { z0Key, z0NeedsK2, escapeSpec } from "./render/pipeline";
 export { mapPalette, mapColorsFrom } from "./palette";
+export * from "./fractint/import";
+export { parFromState } from "./fractint/export";
+export { ddFromDecimal, ddToDecimal } from "./fractint/decimal";
+export { parseFormula } from "./formula";

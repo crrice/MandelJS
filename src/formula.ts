@@ -29,7 +29,7 @@ const F_FUNCS: { [k: string]: 1 } = {
 	sin: 1, cos: 1, tan: 1, sinh: 1, cosh: 1, tanh: 1, exp: 1, log: 1, sqrt: 1, conj: 1, abs: 1, re: 1, im: 1,
 };
 
-type FNode =
+export type FNode =
 	| { t: "num"; v: string }
 	| { t: "var"; name: string }
 	| { t: "const"; name: string }
@@ -309,4 +309,12 @@ export function compileZ0(src: string): FCompileResult {
 	const res = compileFormula(src);
 	if (res.ok && res.refsZ) return { ok: false, error: "z₀ can use c but not z" };
 	return res;
+}
+
+// The parse tree of formula text that compiles (null otherwise) — for printers of other
+// dialects (the Fractint exporter writes it as an frm: formula).
+export function parseFormula(src: string): FNode | null {
+	if (!compileFormula(src).ok) return null;
+	F_TS = fTokenize(src.trim()); F_I = 0;
+	return fParseExpr(1);
 }

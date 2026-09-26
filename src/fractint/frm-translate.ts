@@ -423,7 +423,7 @@ function mCurs(n: MNode, out: { [k: string]: 1 }): void {
 
 // Exact round trip: String(x) digits, with exponent notation spelled out, since formula.ts
 // literals are plain decimals.
-function fmtNum(x: number): string {
+export function fmtNum(x: number): string {
 	const s = String(x);
 	const m = /^(\d+)(?:\.(\d+))?e([+-]\d+)$/.exec(s);
 	if (!m) return s;

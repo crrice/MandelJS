@@ -23,7 +23,7 @@ export interface ParEntry {
 	tokens: ParToken[];      // in file order; continuations joined
 	lines: string[];         // the same text as logical lines (continuations joined, comments stripped, trimmed, non-empty) — for line-based dialects whose values hold spaces
 	comments: string[];      // every ';' comment inside the entry (text after the ';', trimmed)
-	mandeljs: string | null; // the query string of a `; mandeljs: <query>` line, if any
+	mandeljs: string | null; // the query string of the `; mandeljs: <query>` lines (joined), if any
 	dialect: ParDialect;
 }
 export interface ParBlock { kind: string; name: string; body: string; }   // `kind:name { body }`, body verbatim
@@ -83,7 +83,9 @@ function entryFromBody(name: string, raw: string[]): ParEntry {
 		}
 	}
 	let mandeljs: string | null = null;
-	for (const c of comments) if (c.toLowerCase().startsWith(MANDELJS_TAG)) mandeljs = c.slice(MANDELJS_TAG.length).trim();
+	// The query may span several `; mandeljs:` lines (Fractint reads at most 512 chars per
+	// line), joined in order.
+	for (const c of comments) if (c.toLowerCase().startsWith(MANDELJS_TAG)) mandeljs = (mandeljs ?? "") + c.slice(MANDELJS_TAG.length).trim();
 	const entry: ParEntry = { name, tokens, lines, comments, mandeljs, dialect: "unknown" };
 	entry.dialect = parDialect(entry);
 	return entry;

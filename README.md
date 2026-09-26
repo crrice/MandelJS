@@ -32,8 +32,12 @@ Zero runtime dependencies — esbuild bundles `src/` into a static page (`dist/`
   colorizer, telemetry, and a render-sink seam (`CanvasSink` on screen).
 - `src/filters/` — one `FilterDef` file per orbit-trap filter (kernel snippets + color
   readout + palette policy); the UI dropdown is generated from the registry.
-- `src/config.ts` — the app-state schema: URL permalinks and `.par` parameter files
-  serialize through the same per-parameter rows.
+- `src/config.ts` — the app-state schema: URL permalinks serialize through per-parameter
+  rows; `.par` files dispatch to the lossless `; mandeljs:` query, the Fractint importer, or
+  the legacy MandelJS dialect.
+- `src/fractint/` — Fractint 20.04 `.par` support: the tokenizer, `colors=`/logmap codec,
+  frm → MandelJS formula translator, the importer (`import.ts`) and the exporter
+  (`export.ts`: a Fractint-valid entry plus the `; mandeljs:` line).
 - `src/formula.ts` — the `f(z, c)` text → flat f64 codegen compiler.
 - `src/main.ts` + `index.html` — the standalone shell and control wiring. The same
   engine is also embedded — wrapped in site chrome — on

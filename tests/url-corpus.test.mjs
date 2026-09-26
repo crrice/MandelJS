@@ -4,7 +4,9 @@
 // .par round trips must reproduce it byte-for-byte.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { stateFromUrl, urlFromState, parFromState, stateFromPar } from "../dist/node-lib.js";
+import {
+	stateFromUrl, urlFromState, parFromState, stateFromPar, parseParFile, parGet, viewFrame, decodeColors, compileFormula, compileZ0,
+} from "../dist/node-lib.js";
 
 const CORPUS = [
 	// custom palette: stops, inset, bands off, single stop, non-default density
@@ -79,5 +81,44 @@ test("every corpus URL round-trips through .par", () => {
 		const { state, rawView } = stateFromUrl(u);
 		const back = stateFromPar(parFromState("corpus", viewOf(rawView), state));
 		assert.equal(urlFromState(viewOf(back.rawView), back.state), u);
+	}
+});
+
+// The legacy MandelJS dialect (the pre-Fractint writer: one URL row per line) still reads
+// back byte-identically.
+test("every corpus URL round-trips through the legacy .par dialect", () => {
+	for (const u of CORPUS) {
+		const { state, rawView } = stateFromUrl(u);
+		const lines = [];
+		new URLSearchParams(urlFromState(viewOf(rawView), state)).forEach((v, k) => lines.push("  " + k + "=" + v));
+		const back = stateFromPar("corpus { ; MandelJS parameter set\n" + lines.join("\n") + "\n}\n");
+		assert.equal(urlFromState(viewOf(back.rawView), back.state), u);
+	}
+});
+
+// The exported entry WITHOUT its ; mandeljs: lines is a Fractint par on its own: it imports
+// with the same window (corners) and the same map palette.
+test("every corpus URL's export reads back as a Fractint entry with the same geometry + palette", () => {
+	const frame = (raw, s) => viewFrame({ ...viewOf(raw), spanY: raw.span / Number(s.aspect) });
+	for (const u of CORPUS) {
+		const { state, rawView } = stateFromUrl(u);
+		const par = parFromState("corpus", viewOf(rawView), state);
+		assert.ok(par.split("\n").every((l) => l.length <= 512), u);
+		const text = par.split("\n").filter((l) => !/; mandeljs:/.test(l)).join("\n");
+		const file = parseParFile(text);
+		assert.deepEqual(file.errors, [], u);
+		assert.equal(file.entries[0].dialect, "fractint", u);
+		const back = stateFromPar(text);
+		assert.equal(back.error, undefined, u);
+		const a = frame(rawView, state), b = frame(back.rawView, back.state), span = rawView.span;
+		for (const k of ["ux", "uy", "vx", "vy"]) assert.ok(Math.abs(a[k] - b[k]) <= 1e-7 * span, u + " " + k);
+		assert.ok(Math.abs((back.rawView.cx - rawView.cx) + (back.rawView.cxLo - rawView.cxLo)) <= 1e-7 * span, u + " cx");
+		assert.ok(Math.abs((back.rawView.cy - rawView.cy) + (back.rawView.cyLo - rawView.cyLo)) <= 1e-7 * span, u + " cy");
+		assert.equal(back.state.paletteKey, "map", u);
+		assert.equal(back.state.map, state.paletteKey === "map" ? state.map : parGet(file.entries[0], "colors"), u);
+		assert.ok(decodeColors(back.state.map).ok, u);
+		if (back.state.formulaKey === "custom") assert.ok(compileFormula(back.state.expr).ok && compileZ0(back.state.z0).ok, u);
+		assert.equal(back.state.cap, Math.max(2, state.cap ?? 1000), u);   // Fractint's maxiter is at least 2
+		assert.equal(back.state.logmap, state.logmap, u);
 	}
 });

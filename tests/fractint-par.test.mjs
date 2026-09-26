@@ -77,10 +77,15 @@ test("multi-entry files, bare tokens, last value wins, '}' inside a comment", ()
 test("MandelJS dialects: legacy parameter set and the ; mandeljs: line", () => {
 	const { state, rawView } = stateFromUrl("?cx=-0.75&cy=0.1&span=2.5&f=z%5E3+%2B+c");
 	const view = { cx: rawView.cx, cxLo: 0, cy: rawView.cy, cyLo: 0, spanX: rawView.span, spanY: 0 };
-	const legacy = parseParFile(parFromState("My set", view, state)).entries[0];
-	assert.equal(legacy.name, "My_set");
+	const exported = parseParFile(parFromState("My set", view, state)).entries[0];
+	assert.equal(exported.name, "My_set");
+	assert.equal(exported.dialect, "mandeljs");
+	assert.equal(exported.mandeljs, "cx=-0.75&cy=0.1&span=2.5");
+	const legacy = parseParFile("My_set { ; MandelJS parameter set\n  cx=-0.75\n  cy=0.1\n  span=2.5\n}\n").entries[0];
 	assert.equal(legacy.dialect, "mandeljs");
 	assert.ok(legacy.lines.includes("cx=-0.75"));
+	const split = parseParFile("S {\n  ; mandeljs: cx=-0.5&cy=0\n  ; MANDELJS: &span=3\n  type=mandel\n}").entries[0];
+	assert.equal(split.mandeljs, "cx=-0.5&cy=0&span=3");
 	assert.equal(parseParFile("X {\n  cx=1\n  cy=2\n  span=3\n}").entries[0].dialect, "mandeljs");
 	const exp = parseParFile("E { ; mandeljs: cx=-0.5&cy=0&span=3\n  reset=2004 type=mandel\n}").entries[0];
 	assert.equal(exp.dialect, "mandeljs");

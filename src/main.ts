@@ -9,7 +9,8 @@ import { Palette, PALETTES, customPalette, mapPalette, mapColorsFrom, currentPal
 import { RenderPipeline, z0NeedsK2 } from "./render/pipeline";
 import { CanvasSink } from "./render/sink";
 import type { GenStats, FrameStats } from "./render/telemetry";
-import { AppState, PRESETS, CUSTOM_DENSITY, MAP_DENSITY, defaultDensityFor, urlFromState, stateFromUrl, parFromState, stateFromPar } from "./config";
+import { AppState, PRESETS, CUSTOM_DENSITY, MAP_DENSITY, defaultDensityFor, urlFromState, stateFromUrl, stateFromPar } from "./config";
+import { parFromState } from "./fractint/export";
 import { FILTERS } from "./filters/index";
 import type { RawView } from "./config";
 import { easel, canvas, ctx, DEBUG } from "./ui/dom";
@@ -277,9 +278,10 @@ dev.mandelDump = async () => {
 	return rec;
 };
 
-// .par round-trip (schema-driven; see config.ts). No argument: log + return the current
-// state as a Fractint-style parameter block. With text: parse it and apply the whole
-// state (same applier as a URL permalink), then render. e.g.
+// .par round-trip (see config.ts / fractint/export.ts). No argument: log + return the current
+// state as a Fractint par entry (with its lossless `; mandeljs:` line). With text: parse it
+// (MandelJS, legacy or Fractint entry) and apply the whole state (same applier as a URL
+// permalink), then render; returns the import report, or the reason it was refused. e.g.
 //   const p = mandelPar()          // export
 //   mandelPar(p)                   // re-import
 dev.mandelPar = (text?: string) => {
@@ -288,8 +290,10 @@ dev.mandelPar = (text?: string) => {
 		console.log(par);
 		return par;
 	}
-	applyFullState(stateFromPar(text));
-	return "par applied";
+	const r = stateFromPar(text);
+	if (r.error) return r.error;
+	applyFullState(r);
+	return r.report.length ? r.report : "par applied";
 };
 
 // URL round-trip test hook (pure, no rendering): parse a query string through the schema
