@@ -12,6 +12,7 @@
 import { View, FORMULA_CUSTOM, installKernels, setFrameState, setIndexState, computeRef, renderRegion } from "../kernel/kernel";
 import type { KernelFrameState } from "../kernel/kernel";
 import { assembleAll } from "../kernel/assemble";
+import { FILTERS } from "../filters/index";
 import { AppState, RawView, PRESETS, CUSTOM_DENSITY, MAP_DENSITY } from "../config";
 import { PALETTES, customPalette, mapPalette } from "../palette";
 import { compileFormula, compileZ0 } from "../formula";
@@ -63,14 +64,16 @@ export function setupHeadless(state: AppState, rawView: RawView | null, W: numbe
 	const maxIters = opts.iters || state.cap || 1500;
 
 	// Palette: the app's own bakes. Custom stops/inset are absolute; the theme args only
-	// matter for the theme-aware built-ins ("subtle").
+	// matter for the theme-aware built-ins ("subtle"). A filter's LUT override decides the
+	// bake, as in the app's colorizer.
 	const density = Number(state.density) || 32;
 	const pal = state.paletteKey === "custom"
 		? customPalette(state.stops, state.inset, state.cyclic, CUSTOM_DENSITY)
 		: state.paletteKey === "map" ? mapPalette(state.map, state.mapInside, MAP_DENSITY) || PALETTES.escape
 			: (PALETTES[state.paletteKey] || PALETTES.escape);
 	const cyclic = state.paletteKey === "custom" ? state.cyclic : pal.cyclic;
-	const { lut, inSet, map } = pal.build(INK, PAPER, cyclic, state.palBlend);
+	const ov = filterId !== 0 && FILTERS[filterId] ? FILTERS[filterId].lut : null;
+	const { lut, inSet, map } = pal.build(INK, PAPER, ov ? ov.cyclic : cyclic, state.palBlend);
 	const mode = state.coloring === "distance" ? 1 : 0;
 	const bandMap = state.coloring === "linear" ? 0 : state.coloring === "sqrt" ? 1 : 2;
 	const logTable = logmapTable(state.logmap, maxIters);
