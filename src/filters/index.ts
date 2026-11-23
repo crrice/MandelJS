@@ -4,6 +4,7 @@
 // filter = adding a file + a registry row; the CONTROLS stay universal (strands/exposure/
 // blend) per the filter-controls-uniform directive, so there is no per-filter UI here.
 import { xrayRings } from "./xray";
+import { stalks } from "./stalks";
 
 export type FilterColorFn = (
 	inten: number, parity: number, lut: Uint32Array, inSet: number,
@@ -24,4 +25,5 @@ export interface FilterDef {
 
 export const FILTERS: { [id: number]: FilterDef } = {
 	[xrayRings.id]: xrayRings,
+	[stalks.id]: stalks,
 };
